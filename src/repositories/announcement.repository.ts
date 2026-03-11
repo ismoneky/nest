@@ -4,7 +4,7 @@ import { Model } from 'mongoose';
 import { Announcement, AnnouncementDocument } from '../entities/announcement.entity';
 import { CreateAnnouncementDto } from '../modules/announcement/dto/create-announcement.dto';
 import { UpdateAnnouncementDto } from '../modules/announcement/dto/update-announcement.dto';
-import { v4 as uuidv4 } from 'uuid';
+import { randomUUID } from 'crypto';
 
 /**
  * 公告数据访问层
@@ -19,7 +19,7 @@ export class AnnouncementRepository {
     async create(dto: CreateAnnouncementDto) {
         try {
             const announcement = new this.announcementModel({
-                announcementId: uuidv4(),
+                announcementId: randomUUID(),
                 ...dto,
             });
             const savedAnnouncement = await announcement.save();

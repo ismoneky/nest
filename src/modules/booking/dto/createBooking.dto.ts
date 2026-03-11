@@ -1,5 +1,5 @@
 import { IsDateString, IsEnum, IsInt, IsNotEmpty, IsOptional, IsString, Matches, Min, ValidateIf } from 'class-validator';
-import { Gender, TimeSlot, TravelMode, VehicleType } from '../../../entities/booking.entity';
+import { TimeSlot, TravelMode, VehicleType } from '../../../entities/booking.entity';
 
 /**
  * 创建预约订单 DTO
@@ -13,24 +13,19 @@ export class CreateBookingDto {
     /** 联系人姓名 */
     @IsString()
     @IsNotEmpty()
-    contactName: string;
-
-    /** 联系人性别 */
-    @IsEnum(Gender)
-    @IsNotEmpty()
-    contactGender: Gender;
+    name: string;
 
     /** 联系人手机号 (格式: 1开头的11位数字) */
     @IsString()
     @IsNotEmpty()
     @Matches(/^1[3-9]\d{9}$/, { message: 'Invalid phone number format' })
-    contactPhone: string;
+    phone: string;
 
     /** 联系人身份证号 (18位) */
     @IsString()
     @IsNotEmpty()
     @Matches(/^[1-9]\d{5}(18|19|20)\d{2}(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])\d{3}[\dXx]$/, { message: 'Invalid ID card format' })
-    contactIdCard: string;
+    idCard: string;
 
     /** 预约日期 (格式: YYYY-MM-DD) */
     @IsDateString()
@@ -72,13 +67,13 @@ export class CreateBookingDto {
     @ValidateIf((o) => o.travelMode === TravelMode.TOUR_GROUP)
     @IsString()
     @IsNotEmpty({ message: 'Tour order number is required for tour group mode' })
-    tourOrderNumber?: string;
+    tourNumber?: string;
 
     /** 预约人数 (≥1) */
     @IsInt()
     @Min(1)
     @IsNotEmpty()
-    numberOfPeople: number;
+    personCount: number;
 
     /** 备注信息 (可选) */
     @IsString()

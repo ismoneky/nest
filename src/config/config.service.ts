@@ -36,25 +36,17 @@ export class ConfigService {
             family: 4, // 使用 IPv4
         };
 
-        // 如果有用户名密码,使用认证连接 (云数据库)
-        if (user && password) {
-            // 判断是否是 MongoDB Atlas (包含 mongodb.net)
-            if (host.includes('mongodb.net')) {
-                return {
-                    uri: `mongodb+srv://${user}:${password}@${host}/${database}`,
-                    ...connectionOptions,
-                };
-            }
-            // 本地 MongoDB 带认证
-            return {
-                uri: `mongodb://${user}:${password}@${host}/${database}?authSource=admin`,
-                ...connectionOptions,
-            };
-        }
+        // 如果用户名或密码未定义, 使用无认证连接
+        const uri = !user || !password
+            ? `mongodb://${host}/${database}`
+            : host.includes('mongodb.net')
+            ? `mongodb+srv://${user}:${password}@${host}/${database}`
+            : `mongodb://${user}:${password}@${host}/${database}?authSource=admin`;
 
-        // 本地 MongoDB 无认证
+        console.log('MongoDB Connection URI:', uri);
+
         return {
-            uri: `mongodb://${host}/${database}`,
+            uri,
             ...connectionOptions,
         };
     }

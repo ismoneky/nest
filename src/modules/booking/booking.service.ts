@@ -1,8 +1,11 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, BadRequestException } from '@nestjs/common';
+import { InjectQueue } from '@nestjs/bull';
+import { Queue } from 'bull';
 import { BookingRepository } from '../../repositories/booking.repository';
 import { CreateBookingDto } from './dto/createBooking.dto';
 import { GetBookingsDto } from './dto/getBookings.dto';
 import { UpdateBookingDto } from './dto/updateBooking.dto';
+import { TimeSlot } from '../../entities/booking.entity';
 
 /**
  * 预约订单业务逻辑层
@@ -10,7 +13,10 @@ import { UpdateBookingDto } from './dto/updateBooking.dto';
  */
 @Injectable()
 export class BookingService {
-    constructor(private readonly bookingRepository: BookingRepository) {}
+    constructor(
+        private readonly bookingRepository: BookingRepository,
+        @InjectQueue('booking') private readonly bookingQueue: Queue,
+    ) {}
 
     /**
      * 创建预约订单
@@ -18,7 +24,30 @@ export class BookingService {
      * @returns 创建的订单
      */
     async createBooking(createBookingDto: CreateBookingDto) {
-        return await this.bookingRepository.createBooking(createBookingDto);
+        const booking = await this.bookingRepository.createBooking(createBookingDto);
+
+        // 计算预约时间的具体时间点
+        const bookingDate = new Date(createBookingDto.bookingDate);
+        // 设置预约时间的完整日期和时间段
+        const [year, month, day] = createBookingDto.bookingDate.split('-').map(Number);
+        bookingDate.setFullYear(year, month - 1, day); // 设置预约日期
+
+        if (createBookingDto.timeSlot === TimeSlot.MORNING) {
+            bookingDate.setHours(12, 0, 0, 0); // 上午 8:00
+        } else if (createBookingDto.timeSlot === TimeSlot.AFTERNOON) {
+            bookingDate.setHours(18, 0, 0, 0); // 下午 12:00
+        }
+
+        // 计算延迟时间（预约时间 - 当前时间）
+        const delay = bookingDate.getTime() - Date.now();
+        // if (delay > 0) {
+        //     // 创建定时任务
+        //     await this.bookingQueue.add('completeBooking', { bookingId: booking.bookingId }, { delay });
+        // } else {
+        //     throw new BadRequestException('预约时间必须晚于当前时间');
+        // }
+
+        return booking;
     }
 
     /**

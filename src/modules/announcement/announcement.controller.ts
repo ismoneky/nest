@@ -16,7 +16,7 @@ export class AnnouncementController {
     @UseGuards(AdminAuthGuard)
     async create(@Body() dto: CreateAnnouncementDto, @Res() res: Response) {
         const announcement = await this.service.create(dto);
-        return res.status(HttpStatus.CREATED).send({
+        return res.status(HttpStatus.OK).send({
             success: true,
             message: '创建成功',
             data: announcement,

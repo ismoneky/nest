@@ -23,6 +23,13 @@ async function bootstrap() {
     }),
   );
 
+  // 启用 CORS
+  app.enableCors({
+    origin: 'http://localhost:5173', // 替换为前端项目的实际地址
+    methods: 'GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS',
+    allowedHeaders: 'Content-Type, Accept, Authorization',
+  });
+
   const config = new ConfigService();
   await app.listen(await config.getPortConfig());
 }

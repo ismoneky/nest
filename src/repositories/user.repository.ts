@@ -3,7 +3,8 @@ import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
 import { User, UserDocument } from '../entities/user.entity';
 import { CreateUserDto } from '../modules/user/dto/createUser.dto';
-import { v4 as uuidv4 } from 'uuid';
+import { randomUUID } from 'crypto';
+
 
 export class UserRepository {
     constructor(@InjectModel(User.name) private readonly userModel: Model<UserDocument>) {}
@@ -16,7 +17,7 @@ export class UserRepository {
             // 如果用户不存在,创建新用户
             if (!user) {
                 const newUser = new this.userModel({
-                    userId: uuidv4(),
+                    userId: randomUUID(),
                     wechatOpenId: createUserDto.wechatOpenId,
                     wechatNickname: createUserDto.wechatNickname,
                     wechatAvatarUrl: createUserDto.wechatAvatarUrl,

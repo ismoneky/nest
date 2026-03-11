@@ -3,13 +3,6 @@ import { HydratedDocument } from 'mongoose';
 
 export type BookingDocument = HydratedDocument<Booking>;
 
-/**
- * 性别枚举
- */
-export enum Gender {
-    MALE = 'male', // 男
-    FEMALE = 'female', // 女
-}
 
 /**
  * 时间段枚举
@@ -23,26 +16,27 @@ export enum TimeSlot {
  * 出行方式枚举
  */
 export enum TravelMode {
-    SCENIC_BUS = 'scenic_bus', // 景区自营车
-    SELF_DRIVING = 'self_driving', // 自驾
-    TOUR_GROUP = 'tour_group', // 观光团
+    SCENIC_BUS = 'scenicBus', // 景区自营车
+    SELF_DRIVING = 'selfDriving', // 自驾
+    TOUR_GROUP = 'tourGroup', // 观光团
 }
 
 /**
  * 车辆类型枚举 (自驾时必填)
  */
 export enum VehicleType {
-    TWO_WHEEL_MOTORCYCLE = 'two_wheel_motorcycle', // 二轮摩托
-    THREE_WHEEL_MOTORCYCLE = 'three_wheel_motorcycle', // 三轮摩托
-    SMALL_CAR = 'small_car', // 小型客车
+    WHEEL_MOTORCYCLE = 'wheelMotorcycle', // 摩托
+    SMALL_CAR = 'smallCar', // 小型客车
+
 }
 
 /**
  * 订单状态枚举
  */
 export enum BookingStatus {
-    PENDING = 'pending', // 待确认
-    CONFIRMED = 'confirmed', // 已确认
+    // PENDING = 'pending', // 待确认
+    // CONFIRMED = 'confirmed', // 已确认
+    NONE = 'none', // 无状态 (默认值)
     CANCELLED = 'cancelled', // 已取消
     COMPLETED = 'completed', // 已完成
 }
@@ -62,19 +56,15 @@ export class Booking {
 
     /** 联系人姓名 */
     @Prop({ required: true })
-    contactName: string;
-
-    /** 联系人性别 */
-    @Prop({ required: true, enum: Gender })
-    contactGender: Gender;
+    name: string;
 
     /** 联系人手机号 */
     @Prop({ required: true })
-    contactPhone: string;
+    phone: string;
 
     /** 联系人身份证号 */
     @Prop({ required: true })
-    contactIdCard: string;
+    idCard: string;
 
     /** 预约日期 */
     @Prop({ required: true, index: true })
@@ -106,14 +96,14 @@ export class Booking {
 
     /** 预约人数 */
     @Prop({ required: true, min: 1 })
-    numberOfPeople: number;
+    personCount: number;
 
     /** 备注信息 */
     @Prop({ default: '' })
     remarks?: string;
 
     /** 订单状态 */
-    @Prop({ default: BookingStatus.PENDING, enum: BookingStatus, index: true })
+    @Prop({ default: "none", enum: BookingStatus, index: true })
     status: BookingStatus;
 
     /** 创建时间 */

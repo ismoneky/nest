@@ -5,7 +5,7 @@ import { Booking, BookingDocument } from '../entities/booking.entity';
 import { CreateBookingDto } from '../modules/booking/dto/createBooking.dto';
 import { GetBookingsDto } from '../modules/booking/dto/getBookings.dto';
 import { UpdateBookingDto } from '../modules/booking/dto/updateBooking.dto';
-import { v4 as uuidv4 } from 'uuid';
+import { randomUUID } from 'crypto';
 
 /**
  * 预约订单数据访问层
@@ -21,9 +21,10 @@ export class BookingRepository {
      */
     async createBooking(createBookingDto: CreateBookingDto) {
         try {
-            // 生成唯一的订单ID
+            // 生成以 TL 开头的 11 位随机字符订单号
+            const generateBookingId = () => `TL${randomUUID().replace(/-/g, '').substring(0, 11).toUpperCase()}`;
             const booking = new this.bookingModel({
-                bookingId: uuidv4(),
+                bookingId: generateBookingId(),
                 ...createBookingDto,
                 bookingDate: new Date(createBookingDto.bookingDate),
             });
