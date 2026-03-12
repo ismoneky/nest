@@ -50,4 +50,18 @@ export class ConfigService {
             ...connectionOptions,
         };
     }
+
+    public getRedisConfig() {
+        const host = this.get('REDIS_HOST') || 'localhost';
+        const port = parseInt(this.get('REDIS_PORT'), 10) || 6379;
+        const password = this.get('REDIS_PASSWORD');
+
+        return {
+            redis: {
+                host,
+                port,
+                password,
+            },
+        };
+    }
 }

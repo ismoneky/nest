@@ -1,6 +1,6 @@
 import { InternalServerErrorException, NotFoundException } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
-import { Model } from 'mongoose';
+import { Model, FilterQuery, UpdateQuery } from 'mongoose';
 import { Booking, BookingDocument } from '../entities/booking.entity';
 import { CreateBookingDto } from '../modules/booking/dto/createBooking.dto';
 import { GetBookingsDto } from '../modules/booking/dto/getBookings.dto';
@@ -234,5 +234,12 @@ export class BookingRepository {
         } catch (error) {
             throw new InternalServerErrorException(error instanceof Error ? error.message : 'Failed to get booking stats');
         }
+    }
+
+    /**
+     * 更新指定条件的订单
+     */
+    async updateBookings(filter: any, update: any) {
+        return this.bookingModel.updateMany(filter, update).exec();
     }
 }

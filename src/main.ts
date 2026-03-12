@@ -1,5 +1,11 @@
 import { ValidationPipe } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
+import * as crypto from 'crypto';
+
+// Polyfill global.crypto for Node.js < 19
+if (!global.crypto) {
+  (global as any).crypto = crypto;
+}
 
 import { AppModule } from './app.module';
 import { ConfigService } from './config/config.service';
