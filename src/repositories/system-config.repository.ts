@@ -1,36 +1,37 @@
 import { Injectable, InternalServerErrorException } from '@nestjs/common';
-import { InjectModel } from '@nestjs/mongoose';
-import { Model } from 'mongoose';
-import { SystemConfig, SystemConfigDocument } from '../entities/system-config.entity';
+import { InjectRepository } from '@nestjs/typeorm';
+import { Repository } from 'typeorm';
+import { SystemConfig } from '../entities/system-config.entity';
 
 /**
  * 系统配置数据访问层
  */
 @Injectable()
 export class SystemConfigRepository {
-    constructor(@InjectModel(SystemConfig.name) private readonly configModel: Model<SystemConfigDocument>) {}
+    constructor(
+        @InjectRepository(SystemConfig)
+        private readonly configRepository: Repository<SystemConfig>,
+    ) {}
 
     /**
      * 获取系统配置 (单例模式)
      * 如果不存在则创建默认配置
      */
-    async getConfig() {
+    async getConfig(): Promise<SystemConfig> {
         try {
-            let config = await this.configModel.findOne({ configId: 'system_config' }).lean().exec();
+            let config = await this.configRepository.findOne({
+                where: { configId: 'system_config' },
+            });
 
             // 如果配置不存在,创建默认配置
             if (!config) {
-                const defaultConfig = new this.configModel({
+                config = this.configRepository.create({
                     configId: 'system_config',
                     bookingEnabled: true,
-                    banners: [],
-                    timeSlotLimit: {
-                        morningMaxPeople: 1000,
-                        afternoonMaxPeople: 1000,
-                    },
+                    bannersJson: '[]',
+                    timeSlotLimitJson: '{"morningMaxPeople":1000,"afternoonMaxPeople":1000}',
                 });
-                const saved = await defaultConfig.save();
-                config = saved.toObject();
+                await this.configRepository.save(config);
             }
 
             return config;
@@ -42,14 +43,24 @@ export class SystemConfigRepository {
     /**
      * 更新系统配置
      */
-    async updateConfig(updateData: Partial<SystemConfig>) {
+    async updateConfig(updateData: Partial<SystemConfig>): Promise<SystemConfig> {
         try {
-            const config = await this.configModel
-                .findOneAndUpdate({ configId: 'system_config' }, updateData, { new: true, upsert: true })
-                .lean()
-                .exec();
+            let config = await this.configRepository.findOne({
+                where: { configId: 'system_config' },
+            });
 
-            return config;
+            if (!config) {
+                // 如果不存在则创建
+                config = this.configRepository.create({
+                    configId: 'system_config',
+                    ...updateData,
+                });
+            } else {
+                // 更新现有配置
+                Object.assign(config, updateData);
+            }
+
+            return await this.configRepository.save(config);
         } catch (error) {
             throw new InternalServerErrorException(error instanceof Error ? error.message : 'Failed to update system config');
         }

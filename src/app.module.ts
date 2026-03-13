@@ -1,5 +1,5 @@
 import { Module } from '@nestjs/common';
-import { MongooseModule } from '@nestjs/mongoose';
+import { TypeOrmModule } from '@nestjs/typeorm';
 import { ScheduleModule } from '@nestjs/schedule';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
@@ -11,13 +11,23 @@ import { BookingModule } from './modules/booking/booking.module';
 import { SystemConfigModule } from './modules/system-config/system-config.module';
 import { UserModule } from './modules/user/user.module';
 
+// 导入所有实体
+import { User } from './entities/user.entity';
+import { Admin } from './entities/admin.entity';
+import { Booking } from './entities/booking.entity';
+import { Announcement } from './entities/announcement.entity';
+import { SystemConfig } from './entities/system-config.entity';
+
 @Module({
     imports: [
         ConfigModule,
-        // MongoDB Connection
-        MongooseModule.forRootAsync({
+        // SQLite Connection with TypeORM
+        TypeOrmModule.forRootAsync({
             inject: [ConfigService],
-            useFactory: async (configService: ConfigService) => configService.getMongoConfig(),
+            useFactory: async (configService: ConfigService) => ({
+                ...(await configService.getDatabaseConfig()),
+                entities: [User, Admin, Booking, Announcement, SystemConfig],
+            }),
         }),
         ScheduleModule.forRoot(),
         UserModule,

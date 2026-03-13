@@ -1,7 +1,7 @@
-import { InternalServerErrorException, NotFoundException } from '@nestjs/common';
-import { InjectModel } from '@nestjs/mongoose';
-import { Model, FilterQuery, UpdateQuery } from 'mongoose';
-import { Booking, BookingDocument } from '../entities/booking.entity';
+import { Injectable, InternalServerErrorException, NotFoundException } from '@nestjs/common';
+import { InjectRepository } from '@nestjs/typeorm';
+import { Repository, Between, Not } from 'typeorm';
+import { Booking } from '../entities/booking.entity';
 import { CreateBookingDto } from '../modules/booking/dto/createBooking.dto';
 import { GetBookingsDto } from '../modules/booking/dto/getBookings.dto';
 import { UpdateBookingDto } from '../modules/booking/dto/updateBooking.dto';
@@ -9,28 +9,31 @@ import { randomUUID } from 'crypto';
 
 /**
  * 预约订单数据访问层
- * 负责与 MongoDB 数据库交互
  */
+@Injectable()
 export class BookingRepository {
-    constructor(@InjectModel(Booking.name) private readonly bookingModel: Model<BookingDocument>) {}
+    constructor(
+        @InjectRepository(Booking)
+        private readonly bookingRepository: Repository<Booking>,
+    ) {}
 
     /**
      * 创建预约订单
      * @param createBookingDto 创建订单数据传输对象
-     * @returns 创建的订单文档
+     * @returns 创建的订单实体
      */
-    async createBooking(createBookingDto: CreateBookingDto) {
+    async createBooking(createBookingDto: CreateBookingDto): Promise<Booking> {
         try {
             // 生成以 TL 开头的 11 位随机字符订单号
             const generateBookingId = () => `TL${randomUUID().replace(/-/g, '').substring(0, 11).toUpperCase()}`;
-            const booking = new this.bookingModel({
+
+            const booking = this.bookingRepository.create({
                 bookingId: generateBookingId(),
                 ...createBookingDto,
                 bookingDate: new Date(createBookingDto.bookingDate),
             });
-            const savedBooking = await booking.save();
-            // 返回纯对象,避免 Mongoose Document 内存泄漏
-            return savedBooking.toObject();
+
+            return await this.bookingRepository.save(booking);
         } catch (error) {
             throw new InternalServerErrorException(error instanceof Error ? error.message : 'Failed to create booking');
         }
@@ -40,24 +43,19 @@ export class BookingRepository {
      * 更新预约订单
      * @param bookingId 订单ID
      * @param updateBookingDto 更新数据传输对象
-     * @returns 更新后的订单文档
+     * @returns 更新后的订单实体
      */
-    async updateBooking(bookingId: string, updateBookingDto: UpdateBookingDto) {
+    async updateBooking(bookingId: string, updateBookingDto: UpdateBookingDto): Promise<Booking> {
         try {
-            const updateData: any = { ...updateBookingDto };
+            const booking = await this.getBookingById(bookingId);
+
             // 如果更新日期,需要转换为 Date 对象
             if (updateBookingDto.bookingDate) {
-                updateData.bookingDate = new Date(updateBookingDto.bookingDate);
+                updateBookingDto.bookingDate = new Date(updateBookingDto.bookingDate) as any;
             }
 
-            // findOneAndUpdate 返回更新后的文档 (new: true), 使用 lean() 返回纯对象
-            const booking = await this.bookingModel.findOneAndUpdate({ bookingId }, updateData, { new: true }).lean().exec();
-
-            if (!booking) {
-                throw new NotFoundException(`Booking with ID ${bookingId} not found`);
-            }
-
-            return booking;
+            Object.assign(booking, updateBookingDto);
+            return await this.bookingRepository.save(booking);
         } catch (error) {
             if (error instanceof NotFoundException) {
                 throw error;
@@ -69,17 +67,12 @@ export class BookingRepository {
     /**
      * 删除预约订单
      * @param bookingId 订单ID
-     * @returns 被删除的订单文档
+     * @returns 被删除的订单实体
      */
-    async deleteBooking(bookingId: string) {
+    async deleteBooking(bookingId: string): Promise<Booking> {
         try {
-            const result = await this.bookingModel.findOneAndDelete({ bookingId }).lean().exec();
-
-            if (!result) {
-                throw new NotFoundException(`Booking with ID ${bookingId} not found`);
-            }
-
-            return result;
+            const booking = await this.getBookingById(bookingId);
+            return await this.bookingRepository.remove(booking);
         } catch (error) {
             if (error instanceof NotFoundException) {
                 throw error;
@@ -91,11 +84,13 @@ export class BookingRepository {
     /**
      * 根据订单ID查询单个订单
      * @param bookingId 订单ID
-     * @returns 订单文档
+     * @returns 订单实体
      */
-    async getBookingById(bookingId: string) {
+    async getBookingById(bookingId: string): Promise<Booking> {
         try {
-            const booking = await this.bookingModel.findOne({ bookingId }).lean().exec();
+            const booking = await this.bookingRepository.findOne({
+                where: { bookingId },
+            });
 
             if (!booking) {
                 throw new NotFoundException(`Booking with ID ${bookingId} not found`);
@@ -114,37 +109,33 @@ export class BookingRepository {
      * 根据条件查询订单列表 (分页)
      * 支持按 wechatOpenId, bookingDate, timeSlot, status 筛选
      * @param query 查询条件 (包含分页参数)
-     * @returns 订单文档数组和总数
+     * @returns 订单实体数组和总数
      */
     async getBookings(query: GetBookingsDto) {
         try {
-            const filter: any = {};
+            const where: any = {};
 
-            // 按微信OpenID筛选 (利用索引)
+            // 按微信OpenID筛选
             if (query.wechatOpenId) {
-                filter.wechatOpenId = query.wechatOpenId;
+                where.wechatOpenId = query.wechatOpenId;
             }
 
-            // 按预约日期筛选 (利用索引)
-            // 查询指定日期的所有订单 (00:00:00 - 23:59:59)
+            // 按预约日期筛选
             if (query.bookingDate) {
                 const date = new Date(query.bookingDate);
                 const nextDay = new Date(date);
                 nextDay.setDate(date.getDate() + 1);
-                filter.bookingDate = {
-                    $gte: date,
-                    $lt: nextDay,
-                };
+                where.bookingDate = Between(date, nextDay);
             }
 
             // 按时间段筛选
             if (query.timeSlot) {
-                filter.timeSlot = query.timeSlot;
+                where.timeSlot = query.timeSlot;
             }
 
-            // 按订单状态筛选 (利用索引)
+            // 按订单状态筛选
             if (query.status) {
-                filter.status = query.status;
+                where.status = query.status;
             }
 
             // 分页参数
@@ -152,12 +143,13 @@ export class BookingRepository {
             const pageSize = query.pageSize || 10;
             const skip = (page - 1) * pageSize;
 
-            // 并行执行查询和计数
-            // 使用 .lean() 返回纯 JavaScript 对象,减少内存占用
-            const [bookings, total] = await Promise.all([
-                this.bookingModel.find(filter).sort({ createdAt: -1 }).skip(skip).limit(pageSize).lean().exec(),
-                this.bookingModel.countDocuments(filter).exec(),
-            ]);
+            // 执行查询
+            const [bookings, total] = await this.bookingRepository.findAndCount({
+                where,
+                order: { createdAt: 'DESC' },
+                skip,
+                take: pageSize,
+            });
 
             return {
                 bookings,
@@ -182,55 +174,39 @@ export class BookingRepository {
             const nextDay = new Date(date);
             nextDay.setDate(date.getDate() + 1);
 
-            // 使用聚合管道统计各时间段的预约人数
-            const stats = await this.bookingModel
-                .aggregate([
-                    {
-                        // 筛选指定日期的订单
-                        $match: {
-                            bookingDate: {
-                                $gte: date,
-                                $lt: nextDay,
-                            },
-                            // 只统计未取消的订单
-                            status: { $ne: 'cancelled' },
-                        },
-                    },
-                    {
-                        // 按时间段分组,统计人数
-                        $group: {
-                            _id: '$timeSlot',
-                            totalPeople: { $sum: '$numberOfPeople' },
-                            bookingCount: { $sum: 1 },
-                        },
-                    },
-                ])
-                .exec();
+            // 查询上午的统计
+            const morningStats = await this.bookingRepository
+                .createQueryBuilder('booking')
+                .select('SUM(booking.personCount)', 'totalPeople')
+                .addSelect('COUNT(*)', 'bookingCount')
+                .where('booking.bookingDate >= :date', { date })
+                .andWhere('booking.bookingDate < :nextDay', { nextDay })
+                .andWhere('booking.timeSlot = :timeSlot', { timeSlot: 'morning' })
+                .andWhere('booking.status != :status', { status: 'cancelled' })
+                .getRawOne();
 
-            // 格式化返回结果
-            const result = {
+            // 查询下午的统计
+            const afternoonStats = await this.bookingRepository
+                .createQueryBuilder('booking')
+                .select('SUM(booking.personCount)', 'totalPeople')
+                .addSelect('COUNT(*)', 'bookingCount')
+                .where('booking.bookingDate >= :date', { date })
+                .andWhere('booking.bookingDate < :nextDay', { nextDay })
+                .andWhere('booking.timeSlot = :timeSlot', { timeSlot: 'afternoon' })
+                .andWhere('booking.status != :status', { status: 'cancelled' })
+                .getRawOne();
+
+            return {
                 date: bookingDate,
                 morning: {
-                    totalPeople: 0,
-                    bookingCount: 0,
+                    totalPeople: parseInt(morningStats?.totalPeople || '0'),
+                    bookingCount: parseInt(morningStats?.bookingCount || '0'),
                 },
                 afternoon: {
-                    totalPeople: 0,
-                    bookingCount: 0,
+                    totalPeople: parseInt(afternoonStats?.totalPeople || '0'),
+                    bookingCount: parseInt(afternoonStats?.bookingCount || '0'),
                 },
             };
-
-            stats.forEach((stat) => {
-                if (stat._id === 'morning') {
-                    result.morning.totalPeople = stat.totalPeople;
-                    result.morning.bookingCount = stat.bookingCount;
-                } else if (stat._id === 'afternoon') {
-                    result.afternoon.totalPeople = stat.totalPeople;
-                    result.afternoon.bookingCount = stat.bookingCount;
-                }
-            });
-
-            return result;
         } catch (error) {
             throw new InternalServerErrorException(error instanceof Error ? error.message : 'Failed to get booking stats');
         }
@@ -240,6 +216,6 @@ export class BookingRepository {
      * 更新指定条件的订单
      */
     async updateBookings(filter: any, update: any) {
-        return this.bookingModel.updateMany(filter, update).exec();
+        return await this.bookingRepository.update(filter, update);
     }
 }

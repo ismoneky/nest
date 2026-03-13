@@ -1,30 +1,33 @@
-import { InternalServerErrorException } from '@nestjs/common';
-import { InjectModel } from '@nestjs/mongoose';
-import { Model } from 'mongoose';
-import { User, UserDocument } from '../entities/user.entity';
+import { Injectable, InternalServerErrorException } from '@nestjs/common';
+import { InjectRepository } from '@nestjs/typeorm';
+import { Repository } from 'typeorm';
+import { User } from '../entities/user.entity';
 import { CreateUserDto } from '../modules/user/dto/createUser.dto';
 import { randomUUID } from 'crypto';
 
-
+@Injectable()
 export class UserRepository {
-    constructor(@InjectModel(User.name) private readonly userModel: Model<UserDocument>) {}
+    constructor(
+        @InjectRepository(User)
+        private readonly userRepository: Repository<User>,
+    ) {}
 
-    async findOrCreateUser(createUserDto: CreateUserDto) {
+    async findOrCreateUser(createUserDto: CreateUserDto): Promise<User> {
         try {
-            // 先查询用户是否存在,使用 lean() 减少内存占用
-            let user = await this.userModel.findOne({ wechatOpenId: createUserDto.wechatOpenId }).lean().exec();
+            // 先查询用户是否存在
+            let user = await this.userRepository.findOne({
+                where: { wechatOpenId: createUserDto.wechatOpenId },
+            });
 
             // 如果用户不存在,创建新用户
             if (!user) {
-                const newUser = new this.userModel({
+                user = this.userRepository.create({
                     userId: randomUUID(),
                     wechatOpenId: createUserDto.wechatOpenId,
                     wechatNickname: createUserDto.wechatNickname,
                     wechatAvatarUrl: createUserDto.wechatAvatarUrl,
                 });
-                const savedUser = await newUser.save();
-                // 转换为纯对象返回
-                return savedUser.toObject();
+                await this.userRepository.save(user);
             }
 
             return user;

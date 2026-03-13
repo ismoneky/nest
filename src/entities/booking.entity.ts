@@ -1,8 +1,4 @@
-import { Prop, Schema, SchemaFactory } from '@nestjs/mongoose';
-import { HydratedDocument } from 'mongoose';
-
-export type BookingDocument = HydratedDocument<Booking>;
-
+import { Entity, Column, PrimaryGeneratedColumn, CreateDateColumn, UpdateDateColumn, Index } from 'typeorm';
 
 /**
  * 时间段枚举
@@ -27,15 +23,12 @@ export enum TravelMode {
 export enum VehicleType {
     WHEEL_MOTORCYCLE = 'wheelMotorcycle', // 摩托
     SMALL_CAR = 'smallCar', // 小型客车
-
 }
 
 /**
  * 订单状态枚举
  */
 export enum BookingStatus {
-    // PENDING = 'pending', // 待确认
-    // CONFIRMED = 'confirmed', // 已确认
     NONE = 'none', // 无状态 (默认值)
     CANCELLED = 'cancelled', // 已取消
     COMPLETED = 'completed', // 已完成
@@ -44,80 +37,83 @@ export enum BookingStatus {
 /**
  * 预约订单实体
  */
-@Schema({ timestamps: true })
+@Entity('bookings')
+@Index(['wechatOpenId', 'status']) // 复合索引
+@Index(['bookingDate', 'timeSlot']) // 复合索引
 export class Booking {
+    @PrimaryGeneratedColumn()
+    id: number;
+
     /** 订单唯一标识 (UUID) */
-    @Prop({ required: true, unique: true, index: true })
+    @Column({ unique: true })
+    @Index()
     bookingId: string;
 
     /** 微信用户OpenID (关联用户) */
-    @Prop({ required: true, index: true })
+    @Column()
+    @Index()
     wechatOpenId: string;
 
     /** 联系人姓名 */
-    @Prop({ required: true })
+    @Column()
     name: string;
 
     /** 联系人手机号 */
-    @Prop({ required: true })
+    @Column()
     phone: string;
 
     /** 联系人身份证号 */
-    @Prop({ required: true })
+    @Column()
     idCard: string;
 
     /** 预约日期 */
-    @Prop({ required: true, index: true })
+    @Column({ type: 'date' })
+    @Index()
     bookingDate: Date;
 
     /** 预约时间段 (上午/下午) */
-    @Prop({ required: true, enum: TimeSlot })
+    @Column({ type: 'varchar' })
     timeSlot: TimeSlot;
 
     /** 出行方式 */
-    @Prop({ required: true, enum: TravelMode })
+    @Column({ type: 'varchar' })
     travelMode: TravelMode;
 
     /** 车牌号 (自驾时必填) */
-    @Prop({ index: true })
+    @Column({ nullable: true })
+    @Index()
     licensePlate?: string;
 
     /** 车辆类型 (自驾时必填) */
-    @Prop({ enum: VehicleType })
+    @Column({ type: 'varchar', nullable: true })
     vehicleType?: VehicleType;
 
     /** 旅游团名称 (旅游团时必填) */
-    @Prop()
+    @Column({ nullable: true })
     tourGroupName?: string;
 
     /** 旅游团订单编号 (旅游团时必填) */
-    @Prop()
+    @Column({ nullable: true })
     tourOrderNumber?: string;
 
     /** 预约人数 */
-    @Prop({ required: true, min: 1 })
+    @Column()
     personCount: number;
 
     /** 备注信息 */
-    @Prop({ default: '' })
-    remarks?: string;
+    @Column({ default: '' })
+    remarks: string;
 
     /** 订单状态 */
-    @Prop({ default: "none", enum: BookingStatus, index: true })
+    @Column({ type: 'varchar', default: 'none' })
+    @Index()
     status: BookingStatus;
 
     /** 创建时间 */
-    @Prop({ default: Date.now })
+    @CreateDateColumn()
     createdAt: Date;
 
     /** 更新时间 */
-    @Prop()
-    updatedAt?: Date;
+    @UpdateDateColumn()
+    updatedAt: Date;
 }
-
-export const BookingSchema = SchemaFactory.createForClass(Booking);
-
-// 创建复合索引以优化常见查询
-BookingSchema.index({ wechatOpenId: 1, status: 1 }); // 按用户和状态查询
-BookingSchema.index({ bookingDate: 1, timeSlot: 1 }); // 按日期和时间段查询
-BookingSchema.index({ licensePlate: 1 }); // 按车牌号查询

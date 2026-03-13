@@ -1,7 +1,4 @@
-import { Prop, Schema, SchemaFactory } from '@nestjs/mongoose';
-import { HydratedDocument } from 'mongoose';
-
-export type SystemConfigDocument = HydratedDocument<SystemConfig>;
+import { Entity, Column, PrimaryGeneratedColumn, CreateDateColumn, UpdateDateColumn } from 'typeorm';
 
 /**
  * 轮播图配置项
@@ -31,37 +28,60 @@ export interface TimeSlotLimit {
  * 系统配置实体
  * 使用单文档模式存储所有系统配置
  */
-@Schema({ timestamps: true })
+@Entity('system_configs')
 export class SystemConfig {
+    @PrimaryGeneratedColumn()
+    id: number;
+
     /** 配置ID (固定为 'system_config') */
-    @Prop({ required: true, unique: true, default: 'system_config' })
+    @Column({ unique: true, default: 'system_config' })
     configId: string;
 
     /** 是否允许预约 */
-    @Prop({ required: true, default: true })
+    @Column({ default: true })
     bookingEnabled: boolean;
 
-    /** 轮播图配置 */
-    @Prop({ type: Array, default: [] })
-    banners: BannerItem[];
+    /** 轮播图配置 (JSON 存储) */
+    @Column({ type: 'text', default: '[]' })
+    bannersJson: string;
 
-    /** 时间段预约人数限制 */
-    @Prop({
-        type: Object,
-        default: {
-            morningMaxPeople: 100,
-            afternoonMaxPeople: 100,
-        },
+    /** 时间段预约人数限制 (JSON 存储) */
+    @Column({
+        type: 'text',
+        default: '{"morningMaxPeople":100,"afternoonMaxPeople":100}',
     })
-    timeSlotLimit: TimeSlotLimit;
+    timeSlotLimitJson: string;
 
     /** 创建时间 */
-    @Prop({ default: Date.now })
+    @CreateDateColumn()
     createdAt: Date;
 
     /** 更新时间 */
-    @Prop()
-    updatedAt?: Date;
-}
+    @UpdateDateColumn()
+    updatedAt: Date;
 
-export const SystemConfigSchema = SchemaFactory.createForClass(SystemConfig);
+    // 虚拟属性 getter/setter
+    get banners(): BannerItem[] {
+        try {
+            return JSON.parse(this.bannersJson || '[]');
+        } catch {
+            return [];
+        }
+    }
+
+    set banners(value: BannerItem[]) {
+        this.bannersJson = JSON.stringify(value || []);
+    }
+
+    get timeSlotLimit(): TimeSlotLimit {
+        try {
+            return JSON.parse(this.timeSlotLimitJson || '{"morningMaxPeople":100,"afternoonMaxPeople":100}');
+        } catch {
+            return { morningMaxPeople: 100, afternoonMaxPeople: 100 };
+        }
+    }
+
+    set timeSlotLimit(value: TimeSlotLimit) {
+        this.timeSlotLimitJson = JSON.stringify(value);
+    }
+}

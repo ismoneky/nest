@@ -1,36 +1,35 @@
-import { Prop, Schema, SchemaFactory } from '@nestjs/mongoose';
-import { HydratedDocument } from 'mongoose';
-
-export type AdminDocument = HydratedDocument<Admin>;
+import { Entity, Column, PrimaryGeneratedColumn, CreateDateColumn, UpdateDateColumn, Index } from 'typeorm';
 
 /**
  * 管理员实体
  */
-@Schema({ timestamps: true })
+@Entity('admins')
 export class Admin {
+    @PrimaryGeneratedColumn()
+    id: number;
+
     /** 管理员用户名 (唯一) */
-    @Prop({ required: true, unique: true, index: true })
+    @Column({ unique: true })
+    @Index()
     username: string;
 
     /** 密码 (加密存储) */
-    @Prop({ required: true })
+    @Column()
     password: string;
 
     /** 管理员姓名 */
-    @Prop({ required: true })
+    @Column()
     name: string;
 
     /** 最后登录时间 */
-    @Prop()
+    @Column({ type: 'datetime', nullable: true })
     lastLoginAt?: Date;
 
     /** 创建时间 */
-    @Prop({ default: Date.now })
+    @CreateDateColumn()
     createdAt: Date;
 
     /** 更新时间 */
-    @Prop()
-    updatedAt?: Date;
+    @UpdateDateColumn()
+    updatedAt: Date;
 }
-
-export const AdminSchema = SchemaFactory.createForClass(Admin);

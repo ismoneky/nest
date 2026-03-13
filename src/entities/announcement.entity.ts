@@ -1,43 +1,42 @@
-import { Prop, Schema, SchemaFactory } from '@nestjs/mongoose';
-import { HydratedDocument } from 'mongoose';
-
-export type AnnouncementDocument = HydratedDocument<Announcement>;
+import { Entity, Column, PrimaryGeneratedColumn, CreateDateColumn, UpdateDateColumn, Index } from 'typeorm';
 
 /**
  * 公告实体
  */
-@Schema({ timestamps: true })
+@Entity('announcements')
+@Index(['isActive', 'sortOrder']) // 复合索引
 export class Announcement {
+    @PrimaryGeneratedColumn()
+    id: number;
+
     /** 公告ID (UUID) */
-    @Prop({ required: true, unique: true, index: true })
+    @Column({ unique: true })
+    @Index()
     announcementId: string;
 
     /** 公告标题 */
-    @Prop({ required: true })
+    @Column()
     title: string;
 
     /** 公告内容 */
-    @Prop({ required: true })
+    @Column('text')
     content: string;
 
     /** 是否启用 */
-    @Prop({ default: true, index: true })
+    @Column({ default: true })
+    @Index()
     isActive: boolean;
 
     /** 排序顺序 (数字越小越靠前) */
-    @Prop({ default: 0, index: true })
+    @Column({ default: 0 })
+    @Index()
     sortOrder: number;
 
     /** 创建时间 */
-    @Prop({ default: Date.now })
+    @CreateDateColumn()
     createdAt: Date;
 
     /** 更新时间 */
-    @Prop()
-    updatedAt?: Date;
+    @UpdateDateColumn()
+    updatedAt: Date;
 }
-
-export const AnnouncementSchema = SchemaFactory.createForClass(Announcement);
-
-// 创建复合索引
-AnnouncementSchema.index({ isActive: 1, sortOrder: 1 });

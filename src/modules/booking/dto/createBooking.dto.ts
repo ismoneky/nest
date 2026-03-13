@@ -67,7 +67,7 @@ export class CreateBookingDto {
     @ValidateIf((o) => o.travelMode === TravelMode.TOUR_GROUP)
     @IsString()
     @IsNotEmpty({ message: 'Tour order number is required for tour group mode' })
-    tourNumber?: string;
+    tourOrderNumber?: string;
 
     /** 预约人数 (≥1) */
     @IsInt()

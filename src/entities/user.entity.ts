@@ -1,27 +1,27 @@
-import { Prop, Schema, SchemaFactory } from '@nestjs/mongoose';
-import { HydratedDocument } from 'mongoose';
+import { Entity, Column, PrimaryGeneratedColumn, CreateDateColumn, UpdateDateColumn, Index } from 'typeorm';
 
-export type UserDocument = HydratedDocument<User>;
-
-@Schema({ timestamps: true })
+@Entity('users')
 export class User {
-    @Prop({ required: true, unique: true })
+    @PrimaryGeneratedColumn()
+    id: number;
+
+    @Column({ unique: true })
+    @Index()
     userId: string;
 
-    @Prop({ required: true, unique: true })
+    @Column({ unique: true })
+    @Index()
     wechatOpenId: string;
 
-    @Prop({ required: true })
+    @Column()
     wechatNickname: string;
 
-    @Prop()
+    @Column({ nullable: true })
     wechatAvatarUrl?: string;
 
-    @Prop({ default: Date.now })
+    @CreateDateColumn()
     createdAt: Date;
 
-    @Prop()
-    updatedAt?: Date;
+    @UpdateDateColumn()
+    updatedAt: Date;
 }
-
-export const UserSchema = SchemaFactory.createForClass(User);
