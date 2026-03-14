@@ -37,7 +37,7 @@ export class CreateBookingDto {
     @IsNotEmpty()
     timeSlot: TimeSlot;
 
-    /** 出行方式 (scenic_bus/self_driving/tour_group) */
+    /** 出行方式 (scenicBus/selfDriving/tourGroup) */
     @IsEnum(TravelMode)
     @IsNotEmpty()
     travelMode: TravelMode;

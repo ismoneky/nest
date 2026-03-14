@@ -29,14 +29,16 @@ async function bootstrap() {
     }),
   );
 
-  // 启用 CORS
-  app.enableCors({
-    origin: 'http://localhost:5173', // 替换为前端项目的实际地址
-    methods: 'GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS',
-    allowedHeaders: 'Content-Type, Accept, Authorization',
-  });
-
   const config = new ConfigService();
-  await app.listen(await config.getPortConfig());
+
+  // 启用 CORS（从配置文件读取）
+  const corsConfig = config.getCorsConfig();
+  app.enableCors(corsConfig);
+
+  const port = await config.getPortConfig();
+  await app.listen(port);
+
+  console.log(`Application is running on: http://localhost:${port}`);
+  console.log(`Environment: ${config.isProduction() ? 'production' : 'development'}`);
 }
 bootstrap();

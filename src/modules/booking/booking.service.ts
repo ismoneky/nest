@@ -105,13 +105,7 @@ export class BookingService {
 
         // 1. 处理之前日期的未完成订单
         try {
-            await this.bookingRepository.updateBookings(
-                {
-                    bookingDate: { $lt: todayStart },
-                    status: { $nin: [BookingStatus.COMPLETED, BookingStatus.CANCELLED] },
-                },
-                { status: BookingStatus.COMPLETED }
-            );
+            await this.bookingRepository.updatePastBookings(todayStart);
         } catch (error) {
             this.logger.error('Error updating past bookings', error);
         }
@@ -119,14 +113,7 @@ export class BookingService {
         // 2. 处理今天上午过期的订单 (12:00后)
         if (now.getHours() >= 12) {
             try {
-                await this.bookingRepository.updateBookings(
-                    {
-                        bookingDate: todayStart,
-                        timeSlot: TimeSlot.MORNING,
-                        status: { $nin: [BookingStatus.COMPLETED, BookingStatus.CANCELLED] },
-                    },
-                    { status: BookingStatus.COMPLETED }
-                );
+                await this.bookingRepository.updateExpiredBookings(todayStart, TimeSlot.MORNING);
             } catch (error) {
                 this.logger.error('Error updating morning bookings', error);
             }
@@ -135,14 +122,7 @@ export class BookingService {
         // 3. 处理今天下午过期的订单 (18:00后)
         if (now.getHours() >= 18) {
             try {
-                await this.bookingRepository.updateBookings(
-                    {
-                        bookingDate: todayStart,
-                        timeSlot: TimeSlot.AFTERNOON,
-                        status: { $nin: [BookingStatus.COMPLETED, BookingStatus.CANCELLED] },
-                    },
-                    { status: BookingStatus.COMPLETED }
-                );
+                await this.bookingRepository.updateExpiredBookings(todayStart, TimeSlot.AFTERNOON);
             } catch (error) {
                 this.logger.error('Error updating afternoon bookings', error);
             }

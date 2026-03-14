@@ -52,6 +52,21 @@ export class BookingController {
     }
 
     /**
+     * 统计指定日期的预约人数
+     * GET /bookings/stats/by-date?bookingDate=2024-03-15
+     * @param query 查询条件 (包含预约日期)
+     * @param res Express 响应对象
+     */
+    @Get('stats/by-date')
+    async getBookingStatsByDate(@Query() query: GetBookingStatsDto, @Res() res: Response) {
+        const stats = await this.bookingService.getBookingStatsByDate(query.bookingDate);
+        return res.status(HttpStatus.OK).send({
+            success: true,
+            data: stats,
+        });
+    }
+
+    /**
      * 根据订单ID查询订单详情
      * GET /bookings/:bookingId
      * @param bookingId 订单ID (UUID)
@@ -95,21 +110,6 @@ export class BookingController {
         return res.status(HttpStatus.OK).send({
             success: true,
             message: 'Booking deleted successfully',
-        });
-    }
-
-    /**
-     * 统计指定日期的预约人数
-     * GET /bookings/stats/by-date?bookingDate=2024-03-15
-     * @param query 查询条件 (包含预约日期)
-     * @param res Express 响应对象
-     */
-    @Get('stats/by-date')
-    async getBookingStatsByDate(@Query() query: GetBookingStatsDto, @Res() res: Response) {
-        const stats = await this.bookingService.getBookingStatsByDate(query.bookingDate);
-        return res.status(HttpStatus.OK).send({
-            success: true,
-            data: stats,
         });
     }
 }

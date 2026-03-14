@@ -1,7 +1,7 @@
 import { Injectable, InternalServerErrorException, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, Between, Not } from 'typeorm';
-import { Booking } from '../entities/booking.entity';
+import { Booking, BookingStatus, TimeSlot } from '../entities/booking.entity';
 import { CreateBookingDto } from '../modules/booking/dto/createBooking.dto';
 import { GetBookingsDto } from '../modules/booking/dto/getBookings.dto';
 import { UpdateBookingDto } from '../modules/booking/dto/updateBooking.dto';
@@ -213,9 +213,33 @@ export class BookingRepository {
     }
 
     /**
-     * 更新指定条件的订单
+     * 更新过去日期的未完成订单为已完成状态
      */
-    async updateBookings(filter: any, update: any) {
-        return await this.bookingRepository.update(filter, update);
+    async updatePastBookings(todayStart: Date) {
+        return await this.bookingRepository
+            .createQueryBuilder()
+            .update(Booking)
+            .set({ status: BookingStatus.COMPLETED })
+            .where('bookingDate < :todayStart', { todayStart })
+            .andWhere('status NOT IN (:...statuses)', {
+                statuses: [BookingStatus.COMPLETED, BookingStatus.CANCELLED]
+            })
+            .execute();
+    }
+
+    /**
+     * 更新指定日期和时间段的过期订单为已完成状态
+     */
+    async updateExpiredBookings(bookingDate: Date, timeSlot: TimeSlot) {
+        return await this.bookingRepository
+            .createQueryBuilder()
+            .update(Booking)
+            .set({ status: BookingStatus.COMPLETED })
+            .where('bookingDate = :bookingDate', { bookingDate })
+            .andWhere('timeSlot = :timeSlot', { timeSlot })
+            .andWhere('status NOT IN (:...statuses)', {
+                statuses: [BookingStatus.COMPLETED, BookingStatus.CANCELLED]
+            })
+            .execute();
     }
 }
