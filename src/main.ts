@@ -36,7 +36,7 @@ async function bootstrap() {
   app.enableCors(corsConfig);
 
   const port = await config.getPortConfig();
-  await app.listen(port);
+  await app.listen(port, "0.0.0.0");
 
   console.log(`Application is running on: http://localhost:${port}`);
   console.log(`Environment: ${config.isProduction() ? 'production' : 'development'}`);
