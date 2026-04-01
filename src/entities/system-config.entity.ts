@@ -25,6 +25,14 @@ export interface TimeSlotLimit {
 }
 
 /**
+ * 支付配置
+ */
+export interface PaymentConfig {
+    /** 支付金额 */
+    paymentAmount: number;
+}
+
+/**
  * 系统配置实体
  * 使用单文档模式存储所有系统配置
  */
@@ -41,6 +49,10 @@ export class SystemConfig {
     @Column({ default: true })
     bookingEnabled: boolean;
 
+    /** 禁止预约时的展示文案 */
+    @Column({ type: 'text', default: '当前时间段暂不开放预约，请稍后再试' })
+    bookingDisabledMessage: string;
+
     /** 轮播图配置 (JSON 存储) */
     @Column({ type: 'text', default: '[]' })
     bannersJson: string;
@@ -51,6 +63,13 @@ export class SystemConfig {
         default: '{"morningMaxPeople":100,"afternoonMaxPeople":100}',
     })
     timeSlotLimitJson: string;
+
+    /** 支付配置 (JSON 存储) */
+    @Column({
+        type: 'text',
+        default: '{"paymentAmount":0}',
+    })
+    paymentConfigJson: string;
 
     /** 创建时间 */
     @CreateDateColumn()
@@ -83,5 +102,17 @@ export class SystemConfig {
 
     set timeSlotLimit(value: TimeSlotLimit) {
         this.timeSlotLimitJson = JSON.stringify(value);
+    }
+
+    get paymentConfig(): PaymentConfig {
+        try {
+            return JSON.parse(this.paymentConfigJson || '{"paymentAmount":0}');
+        } catch {
+            return { paymentAmount: 0 };
+        }
+    }
+
+    set paymentConfig(value: PaymentConfig) {
+        this.paymentConfigJson = JSON.stringify(value);
     }
 }

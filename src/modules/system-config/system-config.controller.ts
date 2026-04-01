@@ -62,4 +62,30 @@ export class SystemConfigController {
             data: limit,
         });
     }
+
+    /**
+     * 获取支付配置
+     * GET /system-config/payment-config
+     */
+    @Get('payment-config')
+    async getPaymentConfig(@Res() res: Response) {
+        const paymentConfig = await this.configService.getPaymentConfig();
+        return res.status(HttpStatus.OK).send({
+            success: true,
+            data: paymentConfig,
+        });
+    }
+
+    /**
+     * 获取禁止预约时的展示文案
+     * GET /system-config/booking-disabled-message
+     */
+    @Get('booking-disabled-message')
+    async getBookingDisabledMessage(@Res() res: Response) {
+        const message = await this.configService.getBookingDisabledMessage();
+        return res.status(HttpStatus.OK).send({
+            success: true,
+            data: { bookingDisabledMessage: message },
+        });
+    }
 }

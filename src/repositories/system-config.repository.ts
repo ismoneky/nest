@@ -28,8 +28,10 @@ export class SystemConfigRepository {
                 config = this.configRepository.create({
                     configId: 'system_config',
                     bookingEnabled: true,
+                    bookingDisabledMessage: '当前时间段暂不开放预约，请稍后再试',
                     bannersJson: '[]',
                     timeSlotLimitJson: '{"morningMaxPeople":1000,"afternoonMaxPeople":1000}',
+                    paymentConfigJson: '{"paymentAmount":0}',
                 });
                 await this.configRepository.save(config);
             }
@@ -87,6 +89,30 @@ export class SystemConfigRepository {
             return config.timeSlotLimit;
         } catch (error) {
             throw new InternalServerErrorException(error instanceof Error ? error.message : 'Failed to get time slot limit');
+        }
+    }
+
+    /**
+     * 获取支付配置
+     */
+    async getPaymentConfig() {
+        try {
+            const config = await this.getConfig();
+            return config.paymentConfig;
+        } catch (error) {
+            throw new InternalServerErrorException(error instanceof Error ? error.message : 'Failed to get payment config');
+        }
+    }
+
+    /**
+     * 获取禁止预约时的展示文案
+     */
+    async getBookingDisabledMessage() {
+        try {
+            const config = await this.getConfig();
+            return config.bookingDisabledMessage;
+        } catch (error) {
+            throw new InternalServerErrorException(error instanceof Error ? error.message : 'Failed to get booking disabled message');
         }
     }
 }

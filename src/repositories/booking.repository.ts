@@ -1,7 +1,7 @@
 import { Injectable, InternalServerErrorException, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, Between, Not } from 'typeorm';
-import { Booking, BookingStatus, TimeSlot } from '../entities/booking.entity';
+import { Repository, Between, Not, LessThan } from 'typeorm';
+import { Booking, BookingStatus, TimeSlot, PaymentStatus, RefundStatus } from '../entities/booking.entity';
 import { CreateBookingDto } from '../modules/booking/dto/createBooking.dto';
 import { GetBookingsDto } from '../modules/booking/dto/getBookings.dto';
 import { UpdateBookingDto } from '../modules/booking/dto/updateBooking.dto';
@@ -22,7 +22,7 @@ export class BookingRepository {
      * @param createBookingDto 创建订单数据传输对象
      * @returns 创建的订单实体
      */
-    async createBooking(createBookingDto: CreateBookingDto): Promise<Booking> {
+    async createBooking(createBookingDto: any): Promise<Booking> {
         try {
             // 生成以 TL 开头的 11 位随机字符订单号
             const generateBookingId = () => `TL${randomUUID().replace(/-/g, '').substring(0, 11).toUpperCase()}`;
@@ -33,7 +33,8 @@ export class BookingRepository {
                 bookingDate: new Date(createBookingDto.bookingDate),
             });
 
-            return await this.bookingRepository.save(booking);
+            const savedBooking = await this.bookingRepository.save(booking);
+            return Array.isArray(savedBooking) ? savedBooking[0] : savedBooking;
         } catch (error) {
             throw new InternalServerErrorException(error instanceof Error ? error.message : 'Failed to create booking');
         }
@@ -241,5 +242,150 @@ export class BookingRepository {
                 statuses: [BookingStatus.COMPLETED, BookingStatus.CANCELLED]
             })
             .execute();
+    }
+
+    /**
+     * 更新支付状态
+     * @param bookingId 订单ID
+     * @param paymentStatus 支付状态
+     * @param outTradeNo 商户订单号
+     * @param status 订单状态
+     */
+    async updatePaymentStatus(
+        bookingId: string,
+        paymentStatus: PaymentStatus,
+        outTradeNo?: string,
+        status?: BookingStatus
+    ) {
+        try {
+            const booking = await this.getBookingById(bookingId);
+            
+            booking.paymentStatus = paymentStatus;
+            if (outTradeNo) {
+                booking.outTradeNo = outTradeNo;
+            }
+            if (status) {
+                booking.status = status;
+            }
+            
+            return await this.bookingRepository.save(booking);
+        } catch (error) {
+            if (error instanceof NotFoundException) {
+                throw error;
+            }
+            throw new InternalServerErrorException(error instanceof Error ? error.message : 'Failed to update payment status');
+        }
+    }
+
+    /**
+     * 根据商户订单号更新支付状态
+     * @param outTradeNo 商户订单号
+     * @param paymentStatus 支付状态
+     * @param status 订单状态
+     * @param transactionId 微信支付订单号
+     * @param paidAt 支付时间
+     */
+    async updatePaymentStatusByOutTradeNo(
+        outTradeNo: string,
+        paymentStatus: PaymentStatus,
+        status: BookingStatus,
+        transactionId: string,
+        paidAt: Date
+    ) {
+        try {
+            return await this.bookingRepository
+                .createQueryBuilder()
+                .update(Booking)
+                .set({
+                    paymentStatus,
+                    status,
+                    transactionId,
+                    paidAt,
+                })
+                .where('outTradeNo = :outTradeNo', { outTradeNo })
+                .execute();
+        } catch (error) {
+            throw new InternalServerErrorException(error instanceof Error ? error.message : 'Failed to update payment status by outTradeNo');
+        }
+    }
+
+    /**
+     * 更新退款状态
+     * @param bookingId 订单ID
+     * @param refundStatus 退款状态
+     * @param outRefundNo 退款单号
+     */
+    async updateRefundStatus(
+        bookingId: string,
+        refundStatus: RefundStatus,
+        outRefundNo?: string
+    ) {
+        try {
+            const booking = await this.getBookingById(bookingId);
+            
+            booking.refundStatus = refundStatus;
+            if (outRefundNo) {
+                // 这里可以添加退款单号字段
+            }
+            
+            if (refundStatus === RefundStatus.REFUNDED) {
+                booking.status = BookingStatus.REFUNDED;
+                booking.refundedAt = new Date();
+            }
+            
+            return await this.bookingRepository.save(booking);
+        } catch (error) {
+            if (error instanceof NotFoundException) {
+                throw error;
+            }
+            throw new InternalServerErrorException(error instanceof Error ? error.message : 'Failed to update refund status');
+        }
+    }
+
+    /**
+     * 更新支付超时订单
+     * @param now 当前时间
+     */
+    async updatePaymentTimeoutOrders(now: Date) {
+        try {
+            return await this.bookingRepository
+                .createQueryBuilder()
+                .update(Booking)
+                .set({
+                    status: BookingStatus.CANCELLED,
+                    paymentStatus: PaymentStatus.UNPAID,
+                })
+                .where('paymentExpiredAt < :now', { now })
+                .andWhere('paymentStatus IN (:...statuses)', {
+                    statuses: [PaymentStatus.UNPAID, PaymentStatus.PAYING]
+                })
+                .execute();
+        } catch (error) {
+            throw new InternalServerErrorException(error instanceof Error ? error.message : 'Failed to update payment timeout orders');
+        }
+    }
+
+    /**
+     * 根据商户订单号查询订单
+     * @param outTradeNo 商户订单号
+     * @returns 订单实体
+     */
+    async getBookingByOutTradeNo(outTradeNo: string): Promise<Booking> {
+        try {
+            const booking = await this.bookingRepository.findOne({
+                where: { outTradeNo },
+            });
+
+            if (!booking) {
+                throw new NotFoundException(`Booking with outTradeNo ${outTradeNo} not found`);
+            }
+
+            return booking;
+        } catch (error) {
+            if (error instanceof NotFoundException) {
+                throw error;
+            }
+            throw new InternalServerErrorException(error instanceof Error ? error.message : 'Failed to get booking by outTradeNo');
+        }
     }
 }

@@ -86,4 +86,11 @@ export class ConfigService {
     public isDevelopment(): boolean {
         return this.get('NODE_ENV') === 'development';
     }
+
+    public getApiBaseUrl(): string {
+        const protocol = this.get('API_PROTOCOL') || 'http';
+        const host = this.get('API_HOST') || 'localhost';
+        const port = this.get('PORT') || '3000';
+        return `${protocol}://${host}:${port}`;
+    }
 }

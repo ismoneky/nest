@@ -10,6 +10,7 @@ import { AnnouncementModule } from './modules/announcement/announcement.module';
 import { BookingModule } from './modules/booking/booking.module';
 import { SystemConfigModule } from './modules/system-config/system-config.module';
 import { UserModule } from './modules/user/user.module';
+import { WechatPayModule } from './modules/wechat-pay/wechat-pay.module';
 
 // 导入所有实体
 import { User } from './entities/user.entity';
@@ -35,6 +36,7 @@ import { SystemConfig } from './entities/system-config.entity';
         AdminModule,
         AnnouncementModule,
         SystemConfigModule,
+        WechatPayModule,
     ],
     controllers: [AppController],
     providers: [AppService],

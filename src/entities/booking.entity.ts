@@ -30,8 +30,33 @@ export enum VehicleType {
  */
 export enum BookingStatus {
     NONE = 'none', // 无状态 (默认值)
+    PENDING_PAYMENT = 'pending_payment', // 待支付
+    PAYING = 'paying', // 支付中
+    PAID = 'paid', // 已支付
     CANCELLED = 'cancelled', // 已取消
     COMPLETED = 'completed', // 已完成
+    REFUNDED = 'refunded', // 已退款
+}
+
+/**
+ * 支付状态枚举
+ */
+export enum PaymentStatus {
+    UNPAID = 'unpaid', // 未支付
+    PAYING = 'paying', // 支付中
+    PAID = 'paid', // 已支付
+    REFUNDING = 'refunding', // 退款中
+    REFUNDED = 'refunded', // 已退款
+}
+
+/**
+ * 退款状态枚举
+ */
+export enum RefundStatus {
+    NONE = 'none', // 无
+    REFUNDING = 'refunding', // 退款中
+    REFUNDED = 'refunded', // 已退款
+    FAILED = 'failed', // 退款失败
 }
 
 /**
@@ -108,6 +133,42 @@ export class Booking {
     @Column({ type: 'varchar', default: 'none' })
     @Index()
     status: BookingStatus;
+
+    /** 支付状态 */
+    @Column({ type: 'varchar', default: 'unpaid' })
+    @Index()
+    paymentStatus: PaymentStatus;
+
+    /** 退款状态 */
+    @Column({ type: 'varchar', default: 'none' })
+    @Index()
+    refundStatus: RefundStatus;
+
+    /** 支付金额 (单位: 分) */
+    @Column({ type: 'int', nullable: true })
+    amount: number;
+
+    /** 微信支付订单号 */
+    @Column({ nullable: true })
+    @Index()
+    transactionId: string;
+
+    /** 商户订单号 (微信支付) */
+    @Column({ nullable: true })
+    @Index()
+    outTradeNo: string;
+
+    /** 支付时间 */
+    @Column({ type: 'datetime', nullable: true })
+    paidAt: Date;
+
+    /** 退款时间 */
+    @Column({ type: 'datetime', nullable: true })
+    refundedAt: Date;
+
+    /** 支付超时时间 */
+    @Column({ type: 'datetime', nullable: true })
+    paymentExpiredAt: Date;
 
     /** 创建时间 */
     @CreateDateColumn()

@@ -5,6 +5,7 @@ import { CreateBookingDto } from './dto/createBooking.dto';
 import { GetBookingsDto } from './dto/getBookings.dto';
 import { GetBookingStatsDto } from './dto/getBookingStats.dto';
 import { UpdateBookingDto } from './dto/updateBooking.dto';
+import { WechatPayService } from '../wechat-pay/wechat-pay.service';
 
 /**
  * 预约订单控制器
@@ -12,7 +13,10 @@ import { UpdateBookingDto } from './dto/updateBooking.dto';
  */
 @Controller('bookings')
 export class BookingController {
-    constructor(private readonly bookingService: BookingService) {}
+    constructor(
+        private readonly bookingService: BookingService,
+        private readonly wechatPayService: WechatPayService
+    ) {}
 
     /**
      * 创建预约订单
@@ -111,5 +115,76 @@ export class BookingController {
             success: true,
             message: 'Booking deleted successfully',
         });
+    }
+
+    /**
+     * 发起支付
+     * POST /bookings/:bookingId/pay
+     * @param bookingId 订单ID (UUID)
+     * @param res Express 响应对象
+     */
+    @Post(':bookingId/pay')
+    async payBooking(@Param('bookingId') bookingId: string, @Res() res: Response) {
+        try {
+            const paymentParams = await this.bookingService.initiatePayment(bookingId);
+            return res.status(HttpStatus.OK).send({
+                success: true,
+                message: 'Payment initiated successfully',
+                data: paymentParams,
+            });
+        } catch (error) {
+            return res.status(HttpStatus.BAD_REQUEST).send({
+                success: false,
+                message: 'Failed to initiate payment',
+                error: error.message,
+            });
+        }
+    }
+
+    /**
+     * 查询支付状态
+     * GET /bookings/:bookingId/pay-status
+     * @param bookingId 订单ID (UUID)
+     * @param res Express 响应对象
+     */
+    @Get(':bookingId/pay-status')
+    async getPaymentStatus(@Param('bookingId') bookingId: string, @Res() res: Response) {
+        try {
+            const status = await this.bookingService.getPaymentStatus(bookingId);
+            return res.status(HttpStatus.OK).send({
+                success: true,
+                data: status,
+            });
+        } catch (error) {
+            return res.status(HttpStatus.BAD_REQUEST).send({
+                success: false,
+                message: 'Failed to get payment status',
+                error: error.message,
+            });
+        }
+    }
+
+    /**
+     * 申请退款
+     * POST /bookings/:bookingId/refund
+     * @param bookingId 订单ID (UUID)
+     * @param res Express 响应对象
+     */
+    @Post(':bookingId/refund')
+    async refundBooking(@Param('bookingId') bookingId: string, @Res() res: Response) {
+        try {
+            const refundResult = await this.bookingService.initiateRefund(bookingId);
+            return res.status(HttpStatus.OK).send({
+                success: true,
+                message: 'Refund initiated successfully',
+                data: refundResult,
+            });
+        } catch (error) {
+            return res.status(HttpStatus.BAD_REQUEST).send({
+                success: false,
+                message: 'Failed to initiate refund',
+                error: error.message,
+            });
+        }
     }
 }

@@ -34,6 +34,15 @@ export class TimeSlotLimitDto {
 }
 
 /**
+ * 支付配置 DTO
+ */
+export class PaymentConfigDto {
+    @IsInt()
+    @Min(0)
+    paymentAmount: number;
+}
+
+/**
  * 更新系统配置 DTO
  */
 export class UpdateSystemConfigDto {
@@ -41,6 +50,11 @@ export class UpdateSystemConfigDto {
     @IsOptional()
     @IsBoolean()
     bookingEnabled?: boolean;
+
+    /** 禁止预约时的展示文案 */
+    @IsOptional()
+    @IsString()
+    bookingDisabledMessage?: string;
 
     /** 轮播图配置 */
     @IsOptional()
@@ -55,4 +69,11 @@ export class UpdateSystemConfigDto {
     @ValidateNested()
     @Type(() => TimeSlotLimitDto)
     timeSlotLimit?: TimeSlotLimitDto;
+
+    /** 支付配置 */
+    @IsOptional()
+    @IsObject()
+    @ValidateNested()
+    @Type(() => PaymentConfigDto)
+    paymentConfig?: PaymentConfigDto;
 }
