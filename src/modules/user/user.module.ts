@@ -4,13 +4,15 @@ import { JwtModule } from '@nestjs/jwt';
 import { TypeOrmModule } from '@nestjs/typeorm';
 
 import { User } from '../../entities/user.entity';
+import { AdminApplication } from '../../entities/admin-application.entity';
 import { UserRepository } from '../../repositories/user.repository';
+import { AdminApplicationRepository } from '../../repositories/admin-application.repository';
 import { UserController } from './user.controller';
 import { UserService } from './user.service';
 
 @Module({
     imports: [
-        TypeOrmModule.forFeature([User]),
+        TypeOrmModule.forFeature([User, AdminApplication]),
         HttpModule,
         JwtModule.register({
             secret: process.env.JWT_SECRET || 'default_jwt_secret_change_in_production',
@@ -18,7 +20,7 @@ import { UserService } from './user.service';
         }),
     ],
     controllers: [UserController],
-    providers: [UserService, UserRepository],
+    providers: [UserService, UserRepository, AdminApplicationRepository],
     exports: [UserService, UserRepository, JwtModule],
 })
 export class UserModule {}

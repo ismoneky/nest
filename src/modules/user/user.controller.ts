@@ -4,6 +4,7 @@ import { JwtService } from '@nestjs/jwt';
 import { firstValueFrom } from 'rxjs';
 import { Response } from 'express';
 import { UserService } from './user.service';
+import { AdminApplicationRepository } from '../../repositories/admin-application.repository';
 
 @Controller('users')
 export class UserController {
@@ -11,6 +12,7 @@ export class UserController {
         private readonly userService: UserService,
         private readonly httpService: HttpService,
         private readonly jwtService: JwtService,
+        private readonly adminApplicationRepository: AdminApplicationRepository,
     ) {}
 
     /**
@@ -51,9 +53,12 @@ export class UserController {
         // 签发 JWT，payload 中携带 openid 和 userId
         const token = this.jwtService.sign({ openid: user.wechatOpenId, userId: user.userId });
 
+        // 检查是否为已审批的管理员
+        const approvedApp = await this.adminApplicationRepository.findApprovedByOpenid(openid);
+
         return res.status(HttpStatus.OK).send({
             success: true,
-            data: { token },
+            data: { token, admin: !!approvedApp },
         });
     }
 }

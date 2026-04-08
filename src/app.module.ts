@@ -6,6 +6,7 @@ import { AppService } from './app.service';
 import { ConfigModule } from './config/config.module';
 import { ConfigService } from './config/config.service';
 import { AdminModule } from './modules/admin/admin.module';
+import { AdminApplicationModule } from './modules/admin-application/admin-application.module';
 import { AnnouncementModule } from './modules/announcement/announcement.module';
 import { BookingModule } from './modules/booking/booking.module';
 import { SystemConfigModule } from './modules/system-config/system-config.module';
@@ -18,6 +19,7 @@ import { Admin } from './entities/admin.entity';
 import { Booking } from './entities/booking.entity';
 import { Announcement } from './entities/announcement.entity';
 import { SystemConfig } from './entities/system-config.entity';
+import { AdminApplication } from './entities/admin-application.entity';
 
 @Module({
     imports: [
@@ -27,13 +29,14 @@ import { SystemConfig } from './entities/system-config.entity';
             inject: [ConfigService],
             useFactory: async (configService: ConfigService) => ({
                 ...(await configService.getDatabaseConfig()),
-                entities: [User, Admin, Booking, Announcement, SystemConfig],
+                entities: [User, Admin, Booking, Announcement, SystemConfig, AdminApplication],
             }),
         }),
         ScheduleModule.forRoot(),
         UserModule,
         BookingModule,
         AdminModule,
+        AdminApplicationModule,
         AnnouncementModule,
         SystemConfigModule,
         WechatPayModule,
