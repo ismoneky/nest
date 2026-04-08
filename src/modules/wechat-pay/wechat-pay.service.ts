@@ -1,9 +1,12 @@
 import { Injectable, BadRequestException, Logger } from '@nestjs/common';
+import { InjectRepository } from '@nestjs/typeorm';
+import { Repository } from 'typeorm';
 import { ConfigService } from '../../config/config.service';
+import { Booking, BookingStatus, PaymentStatus, RefundStatus } from '../../entities/booking.entity';
 import WechatPay from 'wechatpay-node-v3';
 import { readFileSync } from 'fs';
 import { join } from 'path';
-import { v4 as uuidv4 } from 'uuid';
+import { randomUUID, createSign } from 'crypto';
 
 /**
  * 微信支付服务
@@ -13,8 +16,14 @@ import { v4 as uuidv4 } from 'uuid';
 export class WechatPayService {
     private readonly logger = new Logger(WechatPayService.name);
     private wechatpay: any;
+    private privateKey: Buffer;
+    private appid: string;
 
-    constructor(private configService: ConfigService) {
+    constructor(
+        private configService: ConfigService,
+        @InjectRepository(Booking)
+        private readonly bookingRepository: Repository<Booking>,
+    ) {
         this.initWechatPay();
     }
 
@@ -35,6 +44,8 @@ export class WechatPayService {
             }
 
             const privateKey = readFileSync(join(__dirname, '../../..', privateKeyPath));
+            this.privateKey = privateKey;
+            this.appid = appid;
 
             this.wechatpay = new WechatPay({
                 appid,
@@ -65,10 +76,11 @@ export class WechatPayService {
         }
 
         try {
-            const outTradeNo = `BOOKING_${bookingId}_${Date.now()}_${uuidv4().substring(0, 8)}`;
+            // 微信 out_trade_no 最长 32 位：bookingId(13位) + 时间戳后6位 + 随机4位 = 23位
+            const outTradeNo = `${bookingId}${Date.now().toString().slice(-6)}${randomUUID().replace(/-/g, '').substring(0, 4)}`;
             const notifyUrl = `${this.configService.getApiBaseUrl()}/wechat-pay/notify`;
 
-            const result = await this.wechatpay.transactions.jsapi({
+            const result = await this.wechatpay.transactions_jsapi({
                 description,
                 out_trade_no: outTradeNo,
                 notify_url: notifyUrl,
@@ -81,11 +93,24 @@ export class WechatPayService {
                 },
             });
 
+            const timestamp = Math.floor(Date.now() / 1000).toString();
+            const nonceStr = randomUUID().replace(/-/g, '');
+            const prepayId = result.prepay_id;
+
+            // 按微信文档要求拼接签名串：appId\ntimeStamp\nnonceStr\npackage\n
+            const signStr = `${this.appid}\n${timestamp}\n${nonceStr}\nprepay_id=${prepayId}\n`;
+            const paySign = createSign('RSA-SHA256')
+                .update(signStr)
+                .sign(this.privateKey, 'base64');
+
             return {
                 outTradeNo,
-                prepayId: result.prepay_id,
-                timestamp: Math.floor(Date.now() / 1000).toString(),
-                nonceStr: uuidv4(),
+                appId: this.appid,
+                timeStamp: timestamp,
+                nonceStr,
+                package: `prepay_id=${prepayId}`,
+                signType: 'RSA',
+                paySign,
             };
         } catch (error) {
             this.logger.error('创建微信支付订单失败', error);
@@ -105,29 +130,36 @@ export class WechatPayService {
         }
 
         try {
-            const { resource, event_type, resource_type, trade_state } = body;
+            const { resource, event_type } = body;
 
-            if (event_type === 'TRANSACTION.SUCCESS' && trade_state === 'SUCCESS') {
+            if (event_type === 'TRANSACTION.SUCCESS') {
                 // 验证回调签名
                 const signature = headers['wechatpay-signature'];
                 const timestamp = headers['wechatpay-timestamp'];
                 const nonce = headers['wechatpay-nonce'];
                 const serialNo = headers['wechatpay-serial'];
+                const apiV3Key = process.env.WX_API_V3_KEY;
 
-                const isValid = this.wechatpay.verifyCallback(
-                    JSON.stringify(body),
-                    signature,
+                const isValid = await this.wechatpay.verifySign({
                     timestamp,
                     nonce,
-                    serialNo
-                );
+                    body,
+                    serial: serialNo,
+                    signature,
+                    apiSecret: apiV3Key,
+                });
 
                 if (!isValid) {
                     throw new BadRequestException('回调签名验证失败');
                 }
 
-                // 解密回调数据
-                const decryptedData = this.wechatpay.decryptResource(resource);
+                // 解密回调数据（resource 包含 ciphertext/associated_data/nonce）
+                const decryptedData = this.wechatpay.decipher_gcm(
+                    resource.ciphertext,
+                    resource.associated_data,
+                    resource.nonce,
+                    apiV3Key,
+                );
                 const { out_trade_no, transaction_id, trade_state: status, payer } = decryptedData;
 
                 return {
@@ -159,7 +191,7 @@ export class WechatPayService {
         }
 
         try {
-            const result = await this.wechatpay.refund.domestic({
+            const result = await this.wechatpay.refunds({
                 out_trade_no: outTradeNo,
                 out_refund_no: outRefundNo,
                 amount: {
@@ -188,7 +220,7 @@ export class WechatPayService {
         }
 
         try {
-            const result = await this.wechatpay.transactions.query({ out_trade_no: outTradeNo });
+            const result = await this.wechatpay.query({ out_trade_no: outTradeNo });
             return result;
         } catch (error) {
             this.logger.error('查询订单状态失败', error);
@@ -205,34 +237,93 @@ export class WechatPayService {
      * @param serialNo 证书序列号
      * @returns 是否有效
      */
-    verifyCallback(body: string, signature: string, timestamp: string, nonce: string, serialNo: string): boolean {
+    async verifyCallback(body: any, signature: string, timestamp: string, nonce: string, serialNo: string): Promise<boolean> {
         if (!this.wechatpay) {
             return false;
         }
 
         try {
-            return this.wechatpay.verifyCallback(body, signature, timestamp, nonce, serialNo);
+            return await this.wechatpay.verifySign({
+                timestamp,
+                nonce,
+                body,
+                serial: serialNo,
+                signature,
+                apiSecret: process.env.WX_API_V3_KEY,
+            });
         } catch (error) {
             this.logger.error('验证回调签名失败', error);
             return false;
         }
     }
 
-    /**
-     * 解密回调数据
-     * @param resource 加密的资源数据
-     * @returns 解密后的数据
-     */
     decryptResource(resource: any): any {
         if (!this.wechatpay) {
             throw new BadRequestException('微信支付客户端未初始化');
         }
 
         try {
-            return this.wechatpay.decryptResource(resource);
+            return this.wechatpay.decipher_gcm(
+                resource.ciphertext,
+                resource.associated_data,
+                resource.nonce,
+                process.env.WX_API_V3_KEY,
+            );
         } catch (error) {
             this.logger.error('解密回调数据失败', error);
             throw new BadRequestException('解密回调数据失败');
+        }
+    }
+
+    /**
+     * 处理支付成功回调，更新订单支付状态
+     * @param outTradeNo 商户订单号
+     * @param transactionId 微信支付订单号
+     * @param status 微信返回的支付状态
+     */
+    async handlePaymentSuccess(outTradeNo: string, transactionId: string): Promise<void> {
+        // 支付成功：paymentStatus → PAID，bookingStatus → CONFIRMED（预约正式生效）
+        await this.bookingRepository
+            .createQueryBuilder()
+            .update(Booking)
+            .set({
+                paymentStatus: PaymentStatus.PAID,
+                status: BookingStatus.CONFIRMED,
+                transactionId,
+                paidAt: new Date(),
+            })
+            .where('outTradeNo = :outTradeNo', { outTradeNo })
+            .execute();
+    }
+
+    /**
+     * 处理退款回调，更新订单退款状态
+     * @param outTradeNo 商户订单号
+     * @param refundStatus 微信返回的退款状态
+     */
+    async handleRefundCallback(outTradeNo: string, refundStatus: string): Promise<void> {
+        if (refundStatus === 'SUCCESS') {
+            await this.bookingRepository
+                .createQueryBuilder()
+                .update(Booking)
+                .set({
+                    refundStatus: RefundStatus.REFUNDED,
+                    status: BookingStatus.REFUNDED,
+                    refundedAt: new Date(),
+                })
+                .where('outTradeNo = :outTradeNo', { outTradeNo })
+                .execute();
+        } else if (refundStatus === 'FAILED') {
+            // 退款失败：refundStatus → FAILED，paymentStatus → FAILED
+            await this.bookingRepository
+                .createQueryBuilder()
+                .update(Booking)
+                .set({
+                    refundStatus: RefundStatus.FAILED,
+                    paymentStatus: PaymentStatus.FAILED,
+                })
+                .where('outTradeNo = :outTradeNo', { outTradeNo })
+                .execute();
         }
     }
 }

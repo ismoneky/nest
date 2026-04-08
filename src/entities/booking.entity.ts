@@ -26,27 +26,26 @@ export enum VehicleType {
 }
 
 /**
- * 订单状态枚举
+ * 订单状态枚举（描述预约本身的生命周期，与支付无关）
  */
 export enum BookingStatus {
-    NONE = 'none', // 无状态 (默认值)
-    PENDING_PAYMENT = 'pending_payment', // 待支付
-    PAYING = 'paying', // 支付中
-    PAID = 'paid', // 已支付
-    CANCELLED = 'cancelled', // 已取消
-    COMPLETED = 'completed', // 已完成
-    REFUNDED = 'refunded', // 已退款
+    PENDING = 'pending',       // 待确认（已创建，等待支付完成激活）
+    CONFIRMED = 'confirmed',   // 已确认（支付完成，预约生效）
+    COMPLETED = 'completed',   // 已完成（游览日期已过）
+    CANCELLED = 'cancelled',   // 已取消（支付超时或主动取消）
+    REFUNDED = 'refunded',     // 已退款
 }
 
 /**
- * 支付状态枚举
+ * 支付状态枚举（描述这笔钱的状态）
  */
 export enum PaymentStatus {
-    UNPAID = 'unpaid', // 未支付
-    PAYING = 'paying', // 支付中
-    PAID = 'paid', // 已支付
+    UNPAID = 'unpaid',       // 未支付
+    PAYING = 'paying',       // 支付中（已调起微信支付，等待回调）
+    PAID = 'paid',           // 已支付
     REFUNDING = 'refunding', // 退款中
-    REFUNDED = 'refunded', // 已退款
+    REFUNDED = 'refunded',   // 已退款
+    FAILED = 'failed',       // 退款失败
 }
 
 /**
@@ -130,7 +129,7 @@ export class Booking {
     remarks: string;
 
     /** 订单状态 */
-    @Column({ type: 'varchar', default: 'none' })
+    @Column({ type: 'varchar', default: 'pending' })
     @Index()
     status: BookingStatus;
 

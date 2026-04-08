@@ -7,11 +7,6 @@ import { BookingStatus, TimeSlot } from '../../../entities/booking.entity';
  * 支持分页和多条件筛选
  */
 export class GetBookingsDto {
-    /** 微信用户OpenID (筛选条件) */
-    @IsString()
-    @IsOptional()
-    wechatOpenId?: string;
-
     /** 预约日期 (筛选条件) */
     @IsDateString()
     @IsOptional()

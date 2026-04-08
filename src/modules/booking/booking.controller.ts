@@ -1,11 +1,11 @@
-import { Body, Controller, Delete, Get, HttpStatus, Param, Post, Put, Query, Res } from '@nestjs/common';
-import { Response } from 'express';
+import { Body, Controller, Delete, Get, HttpStatus, Param, Post, Put, Query, Req, Res, UseGuards } from '@nestjs/common';
+import { Request, Response } from 'express';
 import { BookingService } from './booking.service';
 import { CreateBookingDto } from './dto/createBooking.dto';
 import { GetBookingsDto } from './dto/getBookings.dto';
 import { GetBookingStatsDto } from './dto/getBookingStats.dto';
 import { UpdateBookingDto } from './dto/updateBooking.dto';
-import { WechatPayService } from '../wechat-pay/wechat-pay.service';
+import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 
 /**
  * 预约订单控制器
@@ -15,7 +15,6 @@ import { WechatPayService } from '../wechat-pay/wechat-pay.service';
 export class BookingController {
     constructor(
         private readonly bookingService: BookingService,
-        private readonly wechatPayService: WechatPayService
     ) {}
 
     /**
@@ -25,8 +24,10 @@ export class BookingController {
      * @param res Express 响应对象
      */
     @Post()
-    async createBooking(@Body() createBookingDto: CreateBookingDto, @Res() res: Response) {
-        const booking = await this.bookingService.createBooking(createBookingDto);
+    @UseGuards(JwtAuthGuard)
+    async createBooking(@Body() createBookingDto: CreateBookingDto, @Req() req: Request, @Res() res: Response) {
+        const { openid } = req['user'] as { openid: string };
+        const booking = await this.bookingService.createBooking({ ...createBookingDto, wechatOpenId: openid });
         return res.status(HttpStatus.OK).send({
             success: true,
             message: 'Booking created successfully',
@@ -41,8 +42,10 @@ export class BookingController {
      * @param res Express 响应对象
      */
     @Get()
-    async getBookings(@Query() query: GetBookingsDto, @Res() res: Response) {
-        const result = await this.bookingService.getBookings(query);
+    @UseGuards(JwtAuthGuard)
+    async getBookings(@Query() query: GetBookingsDto, @Req() req: Request, @Res() res: Response) {
+        const { openid } = req['user'] as { openid: string };
+        const result = await this.bookingService.getBookings({ ...query, wechatOpenId: openid });
         return res.status(HttpStatus.OK).send({
             success: true,
             data: result.bookings,
@@ -77,8 +80,10 @@ export class BookingController {
      * @param res Express 响应对象
      */
     @Get(':bookingId')
-    async getBookingById(@Param('bookingId') bookingId: string, @Res() res: Response) {
-        const booking = await this.bookingService.getBookingById(bookingId);
+    @UseGuards(JwtAuthGuard)
+    async getBookingById(@Param('bookingId') bookingId: string, @Req() req: Request, @Res() res: Response) {
+        const { openid } = req['user'] as { openid: string };
+        const booking = await this.bookingService.getBookingById(bookingId, openid);
         return res.status(HttpStatus.OK).send({
             success: true,
             data: booking,
@@ -124,9 +129,11 @@ export class BookingController {
      * @param res Express 响应对象
      */
     @Post(':bookingId/pay')
-    async payBooking(@Param('bookingId') bookingId: string, @Res() res: Response) {
+    @UseGuards(JwtAuthGuard)
+    async payBooking(@Param('bookingId') bookingId: string, @Req() req: Request, @Res() res: Response) {
         try {
-            const paymentParams = await this.bookingService.initiatePayment(bookingId);
+            const { openid } = req['user'] as { openid: string };
+            const paymentParams = await this.bookingService.initiatePayment(bookingId, openid);
             return res.status(HttpStatus.OK).send({
                 success: true,
                 message: 'Payment initiated successfully',
@@ -171,9 +178,11 @@ export class BookingController {
      * @param res Express 响应对象
      */
     @Post(':bookingId/refund')
-    async refundBooking(@Param('bookingId') bookingId: string, @Res() res: Response) {
+    @UseGuards(JwtAuthGuard)
+    async refundBooking(@Param('bookingId') bookingId: string, @Req() req: Request, @Res() res: Response) {
         try {
-            const refundResult = await this.bookingService.initiateRefund(bookingId);
+            const { openid } = req['user'] as { openid: string };
+            const refundResult = await this.bookingService.initiateRefund(bookingId, openid);
             return res.status(HttpStatus.OK).send({
                 success: true,
                 message: 'Refund initiated successfully',

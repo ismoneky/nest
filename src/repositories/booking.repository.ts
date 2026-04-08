@@ -112,7 +112,7 @@ export class BookingRepository {
      * @param query 查询条件 (包含分页参数)
      * @returns 订单实体数组和总数
      */
-    async getBookings(query: GetBookingsDto) {
+    async getBookings(query: GetBookingsDto & { wechatOpenId?: string }) {
         try {
             const where: any = {};
 
@@ -222,9 +222,7 @@ export class BookingRepository {
             .update(Booking)
             .set({ status: BookingStatus.COMPLETED })
             .where('bookingDate < :todayStart', { todayStart })
-            .andWhere('status NOT IN (:...statuses)', {
-                statuses: [BookingStatus.COMPLETED, BookingStatus.CANCELLED]
-            })
+            .andWhere('status = :status', { status: BookingStatus.CONFIRMED })
             .execute();
     }
 
@@ -238,9 +236,7 @@ export class BookingRepository {
             .set({ status: BookingStatus.COMPLETED })
             .where('bookingDate = :bookingDate', { bookingDate })
             .andWhere('timeSlot = :timeSlot', { timeSlot })
-            .andWhere('status NOT IN (:...statuses)', {
-                statuses: [BookingStatus.COMPLETED, BookingStatus.CANCELLED]
-            })
+            .andWhere('status = :status', { status: BookingStatus.CONFIRMED })
             .execute();
     }
 

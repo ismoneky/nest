@@ -5,11 +5,6 @@ import { TimeSlot, TravelMode, VehicleType } from '../../../entities/booking.ent
  * 创建预约订单 DTO
  */
 export class CreateBookingDto {
-    /** 微信用户OpenID */
-    @IsString()
-    @IsNotEmpty()
-    wechatOpenId: string;
-
     /** 联系人姓名 */
     @IsString()
     @IsNotEmpty()

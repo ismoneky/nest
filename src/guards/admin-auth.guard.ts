@@ -1,44 +1,19 @@
 import { CanActivate, ExecutionContext, Injectable, UnauthorizedException } from '@nestjs/common';
-import { AdminService } from '../modules/admin/admin.service';
 
 /**
  * 管理员认证守卫
- * 用于保护需要管理员权限的路由
+ * 通过请求头 x-admin-key 与环境变量 ADMIN_API_KEY 比对
  */
 @Injectable()
 export class AdminAuthGuard implements CanActivate {
-    constructor(private readonly adminService: AdminService) {}
-
-    async canActivate(context: ExecutionContext): Promise<boolean> {
+    canActivate(context: ExecutionContext): boolean {
         const request = context.switchToHttp().getRequest();
-        const token = this.extractTokenFromHeader(request);
+        const apiKey = request.headers['x-admin-key'];
 
-        if (!token) {
-            throw new UnauthorizedException('未提供认证令牌');
-        }
-
-        const isValid = await this.adminService.validateToken(token);
-
-        if (!isValid) {
-            throw new UnauthorizedException('认证令牌无效或已过期');
+        if (!apiKey || apiKey !== process.env.ADMIN_API_KEY) {
+            throw new UnauthorizedException('无效的管理员 API Key');
         }
 
         return true;
-    }
-
-    /**
-     * 从请求头中提取token
-     * @param request 请求对象
-     * @returns token字符串
-     */
-    private extractTokenFromHeader(request: any): string | undefined {
-        const authorization = request.headers.authorization;
-        if (!authorization) {
-            return undefined;
-        }
-
-        // 支持 "Bearer token" 格式
-        const [type, token] = authorization.split(' ');
-        return type === 'Bearer' ? token : undefined;
     }
 }

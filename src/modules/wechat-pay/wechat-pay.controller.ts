@@ -1,8 +1,6 @@
 import { Controller, Post, Body, Headers, HttpStatus, Res, Logger, BadRequestException } from '@nestjs/common';
 import { Response } from 'express';
 import { WechatPayService } from './wechat-pay.service';
-import { BookingService } from '../booking/booking.service';
-import { RefundStatus } from '../../entities/booking.entity';
 
 /**
  * 微信支付控制器
@@ -14,7 +12,6 @@ export class WechatPayController {
 
     constructor(
         private readonly wechatPayService: WechatPayService,
-        private readonly bookingService: BookingService
     ) {}
 
     /**
@@ -27,12 +24,10 @@ export class WechatPayController {
             const result = await this.wechatPayService.handlePaymentNotify(body, headers);
 
             if (result) {
-                // 更新订单状态
-                await this.bookingService.updatePaymentStatus(result.outTradeNo, result.transactionId, result.status);
+                await this.wechatPayService.handlePaymentSuccess(result.outTradeNo, result.transactionId);
                 this.logger.log(`支付回调处理成功: ${result.outTradeNo}`);
             }
 
-            // 返回成功响应给微信支付平台
             return res.status(HttpStatus.OK).send({
                 code: 'SUCCESS',
                 message: '成功',
@@ -56,13 +51,12 @@ export class WechatPayController {
             const { resource, event_type } = body;
 
             if (event_type === 'REFUND.SUCCESS') {
-                // 验证回调签名
                 const signature = headers['wechatpay-signature'];
                 const timestamp = headers['wechatpay-timestamp'];
                 const nonce = headers['wechatpay-nonce'];
                 const serialNo = headers['wechatpay-serial'];
 
-                const isValid = this.wechatPayService.verifyCallback(
+                const isValid = await this.wechatPayService.verifyCallback(
                     JSON.stringify(body),
                     signature,
                     timestamp,
@@ -74,24 +68,13 @@ export class WechatPayController {
                     throw new BadRequestException('回调签名验证失败');
                 }
 
-                // 解密回调数据
                 const decryptedData = this.wechatPayService.decryptResource(resource);
                 const { out_trade_no, refund_status } = decryptedData;
 
-                // 根据商户订单号查询订单
-                const booking = await this.bookingService.getBookingByOutTradeNo(out_trade_no);
-
-                // 更新退款状态
-                if (refund_status === 'SUCCESS') {
-                    await this.bookingService.updateRefundStatus(booking.bookingId, RefundStatus.REFUNDED);
-                    this.logger.log(`退款回调处理成功: ${out_trade_no}`);
-                } else if (refund_status === 'FAILED') {
-                    await this.bookingService.updateRefundStatus(booking.bookingId, RefundStatus.FAILED);
-                    this.logger.log(`退款回调处理失败: ${out_trade_no}`);
-                }
+                await this.wechatPayService.handleRefundCallback(out_trade_no, refund_status);
+                this.logger.log(`退款回调处理完成: ${out_trade_no}, 状态: ${refund_status}`);
             }
 
-            // 返回成功响应给微信支付平台
             return res.status(HttpStatus.OK).send({
                 code: 'SUCCESS',
                 message: '成功',

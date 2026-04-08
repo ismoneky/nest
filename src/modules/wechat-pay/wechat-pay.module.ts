@@ -1,8 +1,9 @@
 import { Module } from '@nestjs/common';
+import { TypeOrmModule } from '@nestjs/typeorm';
 import { WechatPayService } from './wechat-pay.service';
 import { WechatPayController } from './wechat-pay.controller';
 import { ConfigModule } from '../../config/config.module';
-import { BookingModule } from '../booking/booking.module';
+import { Booking } from '../../entities/booking.entity';
 
 /**
  * 微信支付模块
@@ -10,7 +11,7 @@ import { BookingModule } from '../booking/booking.module';
 @Module({
     imports: [
         ConfigModule,
-        BookingModule,
+        TypeOrmModule.forFeature([Booking]),
     ],
     controllers: [WechatPayController],
     providers: [WechatPayService],

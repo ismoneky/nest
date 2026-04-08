@@ -1,7 +1,8 @@
-import { Body, Controller, HttpStatus, Post, Res } from '@nestjs/common';
+import { Body, Controller, HttpStatus, Post, Res, UseGuards } from '@nestjs/common';
 import { Response } from 'express';
 import { AdminService } from './admin.service';
 import { LoginDto } from './dto/login.dto';
+import { AdminAuthGuard } from '../../common/guards/admin-jwt-auth.guard';
 
 /**
  * 管理员控制器

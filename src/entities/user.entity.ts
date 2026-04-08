@@ -13,8 +13,8 @@ export class User {
     @Index()
     wechatOpenId: string;
 
-    @Column()
-    wechatNickname: string;
+    @Column({ nullable: true })
+    wechatNickname?: string;
 
     @Column({ nullable: true })
     wechatAvatarUrl?: string;

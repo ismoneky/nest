@@ -27,7 +27,7 @@ export class BookingService {
      * @param createBookingDto 创建订单数据
      * @returns 创建的订单
      */
-    async createBooking(createBookingDto: CreateBookingDto) {
+    async createBooking(createBookingDto: CreateBookingDto & { wechatOpenId: string }) {
         // 检查是否允许预约
         const isBookingEnabled = await this.systemConfigService.isBookingEnabled();
         if (!isBookingEnabled) {
@@ -35,21 +35,13 @@ export class BookingService {
             throw new BadRequestException(disabledMessage);
         }
 
-        // 计算预约时间的具体时间点
-        const bookingDate = new Date(createBookingDto.bookingDate);
-        // 设置预约时间的完整日期和时间段
+        // 用 UTC 构造预约时间点，与定时任务的 todayStart 基准保持一致
         const [year, month, day] = createBookingDto.bookingDate.split('-').map(Number);
-        bookingDate.setFullYear(year, month - 1, day); // 设置预约日期
+        // 上午场次截止 UTC 04:00（北京时间 12:00），下午场次截止 UTC 10:00（北京时间 18:00）
+        const slotHourUTC = createBookingDto.timeSlot === TimeSlot.MORNING ? 4 : 10;
+        const bookingDate = new Date(Date.UTC(year, month - 1, day, slotHourUTC, 0, 0, 0));
 
-        if (createBookingDto.timeSlot === TimeSlot.MORNING) {
-            bookingDate.setHours(12, 0, 0, 0); // 上午 12:00
-        } else if (createBookingDto.timeSlot === TimeSlot.AFTERNOON) {
-            bookingDate.setHours(18, 0, 0, 0); // 下午 18:00
-        }
-
-        // 计算延迟时间（预约时间 - 当前时间）
-        const delay = bookingDate.getTime() - Date.now();
-        if (delay <= 0) {
+        if (bookingDate.getTime() <= Date.now()) {
             throw new BadRequestException('预约时间必须晚于当前时间');
         }
 
@@ -78,10 +70,10 @@ export class BookingService {
         const paymentExpiredAt = new Date();
         paymentExpiredAt.setMinutes(paymentExpiredAt.getMinutes() + 30);
 
-        // 创建订单，设置状态为待支付
+        // 创建订单，初始状态：预约待确认 + 未支付
         const booking = await this.bookingRepository.createBooking({
             ...createBookingDto,
-            status: BookingStatus.PENDING_PAYMENT,
+            status: BookingStatus.PENDING,
             paymentStatus: PaymentStatus.UNPAID,
             refundStatus: RefundStatus.NONE,
             amount,
@@ -115,8 +107,12 @@ export class BookingService {
      * @param bookingId 订单ID
      * @returns 订单详情
      */
-    async getBookingById(bookingId: string) {
-        return await this.bookingRepository.getBookingById(bookingId);
+    async getBookingById(bookingId: string, openid?: string) {
+        const booking = await this.bookingRepository.getBookingById(bookingId);
+        if (openid && booking.wechatOpenId !== openid) {
+            throw new BadRequestException('无权访问该订单');
+        }
+        return booking;
     }
 
     /**
@@ -124,7 +120,7 @@ export class BookingService {
      * @param query 查询条件 (包含分页参数)
      * @returns 订单列表和分页信息
      */
-    async getBookings(query: GetBookingsDto) {
+    async getBookings(query: GetBookingsDto & { wechatOpenId: string }) {
         return await this.bookingRepository.getBookings(query);
     }
 
@@ -187,10 +183,18 @@ export class BookingService {
      * @param bookingId 订单ID
      * @returns 支付参数
      */
-    async initiatePayment(bookingId: string) {
+    async initiatePayment(bookingId: string, openid: string) {
         const booking = await this.bookingRepository.getBookingById(bookingId);
         if (!booking) {
             throw new BadRequestException('订单不存在');
+        }
+
+        if (booking.wechatOpenId !== openid) {
+            throw new BadRequestException('无权操作该订单');
+        }
+
+        if (booking.status === BookingStatus.CANCELLED) {
+            throw new BadRequestException('订单已取消，无法支付');
         }
 
         if (booking.paymentStatus !== PaymentStatus.UNPAID) {
@@ -201,7 +205,7 @@ export class BookingService {
             throw new BadRequestException('支付已超时');
         }
 
-        // 创建支付订单
+        // 每次发起支付都重新下单，生成新的 outTradeNo
         const paymentParams = await this.wechatPayService.createPayment(
             booking.bookingId,
             booking.amount,
@@ -209,7 +213,7 @@ export class BookingService {
             booking.wechatOpenId
         );
 
-        // 更新订单状态为支付中
+        // 更新支付状态为支付中（bookingStatus 保持 PENDING，等待微信回调确认）
         await this.bookingRepository.updatePaymentStatus(
             bookingId,
             PaymentStatus.PAYING,
@@ -238,17 +242,28 @@ export class BookingService {
             };
         }
 
+        // 本地未支付但有微信订单号，主动查微信侧状态兜底
+        // 处理 notify 回调延迟导致本地状态滞后的情况
         if (booking.outTradeNo) {
             const orderStatus = await this.wechatPayService.queryOrder(booking.outTradeNo);
-            return {
-                status: booking.paymentStatus,
-                wechatStatus: orderStatus.trade_state,
-            };
+
+            if (orderStatus.trade_state === 'SUCCESS') {
+                // 微信侧已支付，主动同步本地状态（兜底，正常由 notify 回调更新）
+                await this.wechatPayService.handlePaymentSuccess(
+                    booking.outTradeNo,
+                    orderStatus.transaction_id,
+                );
+                return {
+                    status: PaymentStatus.PAID,
+                    paidAt: new Date(),
+                    transactionId: orderStatus.transaction_id,
+                };
+            }
+
+            return { status: booking.paymentStatus };
         }
 
-        return {
-            status: booking.paymentStatus,
-        };
+        return { status: booking.paymentStatus };
     }
 
     /**
@@ -256,10 +271,14 @@ export class BookingService {
      * @param bookingId 订单ID
      * @returns 退款结果
      */
-    async initiateRefund(bookingId: string) {
+    async initiateRefund(bookingId: string, openid: string) {
         const booking = await this.bookingRepository.getBookingById(bookingId);
         if (!booking) {
             throw new BadRequestException('订单不存在');
+        }
+
+        if (booking.wechatOpenId !== openid) {
+            throw new BadRequestException('无权操作该订单');
         }
 
         if (booking.paymentStatus !== PaymentStatus.PAID) {
@@ -299,10 +318,11 @@ export class BookingService {
      */
     async updatePaymentStatus(outTradeNo: string, transactionId: string, status: string) {
         if (status === 'SUCCESS') {
+            // 支付成功：paymentStatus → PAID，bookingStatus → CONFIRMED（预约正式生效）
             await this.bookingRepository.updatePaymentStatusByOutTradeNo(
                 outTradeNo,
                 PaymentStatus.PAID,
-                BookingStatus.PAID,
+                BookingStatus.CONFIRMED,
                 transactionId,
                 new Date()
             );
@@ -314,6 +334,7 @@ export class BookingService {
      * @param bookingId 订单ID
      */
     async handlePaymentTimeout(bookingId: string) {
+        // 支付超时：paymentStatus → UNPAID，bookingStatus → CANCELLED
         await this.bookingRepository.updatePaymentStatus(
             bookingId,
             PaymentStatus.UNPAID,
