@@ -3,8 +3,6 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 import { ScheduleModule } from '@nestjs/schedule';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
-import { ConfigModule } from './config/config.module';
-import { ConfigService } from './config/config.service';
 import { AdminModule } from './modules/admin/admin.module';
 import { AdminApplicationModule } from './modules/admin-application/admin-application.module';
 import { AnnouncementModule } from './modules/announcement/announcement.module';
@@ -23,14 +21,12 @@ import { AdminApplication } from './entities/admin-application.entity';
 
 @Module({
     imports: [
-        ConfigModule,
-        // SQLite Connection with TypeORM
-        TypeOrmModule.forRootAsync({
-            inject: [ConfigService],
-            useFactory: async (configService: ConfigService) => ({
-                ...(await configService.getDatabaseConfig()),
-                entities: [User, Admin, Booking, Announcement, SystemConfig, AdminApplication],
-            }),
+        TypeOrmModule.forRoot({
+            type: 'sqlite',
+            database: process.env.DATABASE_PATH || 'data/app.db',
+            synchronize: process.env.NODE_ENV !== 'production',
+            logging: process.env.DATABASE_LOGGING === 'true',
+            entities: [User, Admin, Booking, Announcement, SystemConfig, AdminApplication],
         }),
         ScheduleModule.forRoot(),
         UserModule,

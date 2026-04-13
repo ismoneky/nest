@@ -1,6 +1,14 @@
 # Dependencies
 node_modules
 
+# 微信支付证书和密钥（严禁入库）
+certs/
+
+# 环境变量（含敏感信息）
+.env
+.env.development
+.env.production
+
 # Build output
 dist
 

@@ -64,7 +64,7 @@ export class BookingService {
 
         // 计算支付金额（从系统配置获取）
         const paymentConfig = await this.systemConfigService.getPaymentConfig();
-        const amount = createBookingDto.personCount * paymentConfig.paymentAmount * 100; // 转换为分
+        const amount = createBookingDto.personCount * paymentConfig.paymentAmount; // 转换为分
 
         // 设置支付超时时间（30分钟）
         const paymentExpiredAt = new Date();
@@ -171,7 +171,18 @@ export class BookingService {
         }
 
         // 4. 处理支付超时的订单
+        // 官方要求：超时后需先调用微信关单 API，再更新本地状态，避免用户支付旧订单触发回调
         try {
+            const timeoutOrders = await this.bookingRepository.getPaymentTimeoutOrders(now);
+            for (const order of timeoutOrders) {
+                try {
+                    if (order.outTradeNo) {
+                        await this.wechatPayService.closeOrder(order.outTradeNo);
+                    }
+                } catch (closeError) {
+                    this.logger.warn(`关闭超时订单失败: ${order.bookingId}`, closeError);
+                }
+            }
             await this.bookingRepository.updatePaymentTimeoutOrders(now);
         } catch (error) {
             this.logger.error('Error updating payment timeout orders', error);
@@ -197,7 +208,7 @@ export class BookingService {
             throw new BadRequestException('订单已取消，无法支付');
         }
 
-        if (booking.paymentStatus !== PaymentStatus.UNPAID) {
+        if (booking.paymentStatus !== PaymentStatus.UNPAID && booking.paymentStatus !== PaymentStatus.PAYING) {
             throw new BadRequestException('订单状态不允许支付');
         }
 
@@ -205,12 +216,19 @@ export class BookingService {
             throw new BadRequestException('支付已超时');
         }
 
+        // 若已有进行中的微信订单（PAYING 状态），先关闭旧订单再重新下单
+        // 官方要求：重新下单前必须关闭旧的未支付订单，避免用户支付旧订单触发回调导致状态混乱
+        if (booking.paymentStatus === PaymentStatus.PAYING && booking.outTradeNo) {
+            await this.wechatPayService.closeOrder(booking.outTradeNo);
+        }
+
         // 每次发起支付都重新下单，生成新的 outTradeNo
         const paymentParams = await this.wechatPayService.createPayment(
             booking.bookingId,
             booking.amount,
             `预约订单 - ${booking.bookingDate} ${booking.timeSlot}`,
-            booking.wechatOpenId
+            booking.wechatOpenId,
+            booking.paymentExpiredAt,
         );
 
         // 更新支付状态为支付中（bookingStatus 保持 PENDING，等待微信回调确认）
@@ -285,12 +303,13 @@ export class BookingService {
             throw new BadRequestException('订单未支付，无法退款');
         }
 
-        if (booking.refundStatus !== RefundStatus.NONE) {
-            throw new BadRequestException('退款已处理');
+        if (booking.refundStatus === RefundStatus.REFUNDED) {
+            throw new BadRequestException('订单已退款');
         }
 
-        // 生成退款单号
-        const outRefundNo = `REFUND_${booking.bookingId}_${Date.now()}`;
+        // 幂等保护：若已有退款单号（上次请求可能超时），复用原单号重试，避免重复退款
+        // 仅允许 NONE 和 REFUNDING（上次请求结果未知）状态重试
+        const outRefundNo = booking.outRefundNo ?? `RF${booking.bookingId}${Date.now()}`;
 
         // 申请退款
         const refundResult = await this.wechatPayService.refund(
@@ -300,7 +319,7 @@ export class BookingService {
             booking.amount
         );
 
-        // 更新订单状态为退款中
+        // 更新订单状态为退款中，同时持久化退款单号
         await this.bookingRepository.updateRefundStatus(
             bookingId,
             RefundStatus.REFUNDING,

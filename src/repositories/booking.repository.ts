@@ -321,7 +321,7 @@ export class BookingRepository {
             
             booking.refundStatus = refundStatus;
             if (outRefundNo) {
-                // 这里可以添加退款单号字段
+                booking.outRefundNo = outRefundNo;
             }
             
             if (refundStatus === RefundStatus.REFUNDED) {
@@ -335,6 +335,24 @@ export class BookingRepository {
                 throw error;
             }
             throw new InternalServerErrorException(error instanceof Error ? error.message : 'Failed to update refund status');
+        }
+    }
+
+    /**
+     * 查询支付超时的订单列表（用于批量关单）
+     * @param now 当前时间
+     */
+    async getPaymentTimeoutOrders(now: Date): Promise<Booking[]> {
+        try {
+            return await this.bookingRepository.find({
+                where: [
+                    { paymentExpiredAt: LessThan(now), paymentStatus: PaymentStatus.UNPAID },
+                    { paymentExpiredAt: LessThan(now), paymentStatus: PaymentStatus.PAYING },
+                ],
+                select: ['bookingId', 'outTradeNo', 'paymentStatus'],
+            });
+        } catch (error) {
+            throw new InternalServerErrorException(error instanceof Error ? error.message : 'Failed to get payment timeout orders');
         }
     }
 

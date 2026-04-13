@@ -1,3 +1,6 @@
+import * as dotenv from 'dotenv';
+dotenv.config();
+
 import { ValidationPipe } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import * as crypto from 'crypto';
@@ -8,11 +11,13 @@ if (!global.crypto) {
 }
 
 import { AppModule } from './app.module';
-import { ConfigService } from './config/config.service';
 import { HttpExceptionFilter } from './filters/http-exception.filter';
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule);
+  const app = await NestFactory.create(AppModule, {
+    // 保留原始请求体，用于微信支付回调验签
+    rawBody: true,
+  });
 
   // 启用全局异常过滤器,防止未捕获异常导致服务器崩溃
   app.useGlobalFilters(new HttpExceptionFilter());
@@ -20,25 +25,28 @@ async function bootstrap() {
   // 启用全局验证管道,防止无效数据导致内存问题
   app.useGlobalPipes(
     new ValidationPipe({
-      transform: true, // 自动转换类型
-      whitelist: true, // 剥离未定义的属性
-      forbidNonWhitelisted: false, // 不抛出错误,只是忽略
+      transform: true,
+      whitelist: true,
+      forbidNonWhitelisted: false,
       transformOptions: {
-        enableImplicitConversion: true, // 启用隐式类型转换
+        enableImplicitConversion: true,
       },
     }),
   );
 
-  const config = new ConfigService();
+  // 启用 CORS
+  const corsOrigin = process.env.CORS_ORIGIN || '*';
+  app.enableCors({
+    origin: corsOrigin === '*' ? '*' : corsOrigin.split(',').map(o => o.trim()),
+    methods: 'GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS',
+    allowedHeaders: 'Content-Type, Accept, Authorization, x-admin-key',
+    credentials: corsOrigin !== '*',
+  });
 
-  // 启用 CORS（从配置文件读取）
-  const corsConfig = config.getCorsConfig();
-  app.enableCors(corsConfig);
-
-  const port = await config.getPortConfig();
-  await app.listen(port, "0.0.0.0");
+  const port = process.env.PORT || '3000';
+  await app.listen(port, '0.0.0.0');
 
   console.log(`Application is running on: http://localhost:${port}`);
-  console.log(`Environment: ${config.isProduction() ? 'production' : 'development'}`);
+  console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
 }
 bootstrap();

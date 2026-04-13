@@ -157,6 +157,10 @@ export class Booking {
     @Index()
     outTradeNo: string;
 
+    /** 商户退款单号 (微信支付) */
+    @Column({ nullable: true })
+    outRefundNo: string;
+
     /** 支付时间 */
     @Column({ type: 'datetime', nullable: true })
     paidAt: Date;
