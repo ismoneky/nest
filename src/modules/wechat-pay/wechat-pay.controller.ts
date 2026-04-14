@@ -1,4 +1,5 @@
-import { Controller, Post, Get, Param, Body, Headers, HttpStatus, Res, RawBodyRequest, Req, Logger } from '@nestjs/common';
+import { Controller, Post, Get, Param, Body, Headers, HttpStatus, Res, RawBodyRequest, Req, Logger, UsePipes } from '@nestjs/common';
+import { ValidationPipe } from '@nestjs/common';
 import { Request, Response } from 'express';
 import { WechatPayService } from './wechat-pay.service';
 
@@ -40,6 +41,7 @@ export class WechatPayController {
      *   - 业务处理（更新订单）在应答后异步执行，避免超时
      */
     @Post('notify')
+    @UsePipes(new ValidationPipe({ whitelist: false }))
     async handlePaymentNotify(
         @Req() req: RawBodyRequest<Request>,
         @Body() body: any,
@@ -77,6 +79,7 @@ export class WechatPayController {
      * POST /wechat-pay/refund-notify
      */
     @Post('refund-notify')
+    @UsePipes(new ValidationPipe({ whitelist: false }))
     async handleRefundNotify(
         @Req() req: RawBodyRequest<Request>,
         @Body() body: any,

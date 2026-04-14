@@ -455,17 +455,20 @@ export class WechatPayService {
                 .update(Booking)
                 .set({
                     refundStatus: RefundStatus.REFUNDED,
+                    paymentStatus: PaymentStatus.REFUNDED,
                     status: BookingStatus.REFUNDED,
                     refundedAt: new Date(),
                 })
                 .where('outTradeNo = :outTradeNo', { outTradeNo })
                 .execute();
         } else if (refundStatus === 'ABNORMAL' || refundStatus === 'CLOSED') {
-            // 退款失败：refundStatus → FAILED，paymentStatus 保持 PAID
             await this.bookingRepository
                 .createQueryBuilder()
                 .update(Booking)
-                .set({ refundStatus: RefundStatus.FAILED })
+                .set({
+                    refundStatus: RefundStatus.FAILED,
+                    paymentStatus: PaymentStatus.FAILED,
+                })
                 .where('outTradeNo = :outTradeNo', { outTradeNo })
                 .execute();
         }
