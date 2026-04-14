@@ -157,7 +157,7 @@ export class WechatPayService {
                     'Authorization': authorization,
                     'Accept': 'application/json',
                     'Content-Type': 'application/json',
-                    'User-Agent': `Node.js/${process.version}`,
+                    'User-agent': `Node.js/${process.version}`
                 },
             };
 
