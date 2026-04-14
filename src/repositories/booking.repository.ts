@@ -229,7 +229,7 @@ export class BookingRepository {
     /**
      * 更新指定日期和时间段的过期订单为已完成状态
      */
-    async updateExpiredBookings(bookingDate: Date, timeSlot: TimeSlot) {
+    async updateExpiredBookings(bookingDate: string, timeSlot: TimeSlot) {
         return await this.bookingRepository
             .createQueryBuilder()
             .update(Booking)

@@ -172,6 +172,24 @@ export class BookingController {
     }
 
     /**
+     * 核验订单（管理员扫码）
+     * POST /bookings/:bookingId/verify
+     * @param bookingId 订单ID
+     * @param res Express 响应对象
+     */
+    @Post(':bookingId/verify')
+    @UseGuards(JwtAuthGuard)
+    async verifyBooking(@Param('bookingId') bookingId: string, @Req() req: Request, @Res() res: Response) {
+        const { openid } = req['user'] as { openid: string };
+        const booking = await this.bookingService.verifyBooking(bookingId, openid);
+        return res.status(HttpStatus.OK).send({
+            success: true,
+            message: '核验成功',
+            data: booking,
+        });
+    }
+
+    /**
      * 申请退款
      * POST /bookings/:bookingId/refund
      * @param bookingId 订单ID (UUID)

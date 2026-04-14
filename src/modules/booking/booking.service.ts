@@ -1,6 +1,7 @@
-import { Injectable, BadRequestException, Logger } from '@nestjs/common';
+import { Injectable, BadRequestException, ForbiddenException, Logger } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { BookingRepository } from '../../repositories/booking.repository';
+import { AdminApplicationRepository } from '../../repositories/admin-application.repository';
 import { CreateBookingDto } from './dto/createBooking.dto';
 import { GetBookingsDto } from './dto/getBookings.dto';
 import { UpdateBookingDto } from './dto/updateBooking.dto';
@@ -20,6 +21,7 @@ export class BookingService {
         private readonly bookingRepository: BookingRepository,
         private readonly wechatPayService: WechatPayService,
         private readonly systemConfigService: SystemConfigService,
+        private readonly adminApplicationRepository: AdminApplicationRepository,
     ) {}
 
     /**
@@ -137,13 +139,14 @@ export class BookingService {
      * 定时处理过期订单
      * 每小时执行一次 (减轻服务器压力)
      */
-    // @Cron(CronExpression.EVERY_MINUTE)
-    @Cron(CronExpression.EVERY_HOUR)
+    @Cron(CronExpression.EVERY_5_MINUTES)
     async handleCron() {
         this.logger.debug('Running booking cron job...');
         const now = new Date();
-        // 确保构造的是 UTC 时间的 00:00:00，与 createBooking 时的 new Date(string) 保持一致
-        const todayStart = new Date(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()));
+        // todayStr 用于 date 列的精确匹配（YYYY-MM-DD 字符串）
+        const todayStr = now.toLocaleDateString('sv'); // 'sv' locale 输出 YYYY-MM-DD
+        // todayStart 用于 updatePastBookings 的 < 比较
+        const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
 
         // 1. 处理之前日期的未完成订单
         try {
@@ -155,7 +158,7 @@ export class BookingService {
         // 2. 处理今天上午过期的订单 (12:00后)
         if (now.getHours() >= 12) {
             try {
-                await this.bookingRepository.updateExpiredBookings(todayStart, TimeSlot.MORNING);
+                await this.bookingRepository.updateExpiredBookings(todayStr, TimeSlot.MORNING);
             } catch (error) {
                 this.logger.error('Error updating morning bookings', error);
             }
@@ -164,7 +167,7 @@ export class BookingService {
         // 3. 处理今天下午过期的订单 (18:00后)
         if (now.getHours() >= 18) {
             try {
-                await this.bookingRepository.updateExpiredBookings(todayStart, TimeSlot.AFTERNOON);
+                await this.bookingRepository.updateExpiredBookings(todayStr, TimeSlot.AFTERNOON);
             } catch (error) {
                 this.logger.error('Error updating afternoon bookings', error);
             }
@@ -369,6 +372,27 @@ export class BookingService {
      */
     async updateRefundStatus(bookingId: string, refundStatus: RefundStatus) {
         return await this.bookingRepository.updateRefundStatus(bookingId, refundStatus);
+    }
+
+    /**
+     * 核验订单（管理员扫码）
+     * 将 CONFIRMED 订单标记为 COMPLETED
+     * @param bookingId 订单ID
+     * @param openid 操作者 openid
+     */
+    async verifyBooking(bookingId: string, openid: string) {
+        const admin = await this.adminApplicationRepository.findApprovedByOpenid(openid);
+        if (!admin) {
+            throw new ForbiddenException('无核验权限');
+        }
+
+        const booking = await this.bookingRepository.getBookingById(bookingId);
+
+        if (booking.status !== BookingStatus.CONFIRMED) {
+            throw new BadRequestException(`订单状态不可核验，当前状态：${booking.status}`);
+        }
+
+        return await this.bookingRepository.updateBooking(bookingId, { status: BookingStatus.COMPLETED } as any);
     }
 
     /**

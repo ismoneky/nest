@@ -171,6 +171,7 @@ export class WechatPayService {
                             resolve(data as any);
                         }
                     } else {
+                        this.logger.error(`微信支付 API 错误 [${res.statusCode}] ${method} ${path}: ${data}`);
                         reject(new Error(`微信支付 API 错误 [${res.statusCode}]: ${data}`));
                     }
                 });
@@ -202,7 +203,9 @@ export class WechatPayService {
         const notifyUrl = `${this.getApiBaseUrl()}/wechat-pay/notify`;
 
         // time_expire 格式：yyyy-MM-DDTHH:mm:ss+08:00（rfc3339，东八区）
-        const timeExpire = paymentExpiredAt.toISOString().replace('Z', '+08:00');
+        // toISOString() 是 UTC 时间，需先加 8 小时再格式化，不能直接替换 Z
+        const bjTime = new Date(paymentExpiredAt.getTime() + 8 * 60 * 60 * 1000);
+        const timeExpire = bjTime.toISOString().replace('Z', '+08:00').split('.')[0] + '+08:00';
 
         const result = await this.request<{ prepay_id: string }>('POST', '/v3/pay/transactions/jsapi', {
             appid: this.appid,
