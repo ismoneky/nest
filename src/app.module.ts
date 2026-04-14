@@ -5,6 +5,7 @@ import { AppController } from './app.controller';
 import { AppService } from './app.service';
 import { AdminModule } from './modules/admin/admin.module';
 import { AdminApplicationModule } from './modules/admin-application/admin-application.module';
+import { FeedbackModule } from './modules/feedback/feedback.module';
 import { AnnouncementModule } from './modules/announcement/announcement.module';
 import { BookingModule } from './modules/booking/booking.module';
 import { SystemConfigModule } from './modules/system-config/system-config.module';
@@ -18,6 +19,7 @@ import { Booking } from './entities/booking.entity';
 import { Announcement } from './entities/announcement.entity';
 import { SystemConfig } from './entities/system-config.entity';
 import { AdminApplication } from './entities/admin-application.entity';
+import { Feedback } from './entities/feedback.entity';
 
 @Module({
     imports: [
@@ -26,7 +28,7 @@ import { AdminApplication } from './entities/admin-application.entity';
             database: process.env.DATABASE_PATH || 'data/app.db',
             synchronize: process.env.NODE_ENV !== 'production',
             logging: process.env.DATABASE_LOGGING === 'true',
-            entities: [User, Admin, Booking, Announcement, SystemConfig, AdminApplication],
+            entities: [User, Admin, Booking, Announcement, SystemConfig, AdminApplication, Feedback],
         }),
         ScheduleModule.forRoot(),
         UserModule,
@@ -36,6 +38,7 @@ import { AdminApplication } from './entities/admin-application.entity';
         AnnouncementModule,
         SystemConfigModule,
         WechatPayModule,
+        FeedbackModule,
     ],
     controllers: [AppController],
     providers: [AppService],

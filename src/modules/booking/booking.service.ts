@@ -127,6 +127,20 @@ export class BookingService {
     }
 
     /**
+     * 管理员查询订单列表（无 openid 限制）
+     */
+    async getBookingsForAdmin(query: {
+        bookingDate?: string;
+        timeSlot?: TimeSlot;
+        status?: BookingStatus;
+        keyword?: string;
+        page?: number;
+        pageSize?: number;
+    }) {
+        return await this.bookingRepository.getBookingsForAdmin(query);
+    }
+
+    /**
      * 统计指定日期的预约人数
      * @param bookingDate 预约日期
      * @returns 各时间段的预约人数统计

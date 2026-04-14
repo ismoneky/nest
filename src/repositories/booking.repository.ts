@@ -1,6 +1,6 @@
 import { Injectable, InternalServerErrorException, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, Between, Not, LessThan } from 'typeorm';
+import { Repository, Between, Not, LessThan, Like } from 'typeorm';
 import { Booking, BookingStatus, TimeSlot, PaymentStatus, RefundStatus } from '../entities/booking.entity';
 import { CreateBookingDto } from '../modules/booking/dto/createBooking.dto';
 import { GetBookingsDto } from '../modules/booking/dto/getBookings.dto';
@@ -210,6 +210,58 @@ export class BookingRepository {
             };
         } catch (error) {
             throw new InternalServerErrorException(error instanceof Error ? error.message : 'Failed to get booking stats');
+        }
+    }
+
+    /**
+     * 管理员查询订单列表（无 openid 限制，支持关键字搜索）
+     */
+    async getBookingsForAdmin(query: {
+        bookingDate?: string;
+        timeSlot?: TimeSlot;
+        status?: BookingStatus;
+        keyword?: string;
+        page?: number;
+        pageSize?: number;
+    }) {
+        try {
+            const page = query.page || 1;
+            const pageSize = query.pageSize || 10;
+            const skip = (page - 1) * pageSize;
+
+            const qb = this.bookingRepository
+                .createQueryBuilder('booking')
+                .orderBy('booking.createdAt', 'DESC')
+                .skip(skip)
+                .take(pageSize);
+
+            if (query.bookingDate) {
+                qb.andWhere('booking.bookingDate = :bookingDate', { bookingDate: query.bookingDate });
+            }
+            if (query.timeSlot) {
+                qb.andWhere('booking.timeSlot = :timeSlot', { timeSlot: query.timeSlot });
+            }
+            if (query.status) {
+                qb.andWhere('booking.status = :status', { status: query.status });
+            }
+            if (query.keyword) {
+                qb.andWhere(
+                    '(booking.name LIKE :kw OR booking.phone LIKE :kw OR booking.bookingId LIKE :kw)',
+                    { kw: `%${query.keyword}%` },
+                );
+            }
+
+            const [bookings, total] = await qb.getManyAndCount();
+
+            return {
+                bookings,
+                total,
+                page,
+                pageSize,
+                totalPages: Math.ceil(total / pageSize),
+            };
+        } catch (error) {
+            throw new InternalServerErrorException(error instanceof Error ? error.message : 'Failed to get bookings');
         }
     }
 

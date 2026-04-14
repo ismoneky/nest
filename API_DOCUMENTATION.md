@@ -8,6 +8,8 @@
 - 预约订单管理（含微信支付）
 - 系统配置管理
 - 用户管理
+- 管理员申请
+- 意见反馈
 
 ## 基础信息
 
@@ -90,6 +92,7 @@ x-admin-key: <apiKey>
 - `token` 为 JWT，有效期 30 天
 - 后续所有需要用户身份的接口均需在请求头携带 `Authorization: Bearer <token>`
 - Token payload 包含 `openid` 和 `userId`，后端自动从 Token 中获取用户身份，无需前端额外传递
+- `admin: true` 表示该用户的管理员申请已审批通过，小程序可据此显示扫码核验入口
 
 ---
 
@@ -131,6 +134,38 @@ x-admin-key: <apiKey>
 **说明**：
 - 登录成功后返回 `apiKey`，后续管理员接口需在请求头携带 `x-admin-key: <apiKey>`
 - API Key 无过期时间，服务端重启后仍有效（由环境变量 `ADMIN_API_KEY` 控制）
+
+#### 2.2 管理员查询订单列表
+
+**接口路径**：`GET /admin/bookings`
+
+**请求头**：`x-admin-key: <apiKey>`
+
+**说明**：查询所有用户的订单，不限制 openid，支持关键字模糊搜索。与用户侧 `GET /bookings` 的区别：无需 JWT、可查全量数据、多了 `keyword` 搜索字段。
+
+**查询参数**：
+| 参数名 | 类型 | 必填 | 描述 |
+| --- | --- | --- | --- |
+| bookingDate | string | 否 | 按日期筛选，格式 `YYYY-MM-DD` |
+| timeSlot | string | 否 | 按时间段筛选：`morning` / `afternoon` |
+| status | string | 否 | 按订单状态筛选 |
+| keyword | string | 否 | 关键字模糊搜索（姓名 / 手机号 / 订单号） |
+| page | number | 否 | 页码，默认 1 |
+| pageSize | number | 否 | 每页数量，默认 10，最大 100 |
+
+**响应示例**：
+```json
+{
+  "success": true,
+  "data": [...],
+  "pagination": {
+    "page": 1,
+    "pageSize": 10,
+    "total": 100,
+    "totalPages": 10
+  }
+}
+```
 
 ---
 
@@ -199,7 +234,7 @@ x-admin-key: <apiKey>
 
 **请求头**：`Authorization: Bearer <token>`
 
-**说明**：创建订单后状态为 `pending`（待支付），需在 30 分钟内完成支付，否则订单自动取消（定时任务每小时执行一次，超时订单会先调微信关单 API 再更新本地状态）。
+**说明**：创建订单后状态为 `pending`（待支付），需在 30 分钟内完成支付，否则订单自动取消（定时任务每 5 分钟执行一次，超时订单会先调微信关单 API 再更新本地状态）。
 
 **请求参数**：
 | 参数名 | 类型 | 必填 | 描述 |
@@ -807,6 +842,149 @@ iv   = resource.nonce（12字节 UTF-8）
 aad  = resource.associated_data
 密文 = Base64解码(resource.ciphertext)，末尾 16 字节为 authTag
 明文 = AES-256-GCM解密(密文, key, iv, aad, authTag)
+```
+
+---
+
+### 8. 管理员申请模块
+
+#### 8.1 用户申请成为管理员
+
+**接口路径**：`POST /admin-application/apply`
+
+**请求头**：`Authorization: Bearer <token>`
+
+**请求参数**：
+| 参数名 | 类型 | 必填 | 描述 |
+| --- | --- | --- | --- |
+| phone | string | 是 | 手机号 |
+| name | string | 是 | 姓名 |
+
+**说明**：同一用户只能有一个待审核的申请，重复提交返回 400。
+
+**响应示例**：
+```json
+{
+  "success": true,
+  "message": "申请已提交，等待审核",
+  "data": {
+    "applicationId": "uuid...",
+    "openid": "oXxx...",
+    "phone": "138xxxxxxxx",
+    "name": "张三",
+    "status": "pending",
+    "createdAt": "2026-04-14T10:00:00.000Z"
+  }
+}
+```
+
+#### 8.2 获取申请列表（超管）
+
+**接口路径**：`GET /admin/applications`
+
+**请求头**：`x-admin-key: <apiKey>`
+
+**查询参数**：
+| 参数名 | 类型 | 必填 | 描述 |
+| --- | --- | --- | --- |
+| status | string | 否 | `pending` / `approved` / `rejected` |
+
+#### 8.3 审批通过（超管）
+
+**接口路径**：`POST /admin/applications/:id/approve`
+
+**请求头**：`x-admin-key: <apiKey>`
+
+#### 8.4 审批拒绝（超管）
+
+**接口路径**：`POST /admin/applications/:id/reject`
+
+**请求头**：`x-admin-key: <apiKey>`
+
+**请求参数**：
+| 参数名 | 类型 | 必填 | 描述 |
+| --- | --- | --- | --- |
+| rejectionReason | string | 否 | 拒绝原因 |
+
+---
+
+### 9. 核验订单（管理员扫码）
+
+**接口路径**：`POST /bookings/:bookingId/verify`
+
+**请求头**：`Authorization: Bearer <token>`
+
+**说明**：
+- 调用方必须是审批通过的管理员（`wx-login` 返回 `admin: true`）
+- 将订单状态从 `confirmed` 更新为 `completed`
+- 非管理员调用返回 403，订单状态不为 `confirmed` 返回 400
+
+**响应示例**：
+```json
+{
+  "success": true,
+  "message": "核验成功",
+  "data": { ... }
+}
+```
+
+**可能的错误**：
+- `无核验权限` (403) — 当前用户不是管理员
+- `订单状态不可核验，当前状态：xxx` (400) — 订单不处于 `confirmed` 状态
+
+---
+
+### 10. 意见反馈模块 `/feedbacks`
+
+#### 10.1 提交意见反馈
+
+**接口路径**：`POST /feedbacks`
+
+**请求头**：`Authorization: Bearer <token>`
+
+**请求参数**：
+| 参数名 | 类型 | 必填 | 描述 |
+| --- | --- | --- | --- |
+| phone | string | 是 | 联系手机号（国内手机号格式） |
+| content | string | 是 | 反馈内容，最多 1000 字 |
+
+> `wechatOpenId` 和 `createdAt` 由服务端自动记录，无需前端传入。
+
+**响应示例**：
+```json
+{
+  "success": true,
+  "message": "反馈提交成功",
+  "data": {
+    "feedbackId": "uuid...",
+    "wechatOpenId": "oXxx...",
+    "phone": "138xxxxxxxx",
+    "content": "反馈内容...",
+    "createdAt": "2026-04-14T10:00:00.000Z"
+  }
+}
+```
+
+#### 10.2 获取所有反馈（超管）
+
+**接口路径**：`GET /feedbacks`
+
+**请求头**：`x-admin-key: <apiKey>`
+
+**响应示例**：
+```json
+{
+  "success": true,
+  "data": [
+    {
+      "feedbackId": "uuid...",
+      "wechatOpenId": "oXxx...",
+      "phone": "138xxxxxxxx",
+      "content": "反馈内容...",
+      "createdAt": "2026-04-14T10:00:00.000Z"
+    }
+  ]
+}
 ```
 
 ---
