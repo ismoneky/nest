@@ -16,6 +16,7 @@ import { SystemConfigService } from '../system-config/system-config.service';
 @Injectable()
 export class BookingService {
     private readonly logger = new Logger(BookingService.name);
+    private cronRunning = false;
 
     constructor(
         private readonly bookingRepository: BookingRepository,
@@ -155,54 +156,80 @@ export class BookingService {
      */
     @Cron(CronExpression.EVERY_5_MINUTES)
     async handleCron() {
+        if (this.cronRunning) {
+            this.logger.warn('上一次定时任务尚未完成，跳过本次执行');
+            return;
+        }
+        this.cronRunning = true;
         this.logger.debug('Running booking cron job...');
         const now = new Date();
-        // todayStr 用于 date 列的精确匹配（YYYY-MM-DD 字符串）
-        const todayStr = now.toLocaleDateString('sv'); // 'sv' locale 输出 YYYY-MM-DD
-        // todayStart 用于 updatePastBookings 的 < 比较
+        const todayStr = now.toLocaleDateString('sv');
         const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
 
-        // 1. 处理之前日期的未完成订单
-        try {
-            await this.bookingRepository.updatePastBookings(todayStart);
-        } catch (error) {
-            this.logger.error('Error updating past bookings', error);
-        }
+        try { await Promise.allSettled([
+            // 1. 处理之前日期的未完成订单
+            this.bookingRepository.updatePastBookings(todayStart)
+                .catch(error => this.logger.error('Error updating past bookings', error)),
 
-        // 2. 处理今天上午过期的订单 (12:00后)
-        if (now.getHours() >= 12) {
-            try {
-                await this.bookingRepository.updateExpiredBookings(todayStr, TimeSlot.MORNING);
-            } catch (error) {
-                this.logger.error('Error updating morning bookings', error);
-            }
-        }
+            // 2. 处理今天上午过期的订单 (12:00后)
+            now.getHours() >= 12
+                ? this.bookingRepository.updateExpiredBookings(todayStr, TimeSlot.MORNING)
+                    .catch(error => this.logger.error('Error updating morning bookings', error))
+                : Promise.resolve(),
 
-        // 3. 处理今天下午过期的订单 (18:00后)
-        if (now.getHours() >= 18) {
-            try {
-                await this.bookingRepository.updateExpiredBookings(todayStr, TimeSlot.AFTERNOON);
-            } catch (error) {
-                this.logger.error('Error updating afternoon bookings', error);
-            }
-        }
+            // 3. 处理今天下午过期的订单 (18:00后)
+            now.getHours() >= 18
+                ? this.bookingRepository.updateExpiredBookings(todayStr, TimeSlot.AFTERNOON)
+                    .catch(error => this.logger.error('Error updating afternoon bookings', error))
+                : Promise.resolve(),
 
-        // 4. 处理支付超时的订单
-        // 官方要求：超时后需先调用微信关单 API，再更新本地状态，避免用户支付旧订单触发回调
-        try {
-            const timeoutOrders = await this.bookingRepository.getPaymentTimeoutOrders(now);
-            for (const order of timeoutOrders) {
-                try {
-                    if (order.outTradeNo) {
-                        await this.wechatPayService.closeOrder(order.outTradeNo);
-                    }
-                } catch (closeError) {
-                    this.logger.warn(`关闭超时订单失败: ${order.bookingId}`, closeError);
-                }
-            }
-            await this.bookingRepository.updatePaymentTimeoutOrders(now);
-        } catch (error) {
-            this.logger.error('Error updating payment timeout orders', error);
+            // 4. 退款对账：主动查询 REFUNDING 状态的订单，防止回调丢失导致状态卡住
+            this.bookingRepository.getRefundingOrders().then(async refundingOrders => {
+                await Promise.allSettled(
+                    refundingOrders
+                        .filter(order => !!order.outRefundNo)
+                        .map(async order => {
+                            try {
+                                const refundStatus = await this.wechatPayService.queryRefund(order.outRefundNo);
+                                if (refundStatus.status === 'SUCCESS') {
+                                    await this.bookingRepository.updateRefundStatus(
+                                        order.bookingId,
+                                        RefundStatus.REFUNDED,
+                                        undefined,
+                                        PaymentStatus.REFUNDED,
+                                    );
+                                    this.logger.log(`退款对账同步成功: ${order.outRefundNo}`);
+                                } else if (refundStatus.status === 'CLOSED' || refundStatus.status === 'ABNORMAL') {
+                                    await this.bookingRepository.updateRefundStatus(
+                                        order.bookingId,
+                                        RefundStatus.FAILED,
+                                        undefined,
+                                        PaymentStatus.FAILED,
+                                    );
+                                    this.logger.warn(`退款对账异常: ${order.outRefundNo}, 状态: ${refundStatus.status}`);
+                                }
+                                // PROCESSING 状态不处理，等下次定时任务继续查
+                            } catch (queryError) {
+                                this.logger.warn(`查询退款状态失败: ${order.outRefundNo}`, queryError);
+                            }
+                        })
+                );
+            }).catch(error => this.logger.error('退款对账任务失败', error)),
+
+            // 5. 处理支付超时的订单
+            // 官方要求：超时后需先调用微信关单 API，再更新本地状态，避免用户支付旧订单触发回调
+            this.bookingRepository.getPaymentTimeoutOrders(now).then(async timeoutOrders => {
+                await Promise.allSettled(
+                    timeoutOrders
+                        .filter(order => !!order.outTradeNo)
+                        .map(order => this.wechatPayService.closeOrder(order.outTradeNo)
+                            .catch(closeError => this.logger.warn(`关闭超时订单失败: ${order.bookingId}`, closeError))
+                        )
+                );
+                await this.bookingRepository.updatePaymentTimeoutOrders(now);
+            }).catch(error => this.logger.error('Error updating payment timeout orders', error)),
+        ]); } finally {
+            this.cronRunning = false;
         }
     }
 
@@ -324,9 +351,30 @@ export class BookingService {
             throw new BadRequestException('订单已退款');
         }
 
-        // 幂等保护：若已有退款单号（上次请求可能超时），复用原单号重试，避免重复退款
-        // 仅允许 NONE 和 REFUNDING（上次请求结果未知）状态重试
-        const outRefundNo = booking.outRefundNo ?? `RF${booking.bookingId}${Date.now()}`;
+        if (booking.refundStatus === RefundStatus.REFUNDING) {
+            throw new BadRequestException('退款申请处理中，请勿重复提交');
+        }
+
+        // 校验退款有效期：支付后一年内
+        if (booking.paidAt) {
+            const oneYearLater = new Date(booking.paidAt);
+            oneYearLater.setFullYear(oneYearLater.getFullYear() + 1);
+            if (new Date() > oneYearLater) {
+                throw new BadRequestException('订单已超过退款有效期（支付后一年内）');
+            }
+        }
+
+        // 幂等保护：先确保退款单号持久化，再发起退款
+        // 使用固定单号（不含时间戳），保证重试时单号不变，避免重复退款
+        const outRefundNo = booking.outRefundNo ?? `RF${booking.bookingId}`;
+        if (!booking.outRefundNo) {
+            await this.bookingRepository.updateRefundStatus(
+                bookingId,
+                RefundStatus.REFUNDING,
+                outRefundNo,
+                PaymentStatus.REFUNDING,
+            );
+        }
 
         // 申请退款
         const refundResult = await this.wechatPayService.refund(
@@ -334,13 +382,6 @@ export class BookingService {
             outRefundNo,
             booking.amount,
             booking.amount
-        );
-
-        // 更新订单状态为退款中，同时持久化退款单号
-        await this.bookingRepository.updateRefundStatus(
-            bookingId,
-            RefundStatus.REFUNDING,
-            outRefundNo
         );
 
         return refundResult;

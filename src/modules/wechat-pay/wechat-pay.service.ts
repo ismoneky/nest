@@ -157,6 +157,7 @@ export class WechatPayService {
                     'Authorization': authorization,
                     'Accept': 'application/json',
                     'Content-Type': 'application/json',
+                    'User-Agent': `Node.js/${process.version}`,
                 },
             };
 
@@ -178,6 +179,9 @@ export class WechatPayService {
             });
 
             req.on('error', reject);
+            req.setTimeout(10000, () => {
+                req.destroy(new Error(`微信支付请求超时: ${method} ${path}`));
+            });
 
             if (bodyStr) {
                 req.write(bodyStr);
@@ -305,6 +309,21 @@ export class WechatPayService {
         } catch (error) {
             this.logger.error('按微信订单号查询失败', error);
             throw new BadRequestException('查询订单状态失败');
+        }
+    }
+
+    /**
+     * 查询退款状态
+     * 官方文档：GET /v3/refund/domestic/refunds/{out_refund_no}
+     */
+    async queryRefund(outRefundNo: string) {
+        this.assertInitialized();
+
+        try {
+            return await this.request('GET', `/v3/refund/domestic/refunds/${outRefundNo}`);
+        } catch (error) {
+            this.logger.error('查询退款状态失败', error);
+            throw new BadRequestException('查询退款状态失败');
         }
     }
 

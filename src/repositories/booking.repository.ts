@@ -366,27 +366,45 @@ export class BookingRepository {
     async updateRefundStatus(
         bookingId: string,
         refundStatus: RefundStatus,
-        outRefundNo?: string
+        outRefundNo?: string,
+        paymentStatus?: PaymentStatus,
     ) {
         try {
             const booking = await this.getBookingById(bookingId);
-            
+
             booking.refundStatus = refundStatus;
             if (outRefundNo) {
                 booking.outRefundNo = outRefundNo;
             }
-            
+            if (paymentStatus) {
+                booking.paymentStatus = paymentStatus;
+            }
+
             if (refundStatus === RefundStatus.REFUNDED) {
                 booking.status = BookingStatus.REFUNDED;
                 booking.refundedAt = new Date();
             }
-            
+
             return await this.bookingRepository.save(booking);
         } catch (error) {
             if (error instanceof NotFoundException) {
                 throw error;
             }
             throw new InternalServerErrorException(error instanceof Error ? error.message : 'Failed to update refund status');
+        }
+    }
+
+    /**
+     * 查询退款中的订单列表（用于定时对账）
+     */
+    async getRefundingOrders(): Promise<Booking[]> {
+        try {
+            return await this.bookingRepository.find({
+                where: { refundStatus: RefundStatus.REFUNDING },
+                select: ['bookingId', 'outRefundNo', 'outTradeNo', 'amount'],
+            });
+        } catch (error) {
+            throw new InternalServerErrorException(error instanceof Error ? error.message : 'Failed to get refunding orders');
         }
     }
 
