@@ -261,9 +261,13 @@ export class BookingService {
         }
 
         // 每次发起支付都重新下单，生成新的 outTradeNo
-        // 注意：不主动调 closeOrder 关闭旧订单，微信在用户关闭支付弹窗后会将旧单置为 CLOSED，
-        // 若此时再调 closeOrder 紧接着下新单，微信有时会因关单操作尚未完成而对新单返回 ORDERCLOSED。
-        // 旧的 outTradeNo 会在 paymentExpiredAt 到期后由定时任务统一关闭。
+        // 必须先主动关闭旧的微信订单，否则旧单仍处于 USERPAYING 状态，
+        // 微信会拒绝新下单并返回 ORDER_CLOSED 错误。
+        // closeOrder 内部已做容错，旧单已关闭/已支付时不会抛异常。
+        if (booking.outTradeNo) {
+            await this.wechatPayService.closeOrder(booking.outTradeNo);
+        }
+
         const paymentParams = await this.wechatPayService.createPayment(
             booking.bookingId,
             booking.amount,
