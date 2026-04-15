@@ -1,4 +1,5 @@
-import { Body, Controller, Get, HttpStatus, Post, Query, Res, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, HttpStatus, Post, Query, Res, UseGuards, StreamableFile } from '@nestjs/common';
+import { createReadStream } from 'fs';
 import { Response } from 'express';
 import { AdminService } from './admin.service';
 import { BookingService } from '../booking/booking.service';
@@ -28,6 +29,23 @@ export class AdminController {
             message: '登录成功',
             data: result,
         });
+    }
+
+    /**
+     * 导出全量订单为 Excel
+     * GET /admin/bookings/export
+     */
+    @Get('bookings/export')
+    @UseGuards(AdminAuthGuard)
+    async exportBookings(@Res({ passthrough: true }) res: Response) {
+        const filePath = await this.adminService.exportBookingsToExcel();
+        const stream = createReadStream(filePath);
+        stream.on('close', () => this.adminService.cleanupFile(filePath));
+        (res as any).set({
+            'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            'Content-Disposition': `attachment; filename="bookings_${Date.now()}.xlsx"`,
+        });
+        return new StreamableFile(stream);
     }
 
     /**

@@ -1,4 +1,4 @@
-import { Type } from 'class-transformer';
+import { Transform, Type } from 'class-transformer';
 import { IsDateString, IsEnum, IsInt, IsOptional, IsString, Max, Min } from 'class-validator';
 import { BookingStatus, TimeSlot } from '../../../entities/booking.entity';
 
@@ -11,9 +11,10 @@ export class GetBookingsAdminDto {
     @IsOptional()
     timeSlot?: TimeSlot;
 
-    @IsEnum(BookingStatus)
+    @Transform(({ value }) => (Array.isArray(value) ? value : value ? [value] : undefined))
+    @IsEnum(BookingStatus, { each: true })
     @IsOptional()
-    status?: BookingStatus;
+    status?: BookingStatus[];
 
     /** 关键字搜索（姓名 / 手机号 / 订单号） */
     @IsString()

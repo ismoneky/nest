@@ -219,7 +219,7 @@ export class BookingRepository {
     async getBookingsForAdmin(query: {
         bookingDate?: string;
         timeSlot?: TimeSlot;
-        status?: BookingStatus;
+        status?: BookingStatus[];
         keyword?: string;
         page?: number;
         pageSize?: number;
@@ -241,8 +241,8 @@ export class BookingRepository {
             if (query.timeSlot) {
                 qb.andWhere('booking.timeSlot = :timeSlot', { timeSlot: query.timeSlot });
             }
-            if (query.status) {
-                qb.andWhere('booking.status = :status', { status: query.status });
+            if (query.status?.length) {
+                qb.andWhere('booking.status IN (:...status)', { status: query.status });
             }
             if (query.keyword) {
                 qb.andWhere(

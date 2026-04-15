@@ -133,7 +133,7 @@ export class BookingService {
     async getBookingsForAdmin(query: {
         bookingDate?: string;
         timeSlot?: TimeSlot;
-        status?: BookingStatus;
+        status?: BookingStatus[];
         keyword?: string;
         page?: number;
         pageSize?: number;

@@ -8,3 +8,5 @@ scp -r /Users/zhangzhiwei/Desktop/code/copy/nest/certs/* root@82.157.111.208:/ap
 
 scp -r /Users/zhangzhiwei/Desktop/code/copy/nest/.env root@82.157.111.208:/app/backend/.env
 
+scp -r /Users/zhangzhiwei/Desktop/code/copy/nest/scripts/* root@82.157.111.208:/app/backend/scripts/
+
