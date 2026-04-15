@@ -1,4 +1,5 @@
-import { Entity, Column, PrimaryGeneratedColumn, CreateDateColumn, Index } from 'typeorm';
+import { Entity, Column, PrimaryGeneratedColumn, Index, BeforeInsert } from 'typeorm';
+import { timestampTransformer } from './timestamp.transformer';
 
 @Entity('feedbacks')
 export class Feedback {
@@ -19,6 +20,11 @@ export class Feedback {
     @Column({ type: 'text' })
     content: string;
 
-    @CreateDateColumn()
+    @Column({ type: 'integer', transformer: timestampTransformer, default: () => `${Date.now()}` })
     createdAt: Date;
+
+    @BeforeInsert()
+    setCreatedAt() {
+        if (!this.createdAt) this.createdAt = new Date();
+    }
 }

@@ -1,4 +1,5 @@
-import { Entity, Column, PrimaryGeneratedColumn, CreateDateColumn, UpdateDateColumn, Index } from 'typeorm';
+import { Entity, Column, PrimaryGeneratedColumn, Index, BeforeInsert, BeforeUpdate } from 'typeorm';
+import { timestampTransformer } from './timestamp.transformer';
 
 /**
  * 时间段枚举
@@ -162,22 +163,34 @@ export class Booking {
     outRefundNo: string;
 
     /** 支付时间 */
-    @Column({ type: 'datetime', nullable: true })
+    @Column({ type: 'integer', nullable: true, transformer: timestampTransformer })
     paidAt: Date;
 
     /** 退款时间 */
-    @Column({ type: 'datetime', nullable: true })
+    @Column({ type: 'integer', nullable: true, transformer: timestampTransformer })
     refundedAt: Date;
 
     /** 支付超时时间 */
-    @Column({ type: 'datetime', nullable: true })
+    @Column({ type: 'integer', nullable: true, transformer: timestampTransformer })
     paymentExpiredAt: Date;
 
     /** 创建时间 */
-    @CreateDateColumn()
+    @Column({ type: 'integer', transformer: timestampTransformer, default: () => `${Date.now()}` })
     createdAt: Date;
 
     /** 更新时间 */
-    @UpdateDateColumn()
+    @Column({ type: 'integer', transformer: timestampTransformer, default: () => `${Date.now()}` })
     updatedAt: Date;
+
+    @BeforeInsert()
+    setCreatedAt() {
+        const now = new Date();
+        if (!this.createdAt) this.createdAt = now;
+        this.updatedAt = now;
+    }
+
+    @BeforeUpdate()
+    setUpdatedAt() {
+        this.updatedAt = new Date();
+    }
 }

@@ -1,4 +1,5 @@
-import { Entity, Column, PrimaryGeneratedColumn, CreateDateColumn, UpdateDateColumn, Index } from 'typeorm';
+import { Entity, Column, PrimaryGeneratedColumn, Index, BeforeInsert, BeforeUpdate } from 'typeorm';
+import { timestampTransformer } from './timestamp.transformer';
 
 @Entity('users')
 export class User {
@@ -19,9 +20,21 @@ export class User {
     @Column({ nullable: true })
     wechatAvatarUrl?: string;
 
-    @CreateDateColumn()
+    @Column({ type: 'integer', transformer: timestampTransformer, default: () => `${Date.now()}` })
     createdAt: Date;
 
-    @UpdateDateColumn()
+    @Column({ type: 'integer', transformer: timestampTransformer, default: () => `${Date.now()}` })
     updatedAt: Date;
+
+    @BeforeInsert()
+    setCreatedAt() {
+        const now = new Date();
+        if (!this.createdAt) this.createdAt = now;
+        this.updatedAt = now;
+    }
+
+    @BeforeUpdate()
+    setUpdatedAt() {
+        this.updatedAt = new Date();
+    }
 }

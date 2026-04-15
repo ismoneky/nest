@@ -195,8 +195,9 @@ export class WechatPayService {
     async createPayment(bookingId: string, amount: number, description: string, openid: string, paymentExpiredAt: Date) {
         this.assertInitialized();
 
-        // out_trade_no = bookingId + 时间戳，微信关单后原 out_trade_no 作废，必须换新的
-        const outTradeNo = `${bookingId}${Date.now()}`;
+        // out_trade_no = bookingId + 时间戳 + 随机数，微信关单后原 out_trade_no 作废，必须换新的
+        // 加随机数防止极短时间内重复下单时 Date.now() 相同导致 ORDER_CLOSED
+        const outTradeNo = `${bookingId}${Date.now()}${randomUUID().replace(/-/g, '').substring(0, 6)}`;
         const notifyUrl = `${this.getApiBaseUrl()}/wechat-pay/notify`;
 
         // time_expire 格式：yyyy-MM-DDTHH:mm:ss+08:00（rfc3339，东八区）

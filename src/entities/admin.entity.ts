@@ -1,4 +1,5 @@
-import { Entity, Column, PrimaryGeneratedColumn, CreateDateColumn, UpdateDateColumn, Index } from 'typeorm';
+import { Entity, Column, PrimaryGeneratedColumn, Index, BeforeInsert, BeforeUpdate } from 'typeorm';
+import { timestampTransformer } from './timestamp.transformer';
 
 /**
  * 管理员实体
@@ -22,14 +23,26 @@ export class Admin {
     name: string;
 
     /** 最后登录时间 */
-    @Column({ type: 'datetime', nullable: true })
+    @Column({ type: 'integer', nullable: true, transformer: timestampTransformer })
     lastLoginAt?: Date;
 
     /** 创建时间 */
-    @CreateDateColumn()
+    @Column({ type: 'integer', transformer: timestampTransformer, default: () => `${Date.now()}` })
     createdAt: Date;
 
     /** 更新时间 */
-    @UpdateDateColumn()
+    @Column({ type: 'integer', transformer: timestampTransformer, default: () => `${Date.now()}` })
     updatedAt: Date;
+
+    @BeforeInsert()
+    setCreatedAt() {
+        const now = new Date();
+        if (!this.createdAt) this.createdAt = now;
+        this.updatedAt = now;
+    }
+
+    @BeforeUpdate()
+    setUpdatedAt() {
+        this.updatedAt = new Date();
+    }
 }

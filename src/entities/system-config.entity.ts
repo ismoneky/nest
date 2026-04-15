@@ -1,4 +1,5 @@
-import { Entity, Column, PrimaryGeneratedColumn, CreateDateColumn, UpdateDateColumn } from 'typeorm';
+import { Entity, Column, PrimaryGeneratedColumn, BeforeInsert, BeforeUpdate } from 'typeorm';
+import { timestampTransformer } from './timestamp.transformer';
 
 /**
  * 轮播图配置项
@@ -72,12 +73,24 @@ export class SystemConfig {
     paymentConfigJson: string;
 
     /** 创建时间 */
-    @CreateDateColumn()
+    @Column({ type: 'integer', transformer: timestampTransformer, default: () => `${Date.now()}` })
     createdAt: Date;
 
     /** 更新时间 */
-    @UpdateDateColumn()
+    @Column({ type: 'integer', transformer: timestampTransformer, default: () => `${Date.now()}` })
     updatedAt: Date;
+
+    @BeforeInsert()
+    setCreatedAt() {
+        const now = new Date();
+        if (!this.createdAt) this.createdAt = now;
+        this.updatedAt = now;
+    }
+
+    @BeforeUpdate()
+    setUpdatedAt() {
+        this.updatedAt = new Date();
+    }
 
     // 虚拟属性 getter/setter
     get banners(): BannerItem[] {

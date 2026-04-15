@@ -260,13 +260,10 @@ export class BookingService {
             throw new BadRequestException('支付已超时');
         }
 
-        // 若已有进行中的微信订单（PAYING 状态），先关闭旧订单再重新下单
-        // 官方要求：重新下单前必须关闭旧的未支付订单，避免用户支付旧订单触发回调导致状态混乱
-        if (booking.paymentStatus === PaymentStatus.PAYING && booking.outTradeNo) {
-            await this.wechatPayService.closeOrder(booking.outTradeNo);
-        }
-
         // 每次发起支付都重新下单，生成新的 outTradeNo
+        // 注意：不主动调 closeOrder 关闭旧订单，微信在用户关闭支付弹窗后会将旧单置为 CLOSED，
+        // 若此时再调 closeOrder 紧接着下新单，微信有时会因关单操作尚未完成而对新单返回 ORDERCLOSED。
+        // 旧的 outTradeNo 会在 paymentExpiredAt 到期后由定时任务统一关闭。
         const paymentParams = await this.wechatPayService.createPayment(
             booking.bookingId,
             booking.amount,
