@@ -73,13 +73,7 @@ export class WechatPayService {
     }
 
     private getApiBaseUrl(): string {
-        const protocol = process.env.API_PROTOCOL || 'http';
-        const host     = process.env.API_HOST || 'localhost';
-        const port     = process.env.PORT || '3000';
-        const isDefaultPort =
-            (protocol === 'https' && port === '443') ||
-            (protocol === 'http'  && port === '80');
-        return isDefaultPort ? `${protocol}://${host}` : `${protocol}://${host}:${port}`;
+        return 'https://hbfctl.com.cn/api';
     }
 
     // ─────────────────────────────────────────────────────────────────────────
