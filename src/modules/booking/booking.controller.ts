@@ -6,6 +6,14 @@ import { GetBookingsDto } from './dto/getBookings.dto';
 import { GetBookingStatsDto } from './dto/getBookingStats.dto';
 import { UpdateBookingDto } from './dto/updateBooking.dto';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
+import { BookingStatus } from '../../entities/booking.entity';
+import { IsEnum, IsOptional } from 'class-validator';
+
+class GetBookingCountDto {
+    @IsOptional()
+    @IsEnum(BookingStatus)
+    status?: BookingStatus;
+}
 
 /**
  * 预约订单控制器
@@ -70,6 +78,24 @@ export class BookingController {
         return res.status(HttpStatus.OK).send({
             success: true,
             data: stats,
+        });
+    }
+
+    /**
+     * 查询当前用户指定状态下的订单数量
+     * GET /bookings/count?status=pending
+     * @param query 查询条件，status 可选
+     * @param req Express 请求对象
+     * @param res Express 响应对象
+     */
+    @Get('count')
+    @UseGuards(JwtAuthGuard)
+    async getBookingCount(@Query() query: GetBookingCountDto, @Req() req: Request, @Res() res: Response) {
+        const { openid } = req['user'] as { openid: string };
+        const count = await this.bookingService.countBookingsByStatus(openid, query.status);
+        return res.status(HttpStatus.OK).send({
+            success: true,
+            data: { count },
         });
     }
 

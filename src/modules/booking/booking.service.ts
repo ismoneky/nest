@@ -142,6 +142,16 @@ export class BookingService {
     }
 
     /**
+     * 统计当前用户指定状态下的订单数量
+     * @param openid 用户 openid
+     * @param status 可选，指定状态；不传则返回所有订单数量
+     * @returns 订单数量
+     */
+    async countBookingsByStatus(openid: string, status?: BookingStatus): Promise<number> {
+        return await this.bookingRepository.countBookingsByStatus(openid, status);
+    }
+
+    /**
      * 统计指定日期的预约人数
      * @param bookingDate 预约日期
      * @returns 各时间段的预约人数统计

@@ -165,6 +165,20 @@ export class BookingRepository {
     }
 
     /**
+     * 统计当前用户各状态下的订单数量
+     * @param wechatOpenId 用户 openid
+     * @param status 可选，指定状态；不传则返回所有状态的数量
+     * @returns 订单数量
+     */
+    async countBookingsByStatus(wechatOpenId: string, status?: BookingStatus): Promise<number> {
+        const where: any = { wechatOpenId };
+        if (status) {
+            where.status = status;
+        }
+        return await this.bookingRepository.count({ where });
+    }
+
+    /**
      * 统计指定日期的预约人数 (按时间段分组)
      * @param bookingDate 预约日期 (YYYY-MM-DD)
      * @returns 各时间段的预约人数统计
