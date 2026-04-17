@@ -394,8 +394,10 @@ export class BookingRepository {
                 booking.paymentStatus = paymentStatus;
             }
 
-            if (refundStatus === RefundStatus.REFUNDED) {
+            if (refundStatus === RefundStatus.REFUNDING || refundStatus === RefundStatus.REFUNDED) {
                 booking.status = BookingStatus.REFUNDED;
+            }
+            if (refundStatus === RefundStatus.REFUNDED) {
                 booking.refundedAt = new Date();
             }
 
