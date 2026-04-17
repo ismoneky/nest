@@ -197,7 +197,7 @@ export class BookingRepository {
                 .where('booking.bookingDate >= :date', { date })
                 .andWhere('booking.bookingDate < :nextDay', { nextDay })
                 .andWhere('booking.timeSlot = :timeSlot', { timeSlot: 'morning' })
-                .andWhere('booking.status != :status', { status: 'cancelled' })
+                .andWhere('booking.status IN (:...activeStatuses)', { activeStatuses: ['pending', 'confirmed'] })
                 .getRawOne();
 
             // 查询下午的统计
@@ -208,7 +208,7 @@ export class BookingRepository {
                 .where('booking.bookingDate >= :date', { date })
                 .andWhere('booking.bookingDate < :nextDay', { nextDay })
                 .andWhere('booking.timeSlot = :timeSlot', { timeSlot: 'afternoon' })
-                .andWhere('booking.status != :status', { status: 'cancelled' })
+                .andWhere('booking.status IN (:...activeStatuses)', { activeStatuses: ['pending', 'confirmed'] })
                 .getRawOne();
 
             return {
