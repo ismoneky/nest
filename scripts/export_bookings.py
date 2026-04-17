@@ -1,13 +1,7 @@
 #!/usr/bin/env python3
 import sqlite3
 import sys
-import os
-
-try:
-    import openpyxl
-except ImportError:
-    os.system(f"{sys.executable} -m pip install openpyxl -q")
-    import openpyxl
+import openpyxl
 
 db_path = sys.argv[1]
 output_path = sys.argv[2]

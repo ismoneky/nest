@@ -45,7 +45,7 @@ export class AdminService {
      * 导出全量订单为 Excel 文件，返回文件路径
      */
     async exportBookingsToExcel(): Promise<string> {
-        const dbPath = process.env.DATABASE_PATH || 'data/app.db';
+        const dbPath = join(process.cwd(), process.env.DATABASE_PATH || 'data/app.db');
         const tmpDir = join(process.cwd(), 'tmp');
         if (!existsSync(tmpDir)) {
             mkdirSync(tmpDir, { recursive: true });
