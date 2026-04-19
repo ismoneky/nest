@@ -353,6 +353,9 @@ export class BookingService {
         if (booking.wechatOpenId !== openid) {
             throw new BadRequestException('无权操作该订单');
         }
+        if (booking.status === BookingStatus.CONFIRMED) {
+            throw new BadRequestException('订单已完成，无法退款');
+        }
 
         if (booking.paymentStatus !== PaymentStatus.PAID) {
             throw new BadRequestException('订单未支付，无法退款');
