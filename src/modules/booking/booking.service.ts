@@ -38,27 +38,22 @@ export class BookingService {
             throw new BadRequestException(disabledMessage);
         }
 
-        // 用 UTC 构造预约时间点，与定时任务的 todayStart 基准保持一致
-        const [year, month, day] = createBookingDto.bookingDate.split('-').map(Number);
-        // 上午场次截止 UTC 04:00（北京时间 12:00），下午场次截止 UTC 10:00（北京时间 18:00）
-        const slotHourUTC = createBookingDto.timeSlot === TimeSlot.MORNING ? 4 : 10;
-        const bookingDate = new Date(Date.UTC(year, month - 1, day, slotHourUTC, 0, 0, 0));
-
-        if (bookingDate.getTime() <= Date.now()) {
-            throw new BadRequestException('预约时间必须晚于当前时间');
-        }
+        // 时间校验已移至前端，后端不再卡控
+        // const [year, month, day] = createBookingDto.bookingDate.split('-').map(Number);
+        // const slotHourUTC = createBookingDto.timeSlot === TimeSlot.MORNING ? 4 : 10;
+        // const bookingDate = new Date(Date.UTC(year, month - 1, day, slotHourUTC, 0, 0, 0));
+        // if (bookingDate.getTime() <= Date.now()) {
+        //     throw new BadRequestException('预约时间必须晚于当前时间');
+        // }
 
         // 检查预约人数是否超过限制
         const timeSlotLimit = await this.systemConfigService.getTimeSlotLimit();
-        const maxPeople = createBookingDto.timeSlot === TimeSlot.MORNING 
-            ? timeSlotLimit.morningMaxPeople 
-            : timeSlotLimit.afternoonMaxPeople;
+        // 不再区分上下午，取全天总限额和总已预约人数
+        const maxPeople = timeSlotLimit.morningMaxPeople + timeSlotLimit.afternoonMaxPeople;
 
         // 获取当前日期该时间段的已预约人数
         const currentStats = await this.bookingRepository.getBookingStatsByDate(createBookingDto.bookingDate);
-        const currentPeople = createBookingDto.timeSlot === TimeSlot.MORNING 
-            ? currentStats.morning.totalPeople 
-            : currentStats.afternoon.totalPeople;
+        const currentPeople = currentStats.morning.totalPeople + currentStats.afternoon.totalPeople;
 
         // 检查加上新预约的人数后是否超过限制
         if (currentPeople + createBookingDto.personCount > maxPeople) {
@@ -349,6 +344,8 @@ export class BookingService {
         if (!booking) {
             throw new BadRequestException('订单不存在');
         }
+
+        this.logger.log(`[退款调试] bookingId=${bookingId} status=${booking.status} paymentStatus=${booking.paymentStatus} refundStatus=${booking.refundStatus} paidAt=${booking.paidAt} outTradeNo=${booking.outTradeNo}`);
 
         if (booking.wechatOpenId !== openid) {
             throw new BadRequestException('无权操作该订单');

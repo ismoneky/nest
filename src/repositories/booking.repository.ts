@@ -453,7 +453,7 @@ export class BookingRepository {
                 .update(Booking)
                 .set({
                     status: BookingStatus.CANCELLED,
-                    paymentStatus: PaymentStatus.UNPAID,
+                    paymentStatus: PaymentStatus.FAILED,
                 })
                 .where('paymentExpiredAt < :now', { now })
                 .andWhere('paymentStatus IN (:...statuses)', {
