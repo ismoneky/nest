@@ -435,7 +435,9 @@ export class WechatPayService {
                 paidAt: new Date(),
             })
             .where('outTradeNo = :outTradeNo', { outTradeNo })
-            .andWhere('paymentStatus = :paymentStatus', { paymentStatus: PaymentStatus.PAYING })
+            .andWhere('paymentStatus NOT IN (:...excludedStatuses)', {
+                excludedStatuses: [PaymentStatus.PAID, PaymentStatus.REFUNDING, PaymentStatus.REFUNDED],
+            })
             .execute();
     }
 

@@ -176,19 +176,7 @@ export class BookingService {
             this.bookingRepository.updatePastBookings(todayStart)
                 .catch(error => this.logger.error('Error updating past bookings', error)),
 
-            // 2. 处理今天上午过期的订单 (12:00后)
-            now.getHours() >= 12
-                ? this.bookingRepository.updateExpiredBookings(todayStr, TimeSlot.MORNING)
-                    .catch(error => this.logger.error('Error updating morning bookings', error))
-                : Promise.resolve(),
-
-            // 3. 处理今天下午过期的订单 (18:00后)
-            now.getHours() >= 18
-                ? this.bookingRepository.updateExpiredBookings(todayStr, TimeSlot.AFTERNOON)
-                    .catch(error => this.logger.error('Error updating afternoon bookings', error))
-                : Promise.resolve(),
-
-            // 4. 退款对账：主动查询 REFUNDING 状态的订单，防止回调丢失导致状态卡住
+            // 2. 退款对账：主动查询 REFUNDING 状态的订单，防止回调丢失导致状态卡住
             this.bookingRepository.getRefundingOrders().then(async refundingOrders => {
                 await Promise.allSettled(
                     refundingOrders

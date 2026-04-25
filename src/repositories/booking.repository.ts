@@ -432,8 +432,8 @@ export class BookingRepository {
         try {
             return await this.bookingRepository.find({
                 where: [
-                    { paymentExpiredAt: LessThan(now), paymentStatus: PaymentStatus.UNPAID },
-                    { paymentExpiredAt: LessThan(now), paymentStatus: PaymentStatus.PAYING },
+                    { paymentExpiredAt: LessThan(now.getTime()), paymentStatus: PaymentStatus.UNPAID },
+                    { paymentExpiredAt: LessThan(now.getTime()), paymentStatus: PaymentStatus.PAYING },
                 ],
                 select: ['bookingId', 'outTradeNo', 'paymentStatus'],
             });
@@ -455,7 +455,7 @@ export class BookingRepository {
                     status: BookingStatus.CANCELLED,
                     paymentStatus: PaymentStatus.FAILED,
                 })
-                .where('paymentExpiredAt < :now', { now })
+                .where('paymentExpiredAt < :now', { now: now.getTime() })
                 .andWhere('paymentStatus IN (:...statuses)', {
                     statuses: [PaymentStatus.UNPAID, PaymentStatus.PAYING]
                 })
