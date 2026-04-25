@@ -340,8 +340,8 @@ export class WechatPayService {
                 },
             });
         } catch (error) {
-            this.logger.error(`申请退款失败: ${error?.message}`);
-            throw new BadRequestException(error?.message ?? '申请退款失败');
+            this.logger.error('申请退款失败', error);
+            throw new BadRequestException('申请退款失败');
         }
     }
 

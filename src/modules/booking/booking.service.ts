@@ -345,12 +345,10 @@ export class BookingService {
             throw new BadRequestException('订单不存在');
         }
 
-        this.logger.log(`[退款调试] bookingId=${bookingId} status=${booking.status} paymentStatus=${booking.paymentStatus} refundStatus=${booking.refundStatus} paidAt=${booking.paidAt} outTradeNo=${booking.outTradeNo}`);
-
         if (booking.wechatOpenId !== openid) {
             throw new BadRequestException('无权操作该订单');
         }
-        if (booking.status === BookingStatus.CONFIRMED) {
+        if (booking.status === BookingStatus.COMPLETED) {
             throw new BadRequestException('订单已完成，无法退款');
         }
 
