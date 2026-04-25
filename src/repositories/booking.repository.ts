@@ -430,13 +430,14 @@ export class BookingRepository {
      */
     async getPaymentTimeoutOrders(now: Date): Promise<Booking[]> {
         try {
-            return await this.bookingRepository.find({
-                where: [
-                    { paymentExpiredAt: LessThan(now.getTime()), paymentStatus: PaymentStatus.UNPAID },
-                    { paymentExpiredAt: LessThan(now.getTime()), paymentStatus: PaymentStatus.PAYING },
-                ],
-                select: ['bookingId', 'outTradeNo', 'paymentStatus'],
-            });
+            return await this.bookingRepository
+                .createQueryBuilder('booking')
+                .select(['booking.bookingId', 'booking.outTradeNo', 'booking.paymentStatus'])
+                .where('booking.paymentExpiredAt < :now', { now: now.getTime() })
+                .andWhere('booking.paymentStatus IN (:...statuses)', {
+                    statuses: [PaymentStatus.UNPAID, PaymentStatus.PAYING],
+                })
+                .getMany();
         } catch (error) {
             throw new InternalServerErrorException(error instanceof Error ? error.message : 'Failed to get payment timeout orders');
         }
