@@ -88,4 +88,17 @@ export class SystemConfigController {
             data: { bookingDisabledMessage: message },
         });
     }
+
+    /**
+     * 获取轮播图列表（小程序首页使用）
+     * GET /system-config/banners
+     */
+    @Get('banners')
+    async getBanners(@Res() res: Response) {
+        const config = await this.configService.getConfig();
+        return res.status(HttpStatus.OK).send({
+            success: true,
+            data: config.banners,
+        });
+    }
 }

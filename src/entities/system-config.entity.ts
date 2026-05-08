@@ -5,14 +5,7 @@ import { timestampTransformer } from './timestamp.transformer';
  * 轮播图配置项
  */
 export interface BannerItem {
-    /** 图片标题 */
-    title: string;
-    /** 图片URL */
     imageUrl: string;
-    /** 跳转链接 (可选) */
-    linkUrl?: string;
-    /** 排序顺序 */
-    sortOrder: number;
 }
 
 /**

@@ -6,18 +6,8 @@ import { IsArray, IsBoolean, IsInt, IsObject, IsOptional, IsString, IsUrl, Min, 
  */
 export class BannerItemDto {
     @IsString()
-    title: string;
-
-    @IsUrl()
+    @IsUrl({}, { message: '请输入有效的图片链接' })
     imageUrl: string;
-
-    @IsOptional()
-    @IsUrl()
-    linkUrl?: string;
-
-    @IsInt()
-    @Min(0)
-    sortOrder: number;
 }
 
 /**
