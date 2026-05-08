@@ -1,10 +1,13 @@
-import { BadRequestException, Body, Controller, HttpStatus, Post, Res } from '@nestjs/common';
+import { BadRequestException, Body, Controller, Delete, Get, HttpStatus, Param, Post, Put, Req, Res, UseGuards } from '@nestjs/common';
 import { HttpService } from '@nestjs/axios';
 import { JwtService } from '@nestjs/jwt';
 import { firstValueFrom } from 'rxjs';
-import { Response } from 'express';
+import { Response, Request } from 'express';
 import { UserService } from './user.service';
 import { AdminApplicationRepository } from '../../repositories/admin-application.repository';
+import { UserProfileRepository } from '../../repositories/user-profile.repository';
+import { CreateUserProfileDto, UpdateUserProfileDto } from './dto/user-profile.dto';
+import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 
 @Controller('users')
 export class UserController {
@@ -13,11 +16,11 @@ export class UserController {
         private readonly httpService: HttpService,
         private readonly jwtService: JwtService,
         private readonly adminApplicationRepository: AdminApplicationRepository,
+        private readonly userProfileRepository: UserProfileRepository,
     ) {}
 
     /**
      * 微信小程序登录
-     * 前端传 code，后端换取 openid，完成注册/登录，返回 JWT
      * POST /users/wx-login
      */
     @Post('wx-login')
@@ -47,18 +50,67 @@ export class UserController {
             return res.status(HttpStatus.INTERNAL_SERVER_ERROR).send({ success: false, message: '微信登录失败' });
         }
 
-        // 注册或登录用户
         const user = await this.userService.findOrCreateUser({ wechatOpenId: openid });
-
-        // 签发 JWT，payload 中携带 openid 和 userId
         const token = this.jwtService.sign({ openid: user.wechatOpenId, userId: user.userId });
-
-        // 检查是否为已审批的管理员
         const approvedApp = await this.adminApplicationRepository.findApprovedByOpenid(openid);
 
         return res.status(HttpStatus.OK).send({
             success: true,
             data: { token, admin: !!approvedApp },
         });
+    }
+
+    /**
+     * 获取当前用户的常用人员列表
+     * GET /users/profiles
+     */
+    @Get('profiles')
+    @UseGuards(JwtAuthGuard)
+    async getProfiles(@Req() req: Request & { user: { openid: string } }) {
+        const profiles = await this.userProfileRepository.findByOpenId(req.user.openid);
+        return { success: true, data: profiles };
+    }
+
+    /**
+     * 新增常用人员
+     * POST /users/profiles
+     */
+    @Post('profiles')
+    @UseGuards(JwtAuthGuard)
+    async createProfile(
+        @Req() req: Request & { user: { openid: string } },
+        @Body() dto: CreateUserProfileDto,
+    ) {
+        const profile = await this.userProfileRepository.create(req.user.openid, dto);
+        return { success: true, data: profile };
+    }
+
+    /**
+     * 更新常用人员
+     * PUT /users/profiles/:profileId
+     */
+    @Put('profiles/:profileId')
+    @UseGuards(JwtAuthGuard)
+    async updateProfile(
+        @Req() req: Request & { user: { openid: string } },
+        @Param('profileId') profileId: string,
+        @Body() dto: UpdateUserProfileDto,
+    ) {
+        const profile = await this.userProfileRepository.update(profileId, req.user.openid, dto);
+        return { success: true, data: profile };
+    }
+
+    /**
+     * 删除常用人员
+     * DELETE /users/profiles/:profileId
+     */
+    @Delete('profiles/:profileId')
+    @UseGuards(JwtAuthGuard)
+    async deleteProfile(
+        @Req() req: Request & { user: { openid: string } },
+        @Param('profileId') profileId: string,
+    ) {
+        await this.userProfileRepository.delete(profileId, req.user.openid);
+        return { success: true };
     }
 }

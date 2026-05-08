@@ -1,26 +1,33 @@
-import { IsDateString, IsEnum, IsInt, IsNotEmpty, IsOptional, IsString, Matches, Min, ValidateIf } from 'class-validator';
+import { IsDateString, IsEnum, IsInt, IsNotEmpty, IsOptional, IsString, Matches, Min, ValidateIf, ValidateNested, ArrayMinSize, IsArray } from 'class-validator';
+import { Type } from 'class-transformer';
 import { TimeSlot, TravelMode, VehicleType } from '../../../entities/booking.entity';
+
+export class PassengerDto {
+    @IsString()
+    @IsNotEmpty({ message: '姓名不能为空' })
+    name: string;
+
+    @IsString()
+    @IsNotEmpty({ message: '手机号不能为空' })
+    @Matches(/^1[3-9]\d{9}$/, { message: '手机号格式不正确' })
+    phone: string;
+
+    @IsString()
+    @IsNotEmpty({ message: '身份证号不能为空' })
+    @Matches(/^[1-9]\d{5}(18|19|20)\d{2}(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])\d{3}[\dXx]$/, { message: '身份证号格式不正确' })
+    idCard: string;
+}
 
 /**
  * 创建预约订单 DTO
  */
 export class CreateBookingDto {
-    /** 联系人姓名 */
-    @IsString()
-    @IsNotEmpty()
-    name: string;
-
-    /** 联系人手机号 (格式: 1开头的11位数字) */
-    @IsString()
-    @IsNotEmpty()
-    @Matches(/^1[3-9]\d{9}$/, { message: 'Invalid phone number format' })
-    phone: string;
-
-    /** 联系人身份证号 (18位) */
-    @IsString()
-    @IsNotEmpty()
-    @Matches(/^[1-9]\d{5}(18|19|20)\d{2}(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])\d{3}[\dXx]$/, { message: 'Invalid ID card format' })
-    idCard: string;
+    /** 出行人员列表，数量须与 personCount 一致 */
+    @IsArray()
+    @ArrayMinSize(1, { message: '至少填写一名出行人员' })
+    @ValidateNested({ each: true })
+    @Type(() => PassengerDto)
+    passengers: PassengerDto[];
 
     /** 预约日期 (格式: YYYY-MM-DD) */
     @IsDateString()

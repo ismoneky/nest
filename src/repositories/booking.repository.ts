@@ -280,6 +280,38 @@ export class BookingRepository {
     }
 
     /**
+     * 获取全量订单（不分页，供导出使用）
+     */
+    async getAllBookingsForExport(query: {
+        bookingDate?: string;
+        timeSlot?: TimeSlot;
+        status?: BookingStatus[];
+        keyword?: string;
+    }) {
+        const qb = this.bookingRepository
+            .createQueryBuilder('booking')
+            .orderBy('booking.createdAt', 'DESC');
+
+        if (query.bookingDate) {
+            qb.andWhere('booking.bookingDate = :bookingDate', { bookingDate: query.bookingDate });
+        }
+        if (query.timeSlot) {
+            qb.andWhere('booking.timeSlot = :timeSlot', { timeSlot: query.timeSlot });
+        }
+        if (query.status?.length) {
+            qb.andWhere('booking.status IN (:...status)', { status: query.status });
+        }
+        if (query.keyword) {
+            qb.andWhere(
+                '(booking.name LIKE :kw OR booking.phone LIKE :kw OR booking.bookingId LIKE :kw)',
+                { kw: `%${query.keyword}%` },
+            );
+        }
+
+        return qb.getMany();
+    }
+
+    /**
      * 更新过去日期的未完成订单为已完成状态
      */
     async updatePastBookings(todayStart: Date) {

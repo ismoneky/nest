@@ -79,16 +79,20 @@ export class Booking {
     @Index()
     wechatOpenId: string;
 
-    /** 联系人姓名 */
-    @Column()
+    /** 出行人员列表（JSON数组，每项含 name/phone/idCard） */
+    @Column({ type: 'text', nullable: true })
+    passengers: string;
+
+    /** 联系人姓名（兼容字段，同步自 passengers[0].name） */
+    @Column({ nullable: true })
     name: string;
 
-    /** 联系人手机号 */
-    @Column()
+    /** 联系人手机号（兼容字段，同步自 passengers[0].phone） */
+    @Column({ nullable: true })
     phone: string;
 
-    /** 联系人身份证号 */
-    @Column()
+    /** 联系人身份证号（兼容字段，同步自 passengers[0].idCard） */
+    @Column({ nullable: true })
     idCard: string;
 
     /** 预约日期 */

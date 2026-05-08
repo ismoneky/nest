@@ -14,6 +14,7 @@ import { WechatPayModule } from './modules/wechat-pay/wechat-pay.module';
 
 // 导入所有实体
 import { User } from './entities/user.entity';
+import { UserProfile } from './entities/user-profile.entity';
 import { Admin } from './entities/admin.entity';
 import { Booking } from './entities/booking.entity';
 import { Announcement } from './entities/announcement.entity';
@@ -28,7 +29,7 @@ import { Feedback } from './entities/feedback.entity';
             database: process.env.DATABASE_PATH || 'data/app.db',
             synchronize: process.env.NODE_ENV !== 'production',
             logging: process.env.DATABASE_LOGGING === 'true',
-            entities: [User, Admin, Booking, Announcement, SystemConfig, AdminApplication, Feedback],
+            entities: [User, UserProfile, Admin, Booking, Announcement, SystemConfig, AdminApplication, Feedback],
         }),
         ScheduleModule.forRoot(),
         UserModule,

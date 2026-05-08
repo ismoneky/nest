@@ -68,9 +68,17 @@ export class BookingService {
         const paymentExpiredAt = new Date();
         paymentExpiredAt.setMinutes(paymentExpiredAt.getMinutes() + 30);
 
+        // 从 passengers[0] 同步联系人信息到兼容字段
+        const firstPassenger = createBookingDto.passengers[0];
+        const passengersJson = JSON.stringify(createBookingDto.passengers);
+
         // 创建订单，初始状态：预约待确认 + 未支付
         const booking = await this.bookingRepository.createBooking({
             ...createBookingDto,
+            passengers: passengersJson,
+            name: firstPassenger.name,
+            phone: firstPassenger.phone,
+            idCard: firstPassenger.idCard,
             status: BookingStatus.PENDING,
             paymentStatus: PaymentStatus.UNPAID,
             refundStatus: RefundStatus.NONE,
@@ -454,5 +462,17 @@ export class BookingService {
      */
     async getBookingByOutTradeNo(outTradeNo: string) {
         return await this.bookingRepository.getBookingByOutTradeNo(outTradeNo);
+    }
+
+    /**
+     * 获取全量订单（供导出用），支持与列表相同的筛选条件，不分页
+     */
+    async getAllBookingsForExport(query: {
+        bookingDate?: string;
+        timeSlot?: TimeSlot;
+        status?: BookingStatus[];
+        keyword?: string;
+    }) {
+        return await this.bookingRepository.getAllBookingsForExport(query);
     }
 }

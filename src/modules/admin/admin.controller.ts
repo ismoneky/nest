@@ -1,5 +1,4 @@
-import { Body, Controller, Get, HttpStatus, Post, Query, Res, UseGuards, StreamableFile } from '@nestjs/common';
-import { createReadStream } from 'fs';
+import { Body, Controller, Get, HttpStatus, Post, Query, Res, UseGuards } from '@nestjs/common';
 import { Response } from 'express';
 import { AdminService } from './admin.service';
 import { BookingService } from '../booking/booking.service';
@@ -7,9 +6,6 @@ import { LoginDto } from './dto/login.dto';
 import { GetBookingsAdminDto } from './dto/get-bookings-admin.dto';
 import { AdminAuthGuard } from '../../common/guards/admin-jwt-auth.guard';
 
-/**
- * 管理员控制器
- */
 @Controller('admin')
 export class AdminController {
     constructor(
@@ -32,20 +28,20 @@ export class AdminController {
     }
 
     /**
-     * 导出全量订单为 Excel
+     * 导出订单为 Excel（支持与列表相同的筛选条件）
      * GET /admin/bookings/export
      */
     @Get('bookings/export')
     @UseGuards(AdminAuthGuard)
-    async exportBookings(@Res({ passthrough: true }) res: Response) {
-        const filePath = await this.adminService.exportBookingsToExcel();
-        const stream = createReadStream(filePath);
-        stream.on('close', () => this.adminService.cleanupFile(filePath));
-        (res as any).set({
+    async exportBookings(@Query() query: GetBookingsAdminDto, @Res() res: Response) {
+        const buffer = await this.adminService.exportBookingsToBuffer(query);
+        const filename = `bookings_${new Date().toISOString().substring(0, 10)}.xlsx`;
+        res.set({
             'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-            'Content-Disposition': `attachment; filename="bookings_${Date.now()}.xlsx"`,
+            'Content-Disposition': `attachment; filename="${filename}"`,
+            'Content-Length': buffer.length,
         });
-        return new StreamableFile(stream);
+        res.end(buffer);
     }
 
     /**
