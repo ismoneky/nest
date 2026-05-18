@@ -1,3 +1,6 @@
+rm -rf dist
+npm run build
+
 scp -r /Users/zhangzhiwei/Desktop/code/copy/nest/package.json root@82.157.111.208:/app/backend/package.json
 
 scp -r /Users/zhangzhiwei/Desktop/code/copy/nest/package-lock.json root@82.157.111.208:/app/backend/package-lock.json
