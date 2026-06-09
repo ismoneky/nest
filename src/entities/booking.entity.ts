@@ -24,6 +24,7 @@ export enum TravelMode {
 export enum VehicleType {
     WHEEL_MOTORCYCLE = 'wheelMotorcycle', // 摩托
     SMALL_CAR = 'smallCar', // 小型客车
+    NON_MOTORIZED = 'nonMotorized', // 非机动车
 }
 
 /**

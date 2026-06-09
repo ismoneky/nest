@@ -22,6 +22,7 @@ const TRAVEL_MODE_LABEL: Record<string, string> = {
 const VEHICLE_TYPE_LABEL: Record<string, string> = {
     smallCar:        '小型客车',
     wheelMotorcycle: '摩托',
+    nonMotorized:    '非机动车',
 };
 
 const TIME_SLOT_LABEL: Record<string, string> = {
