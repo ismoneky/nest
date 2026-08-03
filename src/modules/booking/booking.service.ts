@@ -75,11 +75,13 @@ export class BookingService {
             const freeEnabled = paymentConfig.freeQuotaEnabled === true;
             const freeLimit = paymentConfig.freeQuotaLimit ?? 100;
 
-            // 该预约日期的当日起止时间（免费名额按预约日期按日统计）
             const bookingDate = new Date(createBookingDto.bookingDate);
-            const dayStart = new Date(bookingDate.getFullYear(), bookingDate.getMonth(), bookingDate.getDate());
-            const nextDay = new Date(dayStart);
-            nextDay.setDate(dayStart.getDate() + 1);
+            // 免费名额按「当天」计算：仅当预约日期为今天时才参与免费，其余日期一律收费
+            const todayStart = new Date();
+            todayStart.setHours(0, 0, 0, 0);
+            const nextDay = new Date(todayStart);
+            nextDay.setDate(todayStart.getDate() + 1);
+            const bookingIsToday = bookingDate.getTime() >= todayStart.getTime() && bookingDate.getTime() < nextDay.getTime();
 
             let isFree = false;
             let amount: number;
@@ -87,23 +89,23 @@ export class BookingService {
             let paymentStatus: PaymentStatus;
             let paymentExpiredAt: Date | null;
 
-            if (freeEnabled) {
-                // 当前用户在该预约日期是否已有免费订单
+            if (freeEnabled && bookingIsToday) {
+                // 当前用户今天是否已有免费订单
                 const userFreeCount = await bookingRepo
                     .createQueryBuilder('booking')
                     .where('booking.wechatOpenId = :openid', { openid: createBookingDto.wechatOpenId })
                     .andWhere('booking.isFree = :isFree', { isFree: true })
-                    .andWhere('booking.bookingDate >= :dayStart', { dayStart })
+                    .andWhere('booking.bookingDate >= :dayStart', { dayStart: todayStart })
                     .andWhere('booking.bookingDate < :nextDay', { nextDay })
                     .getCount();
 
                 if (userFreeCount === 0) {
-                    // 该预约日期已使用的免费名额（去重用户数）
+                    // 今天已使用的免费名额（去重用户数）
                     const freeCountResult = await bookingRepo
                         .createQueryBuilder('booking')
                         .select('COUNT(DISTINCT booking.wechatOpenId)', 'count')
                         .where('booking.isFree = :isFree', { isFree: true })
-                        .andWhere('booking.bookingDate >= :dayStart', { dayStart })
+                        .andWhere('booking.bookingDate >= :dayStart', { dayStart: todayStart })
                         .andWhere('booking.bookingDate < :nextDay', { nextDay })
                         .getRawOne();
                     const currentFreeUsers = parseInt(freeCountResult?.count || '0', 10);
@@ -246,11 +248,18 @@ export class BookingService {
         const freeEnabled = paymentConfig.freeQuotaEnabled === true;
         const freeLimit = paymentConfig.freeQuotaLimit ?? 100;
 
-        // 目标日期的当日起止时间（免费名额按预约日期按日统计）
+        // 目标日期的当日起止时间（免费名额按当天统计）
         const targetDate = bookingDate ? new Date(bookingDate) : new Date();
         const dayStart = new Date(targetDate.getFullYear(), targetDate.getMonth(), targetDate.getDate());
         const nextDay = new Date(dayStart);
         nextDay.setDate(dayStart.getDate() + 1);
+
+        // 是否今天（仅预约日期为今天时才有免费资格）
+        const todayStart = new Date();
+        todayStart.setHours(0, 0, 0, 0);
+        const tomorrowStart = new Date(todayStart);
+        tomorrowStart.setDate(todayStart.getDate() + 1);
+        const bookingIsToday = targetDate.getTime() >= todayStart.getTime() && targetDate.getTime() < tomorrowStart.getTime();
 
         // 该日已使用的免费名额（去重用户数）
         const freeCountResult = await this.dataSource
@@ -275,11 +284,12 @@ export class BookingService {
 
         return {
             bookingDate: targetDate.toLocaleDateString('sv'),
+            bookingIsToday,
             freeQuotaEnabled: freeEnabled,
             freeQuotaLimit: freeLimit,
             freeQuotaUsed: usedCount,
             freeQuotaRemaining: Math.max(0, freeLimit - usedCount),
-            userCanGetFree: freeEnabled && usedCount < freeLimit && userFreeCount === 0,
+            userCanGetFree: freeEnabled && bookingIsToday && usedCount < freeLimit && userFreeCount === 0,
             userHasFreeBooking: userFreeCount > 0,
         };
     }
