@@ -134,6 +134,10 @@ export class Booking {
     @Column({ default: '' })
     remarks: string;
 
+    /** 是否为免费预约（每日前N名免费活动） */
+    @Column({ default: false })
+    isFree: boolean;
+
     /** 订单状态 */
     @Column({ type: 'varchar', default: 'pending' })
     @Index()

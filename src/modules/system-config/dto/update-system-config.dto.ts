@@ -30,6 +30,17 @@ export class PaymentConfigDto {
     @IsInt()
     @Min(0)
     paymentAmount: number;
+
+    /** 每日前N名用户免费：是否开启 */
+    @IsOptional()
+    @IsBoolean()
+    freeQuotaEnabled?: boolean;
+
+    /** 每日前N名用户免费：免费名额上限（去重用户数，按日重置） */
+    @IsOptional()
+    @IsInt()
+    @Min(1)
+    freeQuotaLimit?: number;
 }
 
 /**

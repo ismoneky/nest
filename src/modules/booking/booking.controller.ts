@@ -7,12 +7,19 @@ import { GetBookingStatsDto } from './dto/getBookingStats.dto';
 import { UpdateBookingDto } from './dto/updateBooking.dto';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { BookingStatus } from '../../entities/booking.entity';
-import { IsEnum, IsOptional } from 'class-validator';
+import { IsDateString, IsEnum, IsOptional } from 'class-validator';
 
 class GetBookingCountDto {
     @IsOptional()
     @IsEnum(BookingStatus)
     status?: BookingStatus;
+}
+
+class GetFreeQuotaStatusDto {
+    /** 预约日期 (YYYY-MM-DD)，不传则默认今天 */
+    @IsOptional()
+    @IsDateString()
+    bookingDate?: string;
 }
 
 /**
@@ -96,6 +103,24 @@ export class BookingController {
         return res.status(HttpStatus.OK).send({
             success: true,
             data: { count },
+        });
+    }
+
+    /**
+     * 查询每日免费预约名额状态（判断当前用户是否可享受免费）
+     * GET /bookings/free-quota/status?bookingDate=2026-08-04
+     * @param query 查询条件 (bookingDate 可选)
+     * @param req Express 请求对象
+     * @param res Express 响应对象
+     */
+    @Get('free-quota/status')
+    @UseGuards(JwtAuthGuard)
+    async getFreeQuotaStatus(@Query() query: GetFreeQuotaStatusDto, @Req() req: Request, @Res() res: Response) {
+        const { openid } = req['user'] as { openid: string };
+        const status = await this.bookingService.getFreeQuotaStatus(openid, query.bookingDate);
+        return res.status(HttpStatus.OK).send({
+            success: true,
+            data: status,
         });
     }
 

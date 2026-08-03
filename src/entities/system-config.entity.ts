@@ -24,6 +24,10 @@ export interface TimeSlotLimit {
 export interface PaymentConfig {
     /** 支付金额 */
     paymentAmount: number;
+    /** 每日前N名用户免费：是否开启 */
+    freeQuotaEnabled?: boolean;
+    /** 每日前N名用户免费：免费名额上限（去重用户数，按日重置） */
+    freeQuotaLimit?: number;
 }
 
 /**
@@ -61,7 +65,7 @@ export class SystemConfig {
     /** 支付配置 (JSON 存储) */
     @Column({
         type: 'text',
-        default: '{"paymentAmount":0}',
+        default: '{"paymentAmount":0,"freeQuotaEnabled":false,"freeQuotaLimit":100}',
     })
     paymentConfigJson: string;
 

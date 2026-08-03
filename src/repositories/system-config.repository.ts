@@ -31,7 +31,7 @@ export class SystemConfigRepository {
                     bookingDisabledMessage: '当前时间段暂不开放预约，请稍后再试',
                     bannersJson: '[]',
                     timeSlotLimitJson: '{"morningMaxPeople":1000,"afternoonMaxPeople":1000}',
-                    paymentConfigJson: '{"paymentAmount":0}',
+                    paymentConfigJson: '{"paymentAmount":0,"freeQuotaEnabled":false,"freeQuotaLimit":100}',
                 });
                 await this.configRepository.save(config);
             }

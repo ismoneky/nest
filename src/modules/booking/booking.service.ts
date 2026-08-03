@@ -1,11 +1,14 @@
 import { Injectable, BadRequestException, ForbiddenException, Logger } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
+import { DataSource } from 'typeorm';
+import { randomUUID } from 'crypto';
 import { BookingRepository } from '../../repositories/booking.repository';
 import { AdminApplicationRepository } from '../../repositories/admin-application.repository';
 import { CreateBookingDto } from './dto/createBooking.dto';
 import { GetBookingsDto } from './dto/getBookings.dto';
 import { UpdateBookingDto } from './dto/updateBooking.dto';
-import { TimeSlot, BookingStatus, PaymentStatus, RefundStatus } from '../../entities/booking.entity';
+import { TimeSlot, BookingStatus, PaymentStatus, RefundStatus, Booking } from '../../entities/booking.entity';
+import { SystemConfig } from '../../entities/system-config.entity';
 import { WechatPayService } from '../wechat-pay/wechat-pay.service';
 import { SystemConfigService } from '../system-config/system-config.service';
 
@@ -23,6 +26,7 @@ export class BookingService {
         private readonly wechatPayService: WechatPayService,
         private readonly systemConfigService: SystemConfigService,
         private readonly adminApplicationRepository: AdminApplicationRepository,
+        private readonly dataSource: DataSource,
     ) {}
 
     /**
@@ -60,33 +64,97 @@ export class BookingService {
             throw new BadRequestException(`该时间段预约人数已达上限，当前剩余名额：${maxPeople - currentPeople}`);
         }
 
-        // 计算支付金额（从系统配置获取）
-        const paymentConfig = await this.systemConfigService.getPaymentConfig();
-        const amount = createBookingDto.personCount * paymentConfig.paymentAmount; // 转换为分
+        // 事务内：原子地判断每日免费名额并创建订单，避免并发下免费名额超卖
+        return await this.dataSource.transaction(async (entityManager) => {
+            const bookingRepo = entityManager.getRepository(Booking);
+            const configRepo = entityManager.getRepository(SystemConfig);
 
-        // 设置支付超时时间（30分钟）
-        const paymentExpiredAt = new Date();
-        paymentExpiredAt.setMinutes(paymentExpiredAt.getMinutes() + 30);
+            // 读取支付配置（含每日免费名额配置）
+            const config = await configRepo.findOne({ where: { configId: 'system_config' } });
+            const paymentConfig = config?.paymentConfig ?? { paymentAmount: 0 };
+            const freeEnabled = paymentConfig.freeQuotaEnabled === true;
+            const freeLimit = paymentConfig.freeQuotaLimit ?? 100;
 
-        // 从 passengers[0] 同步联系人信息到兼容字段
-        const firstPassenger = createBookingDto.passengers[0];
-        const passengersJson = JSON.stringify(createBookingDto.passengers);
+            // 该预约日期的当日起止时间（免费名额按预约日期按日统计）
+            const bookingDate = new Date(createBookingDto.bookingDate);
+            const dayStart = new Date(bookingDate.getFullYear(), bookingDate.getMonth(), bookingDate.getDate());
+            const nextDay = new Date(dayStart);
+            nextDay.setDate(dayStart.getDate() + 1);
 
-        // 创建订单，初始状态：预约待确认 + 未支付
-        const booking = await this.bookingRepository.createBooking({
-            ...createBookingDto,
-            passengers: passengersJson,
-            name: firstPassenger.name,
-            phone: firstPassenger.phone,
-            idCard: firstPassenger.idCard,
-            status: BookingStatus.PENDING,
-            paymentStatus: PaymentStatus.UNPAID,
-            refundStatus: RefundStatus.NONE,
-            amount,
-            paymentExpiredAt,
+            let isFree = false;
+            let amount: number;
+            let status: BookingStatus;
+            let paymentStatus: PaymentStatus;
+            let paymentExpiredAt: Date | null;
+
+            if (freeEnabled) {
+                // 当前用户在该预约日期是否已有免费订单
+                const userFreeCount = await bookingRepo
+                    .createQueryBuilder('booking')
+                    .where('booking.wechatOpenId = :openid', { openid: createBookingDto.wechatOpenId })
+                    .andWhere('booking.isFree = :isFree', { isFree: true })
+                    .andWhere('booking.bookingDate >= :dayStart', { dayStart })
+                    .andWhere('booking.bookingDate < :nextDay', { nextDay })
+                    .getCount();
+
+                if (userFreeCount === 0) {
+                    // 该预约日期已使用的免费名额（去重用户数）
+                    const freeCountResult = await bookingRepo
+                        .createQueryBuilder('booking')
+                        .select('COUNT(DISTINCT booking.wechatOpenId)', 'count')
+                        .where('booking.isFree = :isFree', { isFree: true })
+                        .andWhere('booking.bookingDate >= :dayStart', { dayStart })
+                        .andWhere('booking.bookingDate < :nextDay', { nextDay })
+                        .getRawOne();
+                    const currentFreeUsers = parseInt(freeCountResult?.count || '0', 10);
+
+                    if (currentFreeUsers < freeLimit) {
+                        isFree = true;
+                    }
+                }
+            }
+
+            if (isFree) {
+                // 免费订单：直接确认生效，跳过微信支付流程
+                amount = 0;
+                status = BookingStatus.CONFIRMED;
+                paymentStatus = PaymentStatus.PAID;
+                paymentExpiredAt = null;
+            } else {
+                // 收费订单：初始状态为待确认 + 未支付
+                amount = createBookingDto.personCount * (paymentConfig.paymentAmount ?? 0);
+                status = BookingStatus.PENDING;
+                paymentStatus = PaymentStatus.UNPAID;
+                paymentExpiredAt = new Date();
+                paymentExpiredAt.setMinutes(paymentExpiredAt.getMinutes() + 30);
+            }
+
+            // 从 passengers[0] 同步联系人信息到兼容字段
+            const firstPassenger = createBookingDto.passengers[0];
+            const passengersJson = JSON.stringify(createBookingDto.passengers);
+
+            // 生成以 TL 开头的 11 位随机字符订单号
+            const bookingId = `TL${randomUUID().replace(/-/g, '').substring(0, 11).toUpperCase()}`;
+
+            // 创建订单
+            const booking = bookingRepo.create({
+                ...createBookingDto,
+                bookingId,
+                bookingDate,
+                passengers: passengersJson,
+                name: firstPassenger.name,
+                phone: firstPassenger.phone,
+                idCard: firstPassenger.idCard,
+                isFree,
+                amount,
+                status,
+                paymentStatus,
+                refundStatus: RefundStatus.NONE,
+                paymentExpiredAt,
+            });
+
+            return await bookingRepo.save(booking);
         });
-
-        return booking;
     }
 
     /**
@@ -105,6 +173,10 @@ export class BookingService {
      * @returns 被删除的订单
      */
     async deleteBooking(bookingId: string) {
+        const booking = await this.bookingRepository.getBookingById(bookingId);
+        if (booking.isFree) {
+            throw new BadRequestException('免费预约不支持取消');
+        }
         return await this.bookingRepository.deleteBooking(bookingId);
     }
 
@@ -161,6 +233,55 @@ export class BookingService {
      */
     async getBookingStatsByDate(bookingDate: string) {
         return await this.bookingRepository.getBookingStatsByDate(bookingDate);
+    }
+
+    /**
+     * 查询每日免费预约名额状态（前端用于判断当前用户是否可享受免费）
+     * @param openid 用户 openid
+     * @param bookingDate 预约日期 (YYYY-MM-DD)，不传则默认今天
+     * @returns 免费名额状态
+     */
+    async getFreeQuotaStatus(openid: string, bookingDate?: string) {
+        const paymentConfig = await this.systemConfigService.getPaymentConfig();
+        const freeEnabled = paymentConfig.freeQuotaEnabled === true;
+        const freeLimit = paymentConfig.freeQuotaLimit ?? 100;
+
+        // 目标日期的当日起止时间（免费名额按预约日期按日统计）
+        const targetDate = bookingDate ? new Date(bookingDate) : new Date();
+        const dayStart = new Date(targetDate.getFullYear(), targetDate.getMonth(), targetDate.getDate());
+        const nextDay = new Date(dayStart);
+        nextDay.setDate(dayStart.getDate() + 1);
+
+        // 该日已使用的免费名额（去重用户数）
+        const freeCountResult = await this.dataSource
+            .getRepository(Booking)
+            .createQueryBuilder('booking')
+            .select('COUNT(DISTINCT booking.wechatOpenId)', 'count')
+            .where('booking.isFree = :isFree', { isFree: true })
+            .andWhere('booking.bookingDate >= :dayStart', { dayStart })
+            .andWhere('booking.bookingDate < :nextDay', { nextDay })
+            .getRawOne();
+        const usedCount = parseInt(freeCountResult?.count || '0', 10);
+
+        // 当前用户在该日是否已有免费订单
+        const userFreeCount = await this.dataSource
+            .getRepository(Booking)
+            .createQueryBuilder('booking')
+            .where('booking.wechatOpenId = :openid', { openid })
+            .andWhere('booking.isFree = :isFree', { isFree: true })
+            .andWhere('booking.bookingDate >= :dayStart', { dayStart })
+            .andWhere('booking.bookingDate < :nextDay', { nextDay })
+            .getCount();
+
+        return {
+            bookingDate: targetDate.toLocaleDateString('sv'),
+            freeQuotaEnabled: freeEnabled,
+            freeQuotaLimit: freeLimit,
+            freeQuotaUsed: usedCount,
+            freeQuotaRemaining: Math.max(0, freeLimit - usedCount),
+            userCanGetFree: freeEnabled && usedCount < freeLimit && userFreeCount === 0,
+            userHasFreeBooking: userFreeCount > 0,
+        };
     }
 
     /**
@@ -247,6 +368,10 @@ export class BookingService {
 
         if (booking.wechatOpenId !== openid) {
             throw new BadRequestException('无权操作该订单');
+        }
+
+        if (booking.isFree) {
+            throw new BadRequestException('该订单为免费预约，无需支付');
         }
 
         if (booking.status === BookingStatus.CANCELLED) {
@@ -343,6 +468,9 @@ export class BookingService {
 
         if (booking.wechatOpenId !== openid) {
             throw new BadRequestException('无权操作该订单');
+        }
+        if (booking.isFree) {
+            throw new BadRequestException('免费预约无需退款');
         }
         if (booking.status === BookingStatus.COMPLETED) {
             throw new BadRequestException('订单已完成，无法退款');
