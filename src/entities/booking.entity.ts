@@ -134,9 +134,13 @@ export class Booking {
     @Column({ default: '' })
     remarks: string;
 
-    /** 是否为免费预约（每日前N名免费活动） */
+    /** 是否为免费预约（每日前N名免费活动或月卡会员） */
     @Column({ default: false })
     isFree: boolean;
+
+    /** 免费来源：dailyQuota=每日免费名额，member=月卡会员 */
+    @Column({ type: 'varchar', nullable: true })
+    freeReason?: string;
 
     /** 订单状态 */
     @Column({ type: 'varchar', default: 'pending' })

@@ -9,6 +9,7 @@ import { AdminApplicationRepository } from '../../repositories/admin-application
 import { WechatPayModule } from '../wechat-pay/wechat-pay.module';
 import { SystemConfigModule } from '../system-config/system-config.module';
 import { UserModule } from '../user/user.module';
+import { MemberModule } from '../member/member.module';
 
 @Module({
   imports: [
@@ -16,6 +17,7 @@ import { UserModule } from '../user/user.module';
     WechatPayModule,
     SystemConfigModule,
     UserModule,
+    MemberModule,
   ],
   controllers: [BookingController],
   providers: [BookingService, BookingRepository, AdminApplicationRepository],

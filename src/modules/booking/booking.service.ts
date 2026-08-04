@@ -11,6 +11,7 @@ import { TimeSlot, BookingStatus, PaymentStatus, RefundStatus, Booking } from '.
 import { SystemConfig } from '../../entities/system-config.entity';
 import { WechatPayService } from '../wechat-pay/wechat-pay.service';
 import { SystemConfigService } from '../system-config/system-config.service';
+import { MemberService } from '../member/member.service';
 
 /**
  * 预约订单业务逻辑层
@@ -27,6 +28,7 @@ export class BookingService {
         private readonly systemConfigService: SystemConfigService,
         private readonly adminApplicationRepository: AdminApplicationRepository,
         private readonly dataSource: DataSource,
+        private readonly memberService: MemberService,
     ) {}
 
     /**
@@ -69,6 +71,16 @@ export class BookingService {
             const bookingRepo = entityManager.getRepository(Booking);
             const configRepo = entityManager.getRepository(SystemConfig);
 
+            // SQLite 使用 DEFERRED 事务，读操作不会加锁，导致并发事务可能同时读到相同的免费名额计数后超卖。
+            // 解决方案：在事务内最先执行一条写操作（对 system_configs 的无副作用 UPDATE），
+            // 立即获取 SQLite RESERVED 锁，使后续并发的写事务阻塞等待，保证读-写串行化。
+            await configRepo
+                .createQueryBuilder()
+                .update(SystemConfig)
+                .set({ updatedAt: new Date() })
+                .where('configId = :configId', { configId: 'system_config' })
+                .execute();
+
             // 读取支付配置（含每日免费名额配置）
             const config = await configRepo.findOne({ where: { configId: 'system_config' } });
             const paymentConfig = config?.paymentConfig ?? { paymentAmount: 0 };
@@ -84,12 +96,21 @@ export class BookingService {
             const bookingIsToday = bookingDate.getTime() >= todayStart.getTime() && bookingDate.getTime() < nextDay.getTime();
 
             let isFree = false;
+            let freeReason: string | null = null;
             let amount: number;
             let status: BookingStatus;
             let paymentStatus: PaymentStatus;
             let paymentExpiredAt: Date | null;
 
-            if (freeEnabled && bookingIsToday) {
+            // 优先判定：月卡会员免费（不限次数，受每日最大预约数控制，不占每日免费名额）
+            const activeMember = await this.memberService.getActiveMemberByOpenId(createBookingDto.wechatOpenId);
+            if (activeMember) {
+                isFree = true;
+                freeReason = 'member';
+            }
+
+            // 其次判定：每日前N名免费名额（仅当会员免费未命中时）
+            if (!isFree && freeEnabled && bookingIsToday) {
                 // 当前用户今天是否已有免费订单
                 const userFreeCount = await bookingRepo
                     .createQueryBuilder('booking')
@@ -112,6 +133,7 @@ export class BookingService {
 
                     if (currentFreeUsers < freeLimit) {
                         isFree = true;
+                        freeReason = 'dailyQuota';
                     }
                 }
             }
@@ -148,6 +170,7 @@ export class BookingService {
                 phone: firstPassenger.phone,
                 idCard: firstPassenger.idCard,
                 isFree,
+                freeReason,
                 amount,
                 status,
                 paymentStatus,
