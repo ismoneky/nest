@@ -365,7 +365,20 @@ export class BookingService {
                                 }
                                 // PROCESSING 状态不处理，等下次定时任务继续查
                             } catch (queryError) {
-                                this.logger.warn(`查询退款状态失败: ${order.outRefundNo}`, queryError);
+                                // 微信返回 404（退款单不存在）：退款单可能从未成功创建，
+                                // 将本地状态标记为 FAILED，避免定时任务反复查询不存在的退款单
+                                const errMsg = queryError?.message || '';
+                                if (errMsg.includes('404') || errMsg.includes('RESOURCE_NOT_EXISTS')) {
+                                    await this.bookingRepository.updateRefundStatus(
+                                        order.bookingId,
+                                        RefundStatus.FAILED,
+                                        undefined,
+                                        PaymentStatus.FAILED,
+                                    );
+                                    this.logger.warn(`退款单不存在，已标记为失败: ${order.outRefundNo}`);
+                                } else {
+                                    this.logger.warn(`查询退款状态失败: ${order.outRefundNo}`, queryError);
+                                }
                             }
                         })
                 );
