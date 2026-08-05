@@ -102,11 +102,16 @@ export class BookingService {
             let paymentStatus: PaymentStatus;
             let paymentExpiredAt: Date | null;
 
-            // 优先判定：月卡会员免费（不限次数，受每日最大预约数控制，不占每日免费名额）
+            // 优先判定：月卡会员免费（需校验至少一位乘客身份证与会员记录一致）
             const activeMember = await this.memberService.getActiveMemberByOpenId(createBookingDto.wechatOpenId);
             if (activeMember) {
-                isFree = true;
-                freeReason = 'member';
+                const isMemberTraveling = createBookingDto.passengers.some(
+                    p => p.idCard === activeMember.idCard,
+                );
+                if (isMemberTraveling) {
+                    isFree = true;
+                    freeReason = 'member';
+                }
             }
 
             // 其次判定：每日前N名免费名额（仅当会员免费未命中时）

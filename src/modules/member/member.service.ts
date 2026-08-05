@@ -113,4 +113,67 @@ export class MemberService {
     async getActiveMemberByOpenId(wechatOpenId: string): Promise<Member | null> {
         return await this.memberRepository.findActiveByOpenId(wechatOpenId);
     }
+
+    /**
+     * 查询用户会员状态（供前端用户端调用）
+     * @param wechatOpenId 微信 OpenID
+     * @returns 会员状态信息
+     */
+    async getMemberStatus(wechatOpenId: string) {
+        const member = await this.memberRepository.findActiveByOpenId(wechatOpenId);
+
+        if (!member) {
+            return {
+                isMember: false,
+                member: null,
+            };
+        }
+
+        const now = new Date();
+        const daysRemaining = Math.max(
+            0,
+            Math.ceil((member.endDate.getTime() - now.getTime()) / (1000 * 60 * 60 * 24)),
+        );
+
+        return {
+            isMember: true,
+            member: {
+                memberId: member.memberId,
+                name: member.name,
+                phone: member.phone,
+                idCard: member.idCard,
+                startDate: member.startDate,
+                endDate: member.endDate,
+                status: member.status,
+                daysRemaining,
+            },
+        };
+    }
+
+    /**
+     * 校验身份证号是否匹配当前用户的有效会员
+     * @param wechatOpenId 微信 OpenID
+     * @param idCard 待校验的身份证号
+     * @returns 是否匹配
+     */
+    async verifyMemberIdentity(wechatOpenId: string, idCard: string) {
+        const member = await this.memberRepository.findActiveByOpenId(wechatOpenId);
+
+        if (!member) {
+            return {
+                matched: false,
+                isMember: false,
+                reason: '当前用户无有效会员',
+            };
+        }
+
+        const matched = member.idCard === idCard;
+
+        return {
+            matched,
+            isMember: true,
+            name: matched ? member.name : undefined,
+            reason: matched ? undefined : '乘客身份证号与会员记录不一致',
+        };
+    }
 }
