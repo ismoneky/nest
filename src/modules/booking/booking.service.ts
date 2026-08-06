@@ -23,6 +23,8 @@ import { normalizeIdCard } from '../../common/utils/id-card.util';
 export class BookingService {
     private readonly logger = new Logger(BookingService.name);
     private cronRunning = false;
+    /** 预约白名单 openid：不受「关闭预约」开关限制（仍走正常金额/名额判定） */
+    private readonly whitelistOpenIds: Set<string>;
 
     constructor(
         private readonly bookingRepository: BookingRepository,
@@ -31,7 +33,13 @@ export class BookingService {
         private readonly adminApplicationRepository: AdminApplicationRepository,
         private readonly dataSource: DataSource,
         private readonly memberService: MemberService,
-    ) {}
+    ) {
+        // 从 env 解析白名单（逗号分隔），启动时一次性加载
+        const raw = process.env.BOOKING_WHITELIST_OPENIDS || '';
+        this.whitelistOpenIds = new Set(
+            raw.split(',').map((s) => s.trim()).filter(Boolean),
+        );
+    }
 
     /**
      * 创建预约订单
@@ -39,11 +47,14 @@ export class BookingService {
      * @returns 创建的订单
      */
     async createBooking(createBookingDto: CreateBookingDto & { wechatOpenId: string }) {
-        // 检查是否允许预约
-        const isBookingEnabled = await this.systemConfigService.isBookingEnabled();
-        if (!isBookingEnabled) {
-            const disabledMessage = await this.systemConfigService.getBookingDisabledMessage();
-            throw new BadRequestException(disabledMessage);
+        // 检查是否允许预约（白名单 openid 不受「关闭预约」开关限制）
+        const isWhitelisted = this.whitelistOpenIds.has(createBookingDto.wechatOpenId);
+        if (!isWhitelisted) {
+            const isBookingEnabled = await this.systemConfigService.isBookingEnabled();
+            if (!isBookingEnabled) {
+                const disabledMessage = await this.systemConfigService.getBookingDisabledMessage();
+                throw new BadRequestException(disabledMessage);
+            }
         }
 
         // 检查预约人数是否超过限制
@@ -325,7 +336,7 @@ export class BookingService {
     /**
      * 管理员查询订单列表（无 openid 限制）
      */
-    async getBookingsForAdmin(query: { bookingDate?: string; status?: BookingStatus[]; keyword?: string; page?: number; pageSize?: number }) {
+    async getBookingsForAdmin(query: { bookingDate?: string; createdStart?: string; createdEnd?: string; status?: BookingStatus[]; keyword?: string; page?: number; pageSize?: number }) {
         return await this.bookingRepository.getBookingsForAdmin(query);
     }
 
@@ -636,7 +647,7 @@ export class BookingService {
     /**
      * 获取全量订单（供导出用），支持与列表相同的筛选条件，不分页
      */
-    async getAllBookingsForExport(query: { bookingDate?: string; status?: BookingStatus[]; keyword?: string }) {
+    async getAllBookingsForExport(query: { bookingDate?: string; createdStart?: string; createdEnd?: string; status?: BookingStatus[]; keyword?: string }) {
         return await this.bookingRepository.getAllBookingsForExport(query);
     }
 }

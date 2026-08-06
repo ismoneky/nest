@@ -227,6 +227,8 @@ export class BookingRepository {
      */
     async getBookingsForAdmin(query: {
         bookingDate?: string;
+        createdStart?: string;
+        createdEnd?: string;
         status?: BookingStatus[];
         keyword?: string;
         page?: number;
@@ -239,12 +241,25 @@ export class BookingRepository {
 
             const qb = this.bookingRepository
                 .createQueryBuilder('booking')
+                // createdAt + id 双排序，保证同毫秒订单顺序稳定，分页不重复/不丢行
                 .orderBy('booking.createdAt', 'DESC')
+                .addOrderBy('booking.id', 'DESC')
                 .skip(skip)
                 .take(pageSize);
 
             if (query.bookingDate) {
                 qb.andWhere('booking.bookingDate = :bookingDate', { bookingDate: query.bookingDate });
+            }
+            // createdAt 存的是毫秒时间戳，createdStart 当天 00:00:00、createdEnd 当天 23:59:59.999
+            if (query.createdStart) {
+                const start = new Date(query.createdStart);
+                start.setHours(0, 0, 0, 0);
+                qb.andWhere('booking.createdAt >= :createdStart', { createdStart: start.getTime() });
+            }
+            if (query.createdEnd) {
+                const end = new Date(query.createdEnd);
+                end.setHours(23, 59, 59, 999);
+                qb.andWhere('booking.createdAt <= :createdEnd', { createdEnd: end.getTime() });
             }
             if (query.status?.length) {
                 qb.andWhere('booking.status IN (:...status)', { status: query.status });
@@ -275,15 +290,28 @@ export class BookingRepository {
      */
     async getAllBookingsForExport(query: {
         bookingDate?: string;
+        createdStart?: string;
+        createdEnd?: string;
         status?: BookingStatus[];
         keyword?: string;
     }) {
         const qb = this.bookingRepository
             .createQueryBuilder('booking')
-            .orderBy('booking.createdAt', 'DESC');
+            .orderBy('booking.createdAt', 'DESC')
+            .addOrderBy('booking.id', 'DESC');
 
         if (query.bookingDate) {
             qb.andWhere('booking.bookingDate = :bookingDate', { bookingDate: query.bookingDate });
+        }
+        if (query.createdStart) {
+            const start = new Date(query.createdStart);
+            start.setHours(0, 0, 0, 0);
+            qb.andWhere('booking.createdAt >= :createdStart', { createdStart: start.getTime() });
+        }
+        if (query.createdEnd) {
+            const end = new Date(query.createdEnd);
+            end.setHours(23, 59, 59, 999);
+            qb.andWhere('booking.createdAt <= :createdEnd', { createdEnd: end.getTime() });
         }
         if (query.status?.length) {
             qb.andWhere('booking.status IN (:...status)', { status: query.status });

@@ -7,6 +7,16 @@ export class GetBookingsAdminDto {
     @IsOptional()
     bookingDate?: string;
 
+    /** 创建日期范围：起始（含），格式 YYYY-MM-DD */
+    @IsDateString()
+    @IsOptional()
+    createdStart?: string;
+
+    /** 创建日期范围：结束（含），格式 YYYY-MM-DD */
+    @IsDateString()
+    @IsOptional()
+    createdEnd?: string;
+
     @Transform(({ value }) => (Array.isArray(value) ? value : value ? [value] : undefined))
     @IsEnum(BookingStatus, { each: true })
     @IsOptional()
