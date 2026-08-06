@@ -147,7 +147,6 @@ x-admin-key: <apiKey>
 | 参数名 | 类型 | 必填 | 描述 |
 | --- | --- | --- | --- |
 | bookingDate | string | 否 | 按日期筛选，格式 `YYYY-MM-DD` |
-| timeSlot | string | 否 | 按时间段筛选：`morning` / `afternoon` |
 | status | string | 否 | 按订单状态筛选 |
 | keyword | string | 否 | 关键字模糊搜索（姓名 / 手机号 / 订单号） |
 | page | number | 否 | 页码，默认 1 |
@@ -243,7 +242,7 @@ x-admin-key: <apiKey>
 | phone | string | 是 | 联系人手机号（1开头11位） |
 | idCard | string | 是 | 联系人身份证号（18位） |
 | bookingDate | string | 是 | 预约日期（格式：YYYY-MM-DD） |
-| timeSlot | string | 是 | 预约时间段（`morning` / `afternoon`） |
+| timeSlot | string | 否 | 预约时间段（已不再区分上下午，不传默认 `morning`） |
 | travelMode | string | 是 | 出行方式（`scenicBus` / `selfDriving` / `tourGroup`） |
 | licensePlate | string | 条件必填 | 车牌号（自驾时必填） |
 | vehicleType | string | 条件必填 | 车辆类型（自驾时必填，`wheelMotorcycle` / `smallCar`） |
@@ -292,13 +291,11 @@ x-admin-key: <apiKey>
 
 **校验逻辑**：
 - 检查系统配置是否开放预约
-- 检查预约时间是否晚于当前时间（上午场截止北京时间 12:00，下午场截止 18:00）
-- 检查该时间段剩余名额是否充足
+- 检查当天剩余预约名额是否充足（全天总限额 = `morningMaxPeople + afternoonMaxPeople`）
 - 支付金额 = `personCount × paymentAmount × 100`（单位：分），`paymentAmount` 从系统配置读取
 
 **可能的错误**：
 - `预约功能暂未开放` — 系统配置关闭了预约
-- `预约时间必须晚于当前时间` — 时间已过
 - `该时间段预约人数已达上限，当前剩余名额：N` — 名额不足
 
 #### 4.2 查询订单列表（分页）
@@ -315,7 +312,6 @@ x-admin-key: <apiKey>
 | page | number | 否 | 页码（默认 1） |
 | pageSize | number | 否 | 每页数量（默认 10） |
 | bookingDate | string | 否 | 预约日期（格式：YYYY-MM-DD） |
-| timeSlot | string | 否 | 预约时间段（`morning` / `afternoon`） |
 | status | string | 否 | 订单状态 |
 
 **响应示例**：
@@ -697,11 +693,11 @@ function pollPaymentStatus(bookingId) {
 
 ## 数据类型定义
 
-### TimeSlot 枚举
+### TimeSlot 枚举（已废弃分时段语义，订单统一存 `morning`）
 | 值 | 描述 |
 | --- | --- |
-| `morning` | 上午场（截止北京时间 12:00） |
-| `afternoon` | 下午场（截止北京时间 18:00） |
+| `morning` | 上午（当前所有订单均存此值） |
+| `afternoon` | 下午（历史数据，新订单不再产生） |
 
 ### TravelMode 枚举
 | 值 | 描述 |

@@ -1,15 +1,11 @@
 import { Transform, Type } from 'class-transformer';
 import { IsDateString, IsEnum, IsInt, IsOptional, IsString, Max, Min } from 'class-validator';
-import { BookingStatus, TimeSlot } from '../../../entities/booking.entity';
+import { BookingStatus } from '../../../entities/booking.entity';
 
 export class GetBookingsAdminDto {
     @IsDateString()
     @IsOptional()
     bookingDate?: string;
-
-    @IsEnum(TimeSlot)
-    @IsOptional()
-    timeSlot?: TimeSlot;
 
     @Transform(({ value }) => (Array.isArray(value) ? value : value ? [value] : undefined))
     @IsEnum(BookingStatus, { each: true })

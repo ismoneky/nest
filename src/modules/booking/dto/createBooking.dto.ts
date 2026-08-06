@@ -34,10 +34,10 @@ export class CreateBookingDto {
     @IsNotEmpty()
     bookingDate: string;
 
-    /** 预约时间段 (morning/afternoon) */
+    /** 预约时间段 (morning/afternoon) — 已不再区分上下午，不传时后端默认 morning */
     @IsEnum(TimeSlot)
-    @IsNotEmpty()
-    timeSlot: TimeSlot;
+    @IsOptional()
+    timeSlot?: TimeSlot;
 
     /** 出行方式 (scenicBus/selfDriving/tourGroup) */
     @IsEnum(TravelMode)

@@ -3,7 +3,7 @@ import * as ExcelJS from 'exceljs';
 import { AdminRepository } from '../../repositories/admin.repository';
 import { BookingService } from '../booking/booking.service';
 import { LoginDto } from './dto/login.dto';
-import { BookingStatus, TimeSlot } from '../../entities/booking.entity';
+import { BookingStatus } from '../../entities/booking.entity';
 
 const STATUS_LABEL: Record<string, string> = {
     pending:   '待支付',
@@ -64,7 +64,6 @@ export class AdminService {
      */
     async exportBookingsToBuffer(query: {
         bookingDate?: string;
-        timeSlot?: TimeSlot;
         status?: BookingStatus[];
         keyword?: string;
     }) {

@@ -1,6 +1,6 @@
 import { Type } from 'class-transformer';
 import { IsDateString, IsEnum, IsInt, IsOptional, IsString, Max, Min } from 'class-validator';
-import { BookingStatus, TimeSlot } from '../../../entities/booking.entity';
+import { BookingStatus } from '../../../entities/booking.entity';
 
 /**
  * 查询订单列表 DTO
@@ -11,11 +11,6 @@ export class GetBookingsDto {
     @IsDateString()
     @IsOptional()
     bookingDate?: string;
-
-    /** 预约时间段 (筛选条件) */
-    @IsEnum(TimeSlot)
-    @IsOptional()
-    timeSlot?: TimeSlot;
 
     /** 订单状态 (筛选条件) */
     @IsEnum(BookingStatus)

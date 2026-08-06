@@ -2,24 +2,18 @@ import { Body, Controller, Delete, Get, HttpStatus, Param, Post, Put, Query, Req
 import { Request, Response } from 'express';
 import { BookingService } from './booking.service';
 import { CreateBookingDto } from './dto/createBooking.dto';
+import { PreviewBookingDto } from './dto/previewBooking.dto';
 import { GetBookingsDto } from './dto/getBookings.dto';
 import { GetBookingStatsDto } from './dto/getBookingStats.dto';
 import { UpdateBookingDto } from './dto/updateBooking.dto';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { BookingStatus } from '../../entities/booking.entity';
-import { IsDateString, IsEnum, IsOptional } from 'class-validator';
+import { IsEnum, IsOptional } from 'class-validator';
 
 class GetBookingCountDto {
     @IsOptional()
     @IsEnum(BookingStatus)
     status?: BookingStatus;
-}
-
-class GetFreeQuotaStatusDto {
-    /** 预约日期 (YYYY-MM-DD)，不传则默认今天 */
-    @IsOptional()
-    @IsDateString()
-    bookingDate?: string;
 }
 
 /**
@@ -47,6 +41,24 @@ export class BookingController {
             success: true,
             message: 'Booking created successfully',
             data: booking,
+        });
+    }
+
+    /**
+     * 预约费用预览（后端为唯一事实来源，前端进入预约页 / 修改乘客 / 修改日期时调用）
+     * POST /bookings/preview
+     * 注意：此路由必须声明在 :bookingId 参数路由之前，避免被参数路由吃掉
+     * @param dto 预览入参（出行人员 + 预约日期）
+     * @returns 完整费用与免费判定预览（不写库、不抢锁）
+     */
+    @Post('preview')
+    @UseGuards(JwtAuthGuard)
+    async previewBooking(@Body() dto: PreviewBookingDto, @Req() req: Request, @Res() res: Response) {
+        const { openid } = req['user'] as { openid: string };
+        const result = await this.bookingService.determineFreeEligibility(openid, dto.passengers, dto.bookingDate);
+        return res.status(HttpStatus.OK).send({
+            success: true,
+            data: result,
         });
     }
 
@@ -103,24 +115,6 @@ export class BookingController {
         return res.status(HttpStatus.OK).send({
             success: true,
             data: { count },
-        });
-    }
-
-    /**
-     * 查询每日免费预约名额状态（判断当前用户是否可享受免费）
-     * GET /bookings/free-quota/status?bookingDate=2026-08-04
-     * @param query 查询条件 (bookingDate 可选)
-     * @param req Express 请求对象
-     * @param res Express 响应对象
-     */
-    @Get('free-quota/status')
-    @UseGuards(JwtAuthGuard)
-    async getFreeQuotaStatus(@Query() query: GetFreeQuotaStatusDto, @Req() req: Request, @Res() res: Response) {
-        const { openid } = req['user'] as { openid: string };
-        const status = await this.bookingService.getFreeQuotaStatus(openid, query.bookingDate);
-        return res.status(HttpStatus.OK).send({
-            success: true,
-            data: status,
         });
     }
 

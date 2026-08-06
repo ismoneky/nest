@@ -1,7 +1,7 @@
 import { Injectable, InternalServerErrorException, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, Between, Not, LessThan, Like } from 'typeorm';
-import { Booking, BookingStatus, TimeSlot, PaymentStatus, RefundStatus } from '../entities/booking.entity';
+import { Booking, BookingStatus, PaymentStatus, RefundStatus } from '../entities/booking.entity';
 import { CreateBookingDto } from '../modules/booking/dto/createBooking.dto';
 import { GetBookingsDto } from '../modules/booking/dto/getBookings.dto';
 import { UpdateBookingDto } from '../modules/booking/dto/updateBooking.dto';
@@ -108,7 +108,7 @@ export class BookingRepository {
 
     /**
      * 根据条件查询订单列表 (分页)
-     * 支持按 wechatOpenId, bookingDate, timeSlot, status 筛选
+     * 支持按 wechatOpenId, bookingDate, status 筛选
      * @param query 查询条件 (包含分页参数)
      * @returns 订单实体数组和总数
      */
@@ -127,11 +127,6 @@ export class BookingRepository {
                 const nextDay = new Date(date);
                 nextDay.setDate(date.getDate() + 1);
                 where.bookingDate = Between(date, nextDay);
-            }
-
-            // 按时间段筛选
-            if (query.timeSlot) {
-                where.timeSlot = query.timeSlot;
             }
 
             // 按订单状态筛选
@@ -232,7 +227,6 @@ export class BookingRepository {
      */
     async getBookingsForAdmin(query: {
         bookingDate?: string;
-        timeSlot?: TimeSlot;
         status?: BookingStatus[];
         keyword?: string;
         page?: number;
@@ -251,9 +245,6 @@ export class BookingRepository {
 
             if (query.bookingDate) {
                 qb.andWhere('booking.bookingDate = :bookingDate', { bookingDate: query.bookingDate });
-            }
-            if (query.timeSlot) {
-                qb.andWhere('booking.timeSlot = :timeSlot', { timeSlot: query.timeSlot });
             }
             if (query.status?.length) {
                 qb.andWhere('booking.status IN (:...status)', { status: query.status });
@@ -284,7 +275,6 @@ export class BookingRepository {
      */
     async getAllBookingsForExport(query: {
         bookingDate?: string;
-        timeSlot?: TimeSlot;
         status?: BookingStatus[];
         keyword?: string;
     }) {
@@ -294,9 +284,6 @@ export class BookingRepository {
 
         if (query.bookingDate) {
             qb.andWhere('booking.bookingDate = :bookingDate', { bookingDate: query.bookingDate });
-        }
-        if (query.timeSlot) {
-            qb.andWhere('booking.timeSlot = :timeSlot', { timeSlot: query.timeSlot });
         }
         if (query.status?.length) {
             qb.andWhere('booking.status IN (:...status)', { status: query.status });
@@ -320,20 +307,6 @@ export class BookingRepository {
             .update(Booking)
             .set({ status: BookingStatus.COMPLETED })
             .where('bookingDate < :todayStart', { todayStart })
-            .andWhere('status = :status', { status: BookingStatus.CONFIRMED })
-            .execute();
-    }
-
-    /**
-     * 更新指定日期和时间段的过期订单为已完成状态
-     */
-    async updateExpiredBookings(bookingDate: string, timeSlot: TimeSlot) {
-        return await this.bookingRepository
-            .createQueryBuilder()
-            .update(Booking)
-            .set({ status: BookingStatus.COMPLETED })
-            .where('bookingDate = :bookingDate', { bookingDate })
-            .andWhere('timeSlot = :timeSlot', { timeSlot })
             .andWhere('status = :status', { status: BookingStatus.CONFIRMED })
             .execute();
     }
