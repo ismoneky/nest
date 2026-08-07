@@ -1,4 +1,4 @@
-import { IsDateString, IsEnum, IsInt, IsNotEmpty, IsOptional, IsString, Matches, Min, ValidateIf, ValidateNested, ArrayMinSize, IsArray } from 'class-validator';
+import { IsDateString, IsEnum, IsInt, IsNotEmpty, IsOptional, IsString, IsBoolean, Matches, Min, ValidateIf, ValidateNested, ArrayMinSize, IsArray } from 'class-validator';
 import { Type } from 'class-transformer';
 import { TimeSlot, TravelMode, VehicleType } from '../../../entities/booking.entity';
 
@@ -81,4 +81,9 @@ export class CreateBookingDto {
     @IsString()
     @IsOptional()
     remarks?: string;
+
+    /** 是否管理员（前端传入，true 时跳过「预约开关」关闭检查） */
+    @IsBoolean()
+    @IsOptional()
+    isAdmin?: boolean;
 }

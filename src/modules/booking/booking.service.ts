@@ -23,8 +23,6 @@ import { normalizeIdCard } from '../../common/utils/id-card.util';
 export class BookingService {
     private readonly logger = new Logger(BookingService.name);
     private cronRunning = false;
-    /** 预约白名单 openid：不受「关闭预约」开关限制（仍走正常金额/名额判定） */
-    private readonly whitelistOpenIds: Set<string>;
 
     constructor(
         private readonly bookingRepository: BookingRepository,
@@ -33,13 +31,8 @@ export class BookingService {
         private readonly adminApplicationRepository: AdminApplicationRepository,
         private readonly dataSource: DataSource,
         private readonly memberService: MemberService,
-    ) {
-        // 从 env 解析白名单（逗号分隔），启动时一次性加载
-        const raw = process.env.BOOKING_WHITELIST_OPENIDS || '';
-        this.whitelistOpenIds = new Set(
-            raw.split(',').map((s) => s.trim()).filter(Boolean),
-        );
-    }
+    ) {}
+
 
     /**
      * 创建预约订单
@@ -47,9 +40,8 @@ export class BookingService {
      * @returns 创建的订单
      */
     async createBooking(createBookingDto: CreateBookingDto & { wechatOpenId: string }) {
-        // 检查是否允许预约（白名单 openid 不受「关闭预约」开关限制）
-        const isWhitelisted = this.whitelistOpenIds.has(createBookingDto.wechatOpenId);
-        if (!isWhitelisted) {
+        // 检查是否允许预约（管理员 isAdmin=true 时跳过「关闭预约」开关）
+        if (!createBookingDto.isAdmin) {
             const isBookingEnabled = await this.systemConfigService.isBookingEnabled();
             if (!isBookingEnabled) {
                 const disabledMessage = await this.systemConfigService.getBookingDisabledMessage();
