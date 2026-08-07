@@ -1,7 +1,4 @@
 import { Injectable, BadRequestException, NotFoundException } from '@nestjs/common';
-import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
-import { UserProfile } from '../../entities/user-profile.entity';
 import { MemberRepository } from '../../repositories/member.repository';
 import { Member } from '../../entities/member.entity';
 import { CreateMemberDto, UpdateMemberDto, GetMembersDto } from './dto/member.dto';
@@ -13,29 +10,17 @@ import { CreateMemberDto, UpdateMemberDto, GetMembersDto } from './dto/member.dt
 export class MemberService {
     constructor(
         private readonly memberRepository: MemberRepository,
-        @InjectRepository(UserProfile)
-        private readonly userProfileRepository: Repository<UserProfile>,
     ) {}
 
     /**
      * 创建月卡会员
-     * 通过手机号从 UserProfile 反查 wechatOpenId
+     * 不再绑定 openid：录入 姓名/身份证/手机号(展示)/车牌号(可多个)/有效期
      */
     async createMember(dto: CreateMemberDto): Promise<Member> {
-        // 通过手机号查找已注册用户的 wechatOpenId
-        const profile = await this.userProfileRepository.findOne({
-            where: { phone: dto.phone },
-            order: { createdAt: 'DESC' },
-        });
-
-        if (!profile) {
-            throw new BadRequestException(`手机号 ${dto.phone} 尚未在小程序注册，无法录入会员。请该用户先使用小程序后再录入。`);
-        }
-
-        // 检查该 openid 是否已有有效会员
-        const hasActive = await this.memberRepository.hasActiveMember(profile.wechatOpenId);
+        // 同一身份证只允许一条有效会员
+        const hasActive = await this.memberRepository.hasActiveMemberByIdCard(dto.idCard);
         if (hasActive) {
-            throw new BadRequestException('该用户已有生效中的月卡会员，请勿重复录入');
+            throw new BadRequestException('该身份证已有生效中的月卡会员，请勿重复录入');
         }
 
         // 校验日期
@@ -47,11 +32,17 @@ export class MemberService {
             throw new BadRequestException('开始日期不能晚于结束日期');
         }
 
+        // 车牌号归一化（去空格、转大写）后用分号拼接存库
+        const licensePlates = dto.licensePlates
+            .map((p) => (p ?? '').toUpperCase().trim())
+            .filter((p) => p.length > 0)
+            .join(';');
+
         return await this.memberRepository.create({
-            wechatOpenId: profile.wechatOpenId,
             name: dto.name,
             phone: dto.phone,
             idCard: dto.idCard,
+            licensePlates,
             startDate,
             endDate,
             remarks: dto.remarks,
@@ -72,6 +63,20 @@ export class MemberService {
         if (dto.endDate !== undefined) {
             data.endDate = new Date(dto.endDate);
             data.endDate.setHours(23, 59, 59, 999);
+        }
+        if (dto.licensePlates !== undefined) {
+            data.licensePlates = dto.licensePlates
+                .map((p) => (p ?? '').toUpperCase().trim())
+                .filter((p) => p.length > 0)
+                .join(';');
+        }
+
+        // 若改了身份证，校验唯一性（排除自身）
+        if (dto.idCard !== undefined) {
+            const dup = await this.memberRepository.hasActiveMemberByIdCard(dto.idCard, memberId);
+            if (dup) {
+                throw new BadRequestException('该身份证已有生效中的月卡会员，请勿重复录入');
+            }
         }
 
         if (data.startDate && data.endDate && data.startDate > data.endDate) {
@@ -108,9 +113,17 @@ export class MemberService {
 
     /**
      * 根据 wechatOpenId 查询是否为有效会员
-     * 供 BookingService 调用
+     * 历史方法：会员判定已改为按身份证查，此方法仅作兼容保留
      */
     async getActiveMemberByOpenId(wechatOpenId: string): Promise<Member | null> {
         return await this.memberRepository.findActiveByOpenId(wechatOpenId);
+    }
+
+    /**
+     * 根据身份证号查询有效会员
+     * 供 BookingService 判定摩托车会员免费时调用
+     */
+    async getActiveMemberByIdCard(idCard: string): Promise<Member | null> {
+        return await this.memberRepository.findActiveByIdCard(idCard);
     }
 }

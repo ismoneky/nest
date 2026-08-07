@@ -7,7 +7,7 @@ import { AdminApplicationRepository } from '../../repositories/admin-application
 import { CreateBookingDto, PassengerDto } from './dto/createBooking.dto';
 import { GetBookingsDto } from './dto/getBookings.dto';
 import { UpdateBookingDto } from './dto/updateBooking.dto';
-import { TimeSlot, BookingStatus, PaymentStatus, RefundStatus, Booking } from '../../entities/booking.entity';
+import { TimeSlot, TravelMode, VehicleType, BookingStatus, PaymentStatus, RefundStatus, Booking } from '../../entities/booking.entity';
 import { SystemConfig } from '../../entities/system-config.entity';
 import { WechatPayService } from '../wechat-pay/wechat-pay.service';
 import { SystemConfigService } from '../system-config/system-config.service';
@@ -82,7 +82,15 @@ export class BookingService {
             await configRepo.createQueryBuilder().update(SystemConfig).set({ updatedAt: new Date() }).where('configId = :configId', { configId: 'system_config' }).execute();
 
             // 统一免费资格判定（与 preview 共用同一套逻辑），传入事务 EM 保证判定查询与抢锁在同一事务上下文
-            const eligibility = await this.determineFreeEligibility(createBookingDto.wechatOpenId, createBookingDto.passengers, createBookingDto.bookingDate, { entityManager });
+            const eligibility = await this.determineFreeEligibility(
+                createBookingDto.wechatOpenId,
+                createBookingDto.passengers,
+                createBookingDto.bookingDate,
+                createBookingDto.travelMode,
+                createBookingDto.vehicleType,
+                createBookingDto.licensePlate,
+                { entityManager },
+            );
             const { isFree, freeReason, amount } = eligibility;
 
             let status: BookingStatus;
@@ -142,18 +150,25 @@ export class BookingService {
 
     /**
      * 统一免费资格判定（preview 与 createBooking 共用，保证预览结果与最终创建结果一致）
-     * @param wechatOpenId 微信 OpenID
+     * @param wechatOpenId 微信 OpenID（历史入参，会员判定不再依赖；保留以不破坏调用方）
      * @param passengers 出行人员列表
      * @param bookingDate 预约日期 (YYYY-MM-DD)
+     * @param travelMode 出行方式（仅自驾+摩托车命中会员免费）
+     * @param vehicleType 车辆类型（wheelMotorcycle 才查会员）
+     * @param licensePlate 下单车牌号（须命中会员登记车牌其一）
      * @param options.entityManager 可选事务 EntityManager；preview 不传（用默认 EM 纯查询不抢锁），
      *                              createBooking 事务内传入事务 EM（判定查询与抢锁在同一事务上下文）
      *
-     * 判定优先级：月卡会员 → 每日免费名额 → 收费。freeReason（免费来源）与 reason（不能免费原因）互斥。
+     * 判定优先级：月卡会员（仅摩托车，身份证+车牌双匹配）→ 每日免费名额 → 收费。
+     * freeReason（免费来源）与 reason（不能免费原因）互斥。
      */
     async determineFreeEligibility(
         wechatOpenId: string,
         passengers: PassengerDto[],
         bookingDate: string,
+        travelMode?: TravelMode,
+        vehicleType?: VehicleType,
+        licensePlate?: string,
         options?: { entityManager?: EntityManager },
     ): Promise<FreeEligibilityResult> {
         const em = options?.entityManager ?? this.dataSource;
@@ -177,8 +192,23 @@ export class BookingService {
 
         const personCount = passengers.length;
 
-        // 3. 会员判定（身份证归一化后比较 —— 修复大小写 X 不匹配）
-        const activeMember = await this.memberService.getActiveMemberByOpenId(wechatOpenId);
+        // 3. 会员判定：仅「自驾 + 摩托车」才查会员，按身份证+车牌双匹配
+        //    身份证：任一乘客身份证命中会员登记身份证
+        //    车牌：下单车牌命中会员登记车牌（多个，分号分隔）其一
+        const isMotorcycle = travelMode === TravelMode.SELF_DRIVING && vehicleType === VehicleType.WHEEL_MOTORCYCLE;
+        let activeMember: Awaited<ReturnType<MemberService['getActiveMemberByIdCard']>> = null;
+        let memberIdCardMatched = false;
+        if (isMotorcycle) {
+            // 遍历乘客身份证，找到第一个命中的有效会员
+            for (const p of passengers) {
+                const m = await this.memberService.getActiveMemberByIdCard(p.idCard);
+                if (m) {
+                    activeMember = m;
+                    memberIdCardMatched = true;
+                    break;
+                }
+            }
+        }
         const memberInfo = activeMember
             ? {
                   isMember: true,
@@ -223,10 +253,14 @@ export class BookingService {
             userHasFreeBooking,
         };
 
-        // 4. 会员免费命中
-        if (activeMember) {
-            const matched = passengers.some((p) => normalizeIdCard(p.idCard) === normalizeIdCard(activeMember.idCard));
-            if (matched) {
+        // 4. 会员免费命中：摩托车 + 身份证命中 + 车牌命中
+        if (isMotorcycle && activeMember && memberIdCardMatched) {
+            const memberPlates = activeMember.licensePlates
+                ? activeMember.licensePlates.split(';').map((s) => s.toUpperCase().trim()).filter((s) => s.length > 0)
+                : [];
+            const inputPlate = (licensePlate ?? '').toUpperCase().trim();
+            const plateMatched = inputPlate.length > 0 && memberPlates.includes(inputPlate);
+            if (plateMatched) {
                 return {
                     isFree: true,
                     freeReason: 'member',
@@ -255,10 +289,15 @@ export class BookingService {
         }
 
         // 6. 收费分支：按优先级定 reason
-        //    有会员 → 会员未匹配；无会员 → 按 dailyQuota 三态 / 非今日 / 会员过期分流
+        //    摩托车且身份证命中会员但车牌未命中 → member_plate_not_matched
+        //    摩托车但身份证未命中任何会员 → member_idcard_not_matched
+        //    其余 → 按 dailyQuota 三态 / 非今日 / 会员过期分流
         let reason: FreeEligibilityResult['reason'];
-        if (activeMember) {
-            // 有会员但走到收费分支：会员身份证未匹配（且 dailyQuota 也未命中）
+        if (isMotorcycle && activeMember && memberIdCardMatched) {
+            // 身份证命中会员但车牌未命中（走到这里说明车牌比对失败）
+            reason = 'member_plate_not_matched';
+        } else if (isMotorcycle && !memberIdCardMatched) {
+            // 摩托车但身份证未命中任何有效会员
             reason = 'member_idcard_not_matched';
         } else if (freeEnabled && bookingIsToday) {
             if (userHasFreeBooking) {
@@ -272,7 +311,7 @@ export class BookingService {
         } else if (freeEnabled && !bookingIsToday) {
             reason = 'not_today';
         } else {
-            // !freeEnabled：免费功能未开启，无有效会员即正常收费
+            // !freeEnabled：免费功能未开启，正常收费
             reason = 'member_expired';
         }
 

@@ -12,11 +12,13 @@ export enum MemberStatus {
 
 /**
  * 月卡会员实体
- * 管理后台人工录入，绑定 wechatOpenId
+ * 管理后台人工录入，绑定 身份证号 + 车牌号（不再依赖 wechatOpenId）
+ * 下单时出行方式为摩托车才命中会员免费，身份证与车牌号双匹配
  */
 @Entity('members')
 @Index(['wechatOpenId'])
 @Index(['phone'])
+@Index(['idCard'])
 export class Member {
     @PrimaryGeneratedColumn()
     id: number;
@@ -25,21 +27,25 @@ export class Member {
     @Column({ unique: true })
     memberId: string;
 
-    /** 微信用户 OpenID（关联用户身份） */
-    @Column()
+    /** 微信用户 OpenID（历史字段，新录入写空串占位；会员判定不依赖此字段） */
+    @Column({ default: '' })
     wechatOpenId: string;
 
     /** 会员姓名 */
     @Column()
     name: string;
 
-    /** 会员手机号 */
+    /** 会员手机号（仅作联系电话展示，不参与命中校验） */
     @Column()
     phone: string;
 
-    /** 会员身份证号 */
+    /** 会员身份证号（命中钥匙之一） */
     @Column()
     idCard: string;
+
+    /** 车牌号列表，分号分隔（如 京A12345;京B67890），命中钥匙之二：下单车牌命中其一即匹配 */
+    @Column({ default: '' })
+    licensePlates: string;
 
     /** 会员状态 */
     @Column({ type: 'varchar', default: MemberStatus.ACTIVE })

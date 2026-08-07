@@ -55,7 +55,14 @@ export class BookingController {
     @UseGuards(JwtAuthGuard)
     async previewBooking(@Body() dto: PreviewBookingDto, @Req() req: Request, @Res() res: Response) {
         const { openid } = req['user'] as { openid: string };
-        const result = await this.bookingService.determineFreeEligibility(openid, dto.passengers, dto.bookingDate);
+        const result = await this.bookingService.determineFreeEligibility(
+            openid,
+            dto.passengers,
+            dto.bookingDate,
+            dto.travelMode,
+            dto.vehicleType,
+            dto.licensePlate,
+        );
         return res.status(HttpStatus.OK).send({
             success: true,
             data: result,

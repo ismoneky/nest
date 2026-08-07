@@ -1,12 +1,16 @@
-import { IsDateString, IsEnum, IsNotEmpty, IsOptional, IsString, Matches, Min } from 'class-validator';
+import { ArrayMinSize, IsArray, IsDateString, IsEnum, IsNotEmpty, IsOptional, IsString, Matches } from 'class-validator';
 import { MemberStatus } from '../../../entities/member.entity';
+
+/** 车牌号正则（与 createBooking.dto 一致，含挂学警港澳） */
+const LICENSE_PLATE_PATTERN = /^[京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤青藏川宁琼使领][A-Z][A-HJ-NP-Z0-9]{4,5}[A-HJ-NP-Z0-9挂学警港澳]$/;
 
 /**
  * 创建月卡会员 DTO
- * 管理后台录入：输入手机号，系统通过 UserProfile 反查 wechatOpenId
+ * 管理后台录入：姓名/身份证/手机号(仅展示)/车牌号(可多个)/有效期
+ * 不再绑定 openid，下单时按身份证+车牌号双匹配判定
  */
 export class CreateMemberDto {
-    /** 会员手机号（用于查找已注册用户） */
+    /** 会员手机号（仅作联系电话展示，不参与命中校验） */
     @IsString()
     @IsNotEmpty({ message: '手机号不能为空' })
     @Matches(/^1[3-9]\d{9}$/, { message: '手机号格式不正确' })
@@ -17,11 +21,18 @@ export class CreateMemberDto {
     @IsNotEmpty({ message: '姓名不能为空' })
     name: string;
 
-    /** 会员身份证号 */
+    /** 会员身份证号（命中钥匙之一；同身份证只允许一条有效会员） */
     @IsString()
     @IsNotEmpty({ message: '身份证号不能为空' })
     @Matches(/^[1-9]\d{5}(18|19|20)\d{2}(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])\d{3}[\dXx]$/, { message: '身份证号格式不正确' })
     idCard: string;
+
+    /** 车牌号列表（命中钥匙之二：下单车牌命中其一即匹配） */
+    @IsArray()
+    @ArrayMinSize(1, { message: '至少填写一个车牌号' })
+    @IsString({ each: true })
+    @Matches(LICENSE_PLATE_PATTERN, { each: true, message: '车牌号格式不正确' })
+    licensePlates: string[];
 
     /** 会员有效期开始日期 (YYYY-MM-DD) */
     @IsDateString()
@@ -59,6 +70,14 @@ export class UpdateMemberDto {
     @IsOptional()
     @Matches(/^[1-9]\d{5}(18|19|20)\d{2}(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])\d{3}[\dXx]$/, { message: '身份证号格式不正确' })
     idCard?: string;
+
+    /** 车牌号列表（可选更新） */
+    @IsOptional()
+    @IsArray()
+    @ArrayMinSize(1, { message: '至少填写一个车牌号' })
+    @IsString({ each: true })
+    @Matches(LICENSE_PLATE_PATTERN, { each: true, message: '车牌号格式不正确' })
+    licensePlates?: string[];
 
     /** 会员有效期开始日期 (YYYY-MM-DD) */
     @IsDateString()
