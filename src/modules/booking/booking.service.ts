@@ -283,7 +283,8 @@ export class BookingService {
         // 6. 收费分支：按优先级定 reason
         //    摩托车且身份证命中会员但车牌未命中 → member_plate_not_matched
         //    摩托车但身份证未命中任何会员 → member_idcard_not_matched
-        //    其余 → 按 dailyQuota 三态 / 非今日 / 会员过期分流
+        //    每日免费活动开启但名额用完/已享过/非今日 → daily_quota_* / not_today
+        //    每日免费活动未开启（关闭）→ no_free_activity（活动隐藏，不向用户暴露免费相关文案）
         let reason: FreeEligibilityResult['reason'];
         if (isMotorcycle && activeMember && memberIdCardMatched) {
             // 身份证命中会员但车牌未命中（走到这里说明车牌比对失败）
@@ -303,8 +304,8 @@ export class BookingService {
         } else if (freeEnabled && !bookingIsToday) {
             reason = 'not_today';
         } else {
-            // !freeEnabled：免费功能未开启，正常收费
-            reason = 'member_expired';
+            // !freeEnabled：每日免费活动未开启（活动隐藏），正常收费，不暴露免费相关文案
+            reason = 'no_free_activity';
         }
 
         return {

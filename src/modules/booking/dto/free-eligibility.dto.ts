@@ -8,7 +8,7 @@ export interface FreeEligibilityResult {
     /** 免费来源：会员免费 | 每日名额 | 无（收费） */
     freeReason: 'member' | 'dailyQuota' | null;
     /** 不能免费的原因码（仅 isFree=false 时有值，互斥于 freeReason） */
-    reason: 'member_expired' | 'member_idcard_not_matched' | 'member_plate_not_matched'
+    reason: 'no_free_activity' | 'member_idcard_not_matched' | 'member_plate_not_matched'
           | 'daily_quota_full' | 'daily_quota_used' | 'not_today' | null;
     /** 总金额（分），isFree 时为 0 */
     amount: number;
