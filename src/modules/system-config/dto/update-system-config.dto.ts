@@ -19,7 +19,7 @@ export class TimeSlotLimitDto {
     morningMaxPeople: number;
 
     @IsInt()
-    @Min(1)
+    @Min(0)
     afternoonMaxPeople: number;
 }
 
