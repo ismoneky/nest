@@ -90,6 +90,19 @@ export class SystemConfigController {
     }
 
     /**
+     * 获取温馨提示配置（进入预约页弹窗，小程序使用）
+     * GET /system-config/notice
+     */
+    @Get('notice')
+    async getNoticeConfig(@Res() res: Response) {
+        const noticeConfig = await this.configService.getNoticeConfig();
+        return res.status(HttpStatus.OK).send({
+            success: true,
+            data: noticeConfig,
+        });
+    }
+
+    /**
      * 获取轮播图列表（小程序首页使用）
      * GET /system-config/banners
      */

@@ -44,6 +44,19 @@ export class PaymentConfigDto {
 }
 
 /**
+ * 温馨提示配置 DTO
+ */
+export class NoticeConfigDto {
+    /** 是否开启温馨提示弹窗 */
+    @IsBoolean()
+    enabled: boolean;
+
+    /** 提示内容 */
+    @IsString()
+    content: string;
+}
+
+/**
  * 更新系统配置 DTO
  */
 export class UpdateSystemConfigDto {
@@ -77,4 +90,11 @@ export class UpdateSystemConfigDto {
     @ValidateNested()
     @Type(() => PaymentConfigDto)
     paymentConfig?: PaymentConfigDto;
+
+    /** 温馨提示配置 */
+    @IsOptional()
+    @IsObject()
+    @ValidateNested()
+    @Type(() => NoticeConfigDto)
+    noticeConfig?: NoticeConfigDto;
 }

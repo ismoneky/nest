@@ -32,6 +32,8 @@ export class SystemConfigRepository {
                     bannersJson: '[]',
                     timeSlotLimitJson: '{"morningMaxPeople":1000,"afternoonMaxPeople":1000}',
                     paymentConfigJson: '{"paymentAmount":0,"freeQuotaEnabled":false,"freeQuotaLimit":100}',
+                    noticeConfigJson:
+                        '{"enabled":true,"content":"风车天路目前半开放，仅开放鲍庄出入口通行；每日限行100辆，请合理安排出行时间，敬请知悉。"}',
                 });
                 await this.configRepository.save(config);
             }
@@ -113,6 +115,18 @@ export class SystemConfigRepository {
             return config.bookingDisabledMessage;
         } catch (error) {
             throw new InternalServerErrorException(error instanceof Error ? error.message : 'Failed to get booking disabled message');
+        }
+    }
+
+    /**
+     * 获取温馨提示配置
+     */
+    async getNoticeConfig() {
+        try {
+            const config = await this.getConfig();
+            return config.noticeConfig;
+        } catch (error) {
+            throw new InternalServerErrorException(error instanceof Error ? error.message : 'Failed to get notice config');
         }
     }
 }

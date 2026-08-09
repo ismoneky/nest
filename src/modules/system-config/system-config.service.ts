@@ -50,4 +50,11 @@ export class SystemConfigService {
     async getBookingDisabledMessage() {
         return await this.configRepository.getBookingDisabledMessage();
     }
+
+    /**
+     * 获取温馨提示配置
+     */
+    async getNoticeConfig() {
+        return await this.configRepository.getNoticeConfig();
+    }
 }

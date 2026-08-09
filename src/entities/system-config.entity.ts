@@ -31,6 +31,16 @@ export interface PaymentConfig {
 }
 
 /**
+ * 温馨提示配置（进入预约页弹窗）
+ */
+export interface NoticeConfig {
+    /** 是否开启温馨提示弹窗 */
+    enabled: boolean;
+    /** 提示内容 */
+    content: string;
+}
+
+/**
  * 系统配置实体
  * 使用单文档模式存储所有系统配置
  */
@@ -68,6 +78,13 @@ export class SystemConfig {
         default: '{"paymentAmount":0,"freeQuotaEnabled":false,"freeQuotaLimit":100}',
     })
     paymentConfigJson: string;
+
+    /** 温馨提示配置 (JSON 存储) */
+    @Column({
+        type: 'text',
+        default: '{"enabled":true,"content":"风车天路目前半开放，仅开放鲍庄出入口通行；每日限行100辆，请合理安排出行时间，敬请知悉。"}',
+    })
+    noticeConfigJson: string;
 
     /** 创建时间 */
     @Column({ type: 'integer', transformer: timestampTransformer, default: () => `${Date.now()}` })
@@ -124,5 +141,20 @@ export class SystemConfig {
 
     set paymentConfig(value: PaymentConfig) {
         this.paymentConfigJson = JSON.stringify(value);
+    }
+
+    get noticeConfig(): NoticeConfig {
+        try {
+            return JSON.parse(
+                this.noticeConfigJson ||
+                    '{"enabled":true,"content":"风车天路目前半开放，仅开放鲍庄出入口通行；每日限行100辆，请合理安排出行时间，敬请知悉。"}',
+            );
+        } catch {
+            return { enabled: true, content: '' };
+        }
+    }
+
+    set noticeConfig(value: NoticeConfig) {
+        this.noticeConfigJson = JSON.stringify(value);
     }
 }
