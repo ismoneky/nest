@@ -1,6 +1,6 @@
 import { Injectable, InternalServerErrorException, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, Between, Not, LessThan, Like } from 'typeorm';
+import { Repository, Not, LessThan, Like } from 'typeorm';
 import { Booking, BookingStatus, PaymentStatus, RefundStatus } from '../entities/booking.entity';
 import { CreateBookingDto } from '../modules/booking/dto/createBooking.dto';
 import { GetBookingsDto } from '../modules/booking/dto/getBookings.dto';
@@ -122,11 +122,11 @@ export class BookingRepository {
             }
 
             // 按预约日期筛选
+            // SQLite date 列存储为纯日期字符串，不能用 new Date() 构造 Date 对象比较
             if (query.bookingDate) {
-                const date = new Date(query.bookingDate);
-                const nextDay = new Date(date);
-                nextDay.setDate(date.getDate() + 1);
-                where.bookingDate = Between(date, nextDay);
+                where.bookingDate = query.bookingDate.length >= 10
+                    ? query.bookingDate.substring(0, 10)
+                    : query.bookingDate;
             }
 
             // 按订单状态筛选
@@ -180,17 +180,19 @@ export class BookingRepository {
      */
     async getBookingStatsByDate(bookingDate: string) {
         try {
-            const date = new Date(bookingDate);
-            const nextDay = new Date(date);
-            nextDay.setDate(date.getDate() + 1);
+            // SQLite 的 date 列存储为纯日期字符串 "YYYY-MM-DD"，
+            // 不能用 new Date() 构造 Date 对象传入比较（会变成 ISO 字符串带时间部分，
+            // 导致字符串比较时 "2026-04-26" < "2026-04-26T00:00:00.000Z"，当天记录被排除）
+            // 直接用纯日期字符串做 >= 和 <= 比较
+            const dateStr = bookingDate.length >= 10 ? bookingDate.substring(0, 10) : bookingDate;
 
             // 查询上午的统计
             const morningStats = await this.bookingRepository
                 .createQueryBuilder('booking')
                 .select('SUM(booking.personCount)', 'totalPeople')
                 .addSelect('COUNT(*)', 'bookingCount')
-                .where('booking.bookingDate >= :date', { date })
-                .andWhere('booking.bookingDate < :nextDay', { nextDay })
+                .where('booking.bookingDate >= :date', { date: dateStr })
+                .andWhere('booking.bookingDate <= :nextDate', { nextDate: dateStr })
                 .andWhere('booking.timeSlot = :timeSlot', { timeSlot: 'morning' })
                 .andWhere('booking.status IN (:...activeStatuses)', { activeStatuses: ['pending', 'confirmed'] })
                 .getRawOne();
@@ -200,8 +202,8 @@ export class BookingRepository {
                 .createQueryBuilder('booking')
                 .select('SUM(booking.personCount)', 'totalPeople')
                 .addSelect('COUNT(*)', 'bookingCount')
-                .where('booking.bookingDate >= :date', { date })
-                .andWhere('booking.bookingDate < :nextDay', { nextDay })
+                .where('booking.bookingDate >= :date', { date: dateStr })
+                .andWhere('booking.bookingDate <= :nextDate', { nextDate: dateStr })
                 .andWhere('booking.timeSlot = :timeSlot', { timeSlot: 'afternoon' })
                 .andWhere('booking.status IN (:...activeStatuses)', { activeStatuses: ['pending', 'confirmed'] })
                 .getRawOne();

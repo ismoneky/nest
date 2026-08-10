@@ -12,6 +12,7 @@ import { SystemConfig } from '../../entities/system-config.entity';
 import { WechatPayService } from '../wechat-pay/wechat-pay.service';
 import { SystemConfigService } from '../system-config/system-config.service';
 import { MemberService } from '../member/member.service';
+import { UserProfileRepository } from '../../repositories/user-profile.repository';
 import { FreeEligibilityResult } from './dto/free-eligibility.dto';
 import { normalizeIdCard } from '../../common/utils/id-card.util';
 
@@ -31,6 +32,7 @@ export class BookingService {
         private readonly adminApplicationRepository: AdminApplicationRepository,
         private readonly dataSource: DataSource,
         private readonly memberService: MemberService,
+        private readonly userProfileRepository: UserProfileRepository,
     ) {}
 
 
@@ -51,16 +53,16 @@ export class BookingService {
 
         // 检查预约人数是否超过限制
         const timeSlotLimit = await this.systemConfigService.getTimeSlotLimit();
-        // 不再区分上下午，取全天总限额和总已预约人数
-        const maxPeople = timeSlotLimit.morningMaxPeople + timeSlotLimit.afternoonMaxPeople;
+        // 已废弃上下午概念，morningMaxPeople 即全天总限额
+        const maxPeople = timeSlotLimit.morningMaxPeople;
 
-        // 获取当前日期该时间段的已预约人数
+        // 获取当前日期的已预约人数
         const currentStats = await this.bookingRepository.getBookingStatsByDate(createBookingDto.bookingDate);
         const currentPeople = currentStats.morning.totalPeople + currentStats.afternoon.totalPeople;
 
         // 检查加上新预约的人数后是否超过限制
         if (currentPeople + createBookingDto.personCount > maxPeople) {
-            throw new BadRequestException(`该时间段预约人数已达上限，当前剩余名额：${maxPeople - currentPeople}`);
+            throw new BadRequestException(`该日期预约人数已达上限，当前剩余名额：${Math.max(0, maxPeople - currentPeople)}`);
         }
 
         // 事务内：原子地判断免费资格并创建订单，避免并发下免费名额超卖
@@ -136,7 +138,19 @@ export class BookingService {
                 paymentExpiredAt,
             });
 
-            return await bookingRepo.save(booking);
+            const savedBooking = await bookingRepo.save(booking);
+
+            // 订单创建成功后，异步将乘客信息保存为常用联系人（按身份证号去重）
+            // 不影响订单创建流程，即使保存失败也不阻断
+            setImmediate(async () => {
+                try {
+                    await this.userProfileRepository.upsertProfiles(createBookingDto.wechatOpenId, normalizedPassengers);
+                } catch (err) {
+                    this.logger.warn(`自动保存常用联系人失败: ${err.message}`, err);
+                }
+            });
+
+            return savedBooking;
         });
     }
 
@@ -175,12 +189,13 @@ export class BookingService {
         const freeLimit = paymentConfig.freeQuotaLimit ?? 100;
 
         // 2. 是否今天（仅预约日期为今天时才参与每日免费）
-        const target = new Date(bookingDate);
-        const todayStart = new Date();
-        todayStart.setHours(0, 0, 0, 0);
-        const nextDay = new Date(todayStart);
-        nextDay.setDate(todayStart.getDate() + 1);
-        const bookingIsToday = target.getTime() >= todayStart.getTime() && target.getTime() < nextDay.getTime();
+        // 用纯日期字符串比较，避免 new Date() 产生的 ISO 字符串与 SQLite date 列不一致
+        const targetDateStr = bookingDate.length >= 10 ? bookingDate.substring(0, 10) : bookingDate;
+        const todayDateStr = new Date().toISOString().substring(0, 10); // YYYY-MM-DD
+        const bookingIsToday = targetDateStr === todayDateStr;
+        // SQLite date 列只存日期，用纯日期字符串做范围查询
+        const todayStart = todayDateStr;
+        const nextDay = todayDateStr; // >= :todayStart AND <= :nextDay 即当天
 
         const personCount = passengers.length;
 
@@ -220,7 +235,7 @@ export class BookingService {
                 .where('booking.isFree = :isFree', { isFree: true })
                 .andWhere('booking.freeReason = :reason', { reason: 'dailyQuota' })
                 .andWhere('booking.bookingDate >= :dayStart', { dayStart: todayStart })
-                .andWhere('booking.bookingDate < :nextDay', { nextDay })
+                .andWhere('booking.bookingDate <= :nextDay', { nextDay })
                 .getRawOne();
             quotaUsed = parseInt(freeCountResult?.count || '0', 10);
 
@@ -231,7 +246,7 @@ export class BookingService {
                 .andWhere('booking.isFree = :isFree', { isFree: true })
                 .andWhere('booking.freeReason = :reason', { reason: 'dailyQuota' })
                 .andWhere('booking.bookingDate >= :dayStart', { dayStart: todayStart })
-                .andWhere('booking.bookingDate < :nextDay', { nextDay })
+                .andWhere('booking.bookingDate <= :nextDay', { nextDay })
                 .getCount();
             userHasFreeBooking = userFreeCount > 0;
         }
