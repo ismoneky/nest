@@ -1,4 +1,4 @@
-import { Body, Controller, Delete, Get, HttpStatus, Param, Post, Put, Query, Req, Res, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, HttpStatus, Param, Post, Put, Query, Req, Res, UseGuards } from '@nestjs/common';
 import { Request, Response } from 'express';
 import { BookingService } from './booking.service';
 import { CreateBookingDto } from './dto/createBooking.dto';
@@ -156,21 +156,6 @@ export class BookingController {
             success: true,
             message: 'Booking updated successfully',
             data: booking,
-        });
-    }
-
-    /**
-     * 删除预约订单
-     * DELETE /bookings/:bookingId
-     * @param bookingId 订单ID (UUID)
-     * @param res Express 响应对象
-     */
-    @Delete(':bookingId')
-    async deleteBooking(@Param('bookingId') bookingId: string, @Res() res: Response) {
-        await this.bookingService.deleteBooking(bookingId);
-        return res.status(HttpStatus.OK).send({
-            success: true,
-            message: 'Booking deleted successfully',
         });
     }
 

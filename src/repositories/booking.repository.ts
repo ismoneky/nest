@@ -66,23 +66,6 @@ export class BookingRepository {
     }
 
     /**
-     * 删除预约订单
-     * @param bookingId 订单ID
-     * @returns 被删除的订单实体
-     */
-    async deleteBooking(bookingId: string): Promise<Booking> {
-        try {
-            const booking = await this.getBookingById(bookingId);
-            return await this.bookingRepository.remove(booking);
-        } catch (error) {
-            if (error instanceof NotFoundException) {
-                throw error;
-            }
-            throw new InternalServerErrorException(error instanceof Error ? error.message : 'Failed to delete booking');
-        }
-    }
-
-    /**
      * 根据订单ID查询单个订单
      * @param bookingId 订单ID
      * @returns 订单实体

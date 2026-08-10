@@ -346,19 +346,6 @@ export class BookingService {
     }
 
     /**
-     * 删除预约订单
-     * @param bookingId 订单ID
-     * @returns 被删除的订单
-     */
-    async deleteBooking(bookingId: string) {
-        const booking = await this.bookingRepository.getBookingById(bookingId);
-        if (booking.isFree) {
-            throw new BadRequestException('免费预约不支持取消');
-        }
-        return await this.bookingRepository.deleteBooking(bookingId);
-    }
-
-    /**
      * 根据订单ID查询订单
      * @param bookingId 订单ID
      * @returns 订单详情
