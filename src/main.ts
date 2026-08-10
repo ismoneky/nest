@@ -1,3 +1,6 @@
+// 必须在所有其他代码之前设置，扩大 libuv 线程池（默认 4），避免 DNS 解析等阻塞操作打满线程池导致事件循环卡死
+process.env.UV_THREADPOOL_SIZE = process.env.UV_THREADPOOL_SIZE || '16';
+
 import * as dotenv from 'dotenv';
 dotenv.config();
 

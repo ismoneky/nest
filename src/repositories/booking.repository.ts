@@ -462,6 +462,26 @@ export class BookingRepository {
     }
 
     /**
+     * 查询 PAYING 状态且未超时的订单（用于定时兜底查单，防止回调丢失导致状态卡住）
+     * 只查最近 30 分钟内的订单，避免查到很久之前的无效订单
+     * @param now 当前时间
+     */
+    async getPayingOrders(now: Date): Promise<Booking[]> {
+        try {
+            const thirtyMinAgo = now.getTime() - 30 * 60 * 1000;
+            return await this.bookingRepository
+                .createQueryBuilder('booking')
+                .select(['booking.bookingId', 'booking.outTradeNo'])
+                .where('booking.paymentStatus = :status', { status: PaymentStatus.PAYING })
+                .andWhere('booking.paymentExpiredAt >= :now', { now: now.getTime() })
+                .andWhere('booking.createdAt >= :thirtyMinAgo', { thirtyMinAgo })
+                .getMany();
+        } catch (error) {
+            throw new InternalServerErrorException(error instanceof Error ? error.message : 'Failed to get paying orders');
+        }
+    }
+
+    /**
      * 更新支付超时订单
      * @param now 当前时间
      */

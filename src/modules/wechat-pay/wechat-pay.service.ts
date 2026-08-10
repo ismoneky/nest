@@ -25,6 +25,15 @@ export class WechatPayService {
     private apiV3Key: string;       // APIv3 密钥（用于 AES-GCM 解密回调数据）
     private initialized = false;
 
+    // keepAlive Agent：复用 TCP+TLS 连接，避免每次请求都做 DNS 解析 + 三次握手 + TLS 握手
+    // 限制 maxSockets 防止对微信 API 发起过多并发连接
+    private readonly httpsAgent = new https.Agent({
+        keepAlive: true,
+        maxSockets: 5,
+        maxFreeSockets: 2,
+        timeout: 10000,
+    });
+
     constructor(
         @InjectRepository(Booking)
         private readonly bookingRepository: Repository<Booking>,
@@ -153,6 +162,7 @@ export class WechatPayService {
                     'Content-Type': 'application/json',
                     'User-agent': `Node.js/${process.version}`
                 },
+                agent: this.httpsAgent,
             };
 
             const req = https.request(options, (res) => {

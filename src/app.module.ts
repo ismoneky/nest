@@ -32,6 +32,16 @@ import { Member } from './entities/member.entity';
             synchronize: process.env.NODE_ENV !== 'production',
             logging: process.env.DATABASE_LOGGING === 'true',
             entities: [User, UserProfile, Admin, Booking, Announcement, SystemConfig, AdminApplication, Feedback, Member],
+            // WAL 模式：读写不互斥，显著提升并发性能
+            // busy_timeout：写锁冲突时等待 5 秒而非立即报错
+            // synchronous=NORMAL：WAL 模式下安全且更快的同步级别
+            extra: {
+                pragma: [
+                    'journal_mode = WAL',
+                    'busy_timeout = 5000',
+                    'synchronous = NORMAL',
+                ],
+            },
         }),
         ScheduleModule.forRoot(),
         UserModule,

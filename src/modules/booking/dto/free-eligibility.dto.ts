@@ -27,4 +27,6 @@ export interface FreeEligibilityResult {
         bookingIsToday: boolean;
         userHasFreeBooking: boolean;
     } | null;
+    /** 当天已预约人数（pending + confirmed 状态），用户预约的话是第 bookingRank + 1 位 */
+    bookingRank: number;
 }

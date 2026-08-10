@@ -260,6 +260,16 @@ export class BookingService {
             userHasFreeBooking,
         };
 
+        // 查询当天已预约总人数（pending + confirmed），用于前端展示"您是第 N 位预约"
+        const targetDateStrForQuery = bookingDate.length >= 10 ? bookingDate.substring(0, 10) : bookingDate;
+        const rankResult = await bookingRepo
+            .createQueryBuilder('booking')
+            .select('COALESCE(SUM(booking.personCount), 0)', 'totalPeople')
+            .where('booking.bookingDate = :date', { date: targetDateStrForQuery })
+            .andWhere('booking.status IN (:...activeStatuses)', { activeStatuses: ['pending', 'confirmed'] })
+            .getRawOne();
+        const bookingRank = parseInt(rankResult?.totalPeople || '0', 10);
+
         // 4. 会员免费命中：摩托车 + 身份证命中 + 车牌命中
         if (isMotorcycle && activeMember && memberIdCardMatched) {
             const memberPlates = activeMember.licensePlates
@@ -277,6 +287,7 @@ export class BookingService {
                     personCount,
                     memberInfo,
                     freeQuotaInfo,
+                    bookingRank,
                 };
             }
         }
@@ -292,6 +303,7 @@ export class BookingService {
                 personCount,
                 memberInfo,
                 freeQuotaInfo,
+                bookingRank,
             };
         }
 
@@ -332,6 +344,7 @@ export class BookingService {
             personCount,
             memberInfo,
             freeQuotaInfo,
+            bookingRank,
         };
     }
 
@@ -448,7 +461,30 @@ export class BookingService {
                     })
                     .catch((error) => this.logger.error('退款对账任务失败', error)),
 
-                // 5. 处理支付超时的订单
+                // 3. 支付状态兜底：主动查询 PAYING 状态且未超时的订单，防止回调丢失导致状态卡住
+                // getPaymentStatus 改为只查数据库后，此处作为兜底补偿
+                this.bookingRepository
+                    .getPayingOrders(now)
+                    .then(async (payingOrders) => {
+                        await Promise.allSettled(
+                            payingOrders
+                                .filter((order) => !!order.outTradeNo)
+                                .map(async (order) => {
+                                    try {
+                                        const orderStatus = await this.wechatPayService.queryOrder(order.outTradeNo);
+                                        if (orderStatus.trade_state === 'SUCCESS') {
+                                            await this.wechatPayService.handlePaymentSuccess(order.outTradeNo, orderStatus.transaction_id);
+                                            this.logger.log(`支付状态兜底同步成功: ${order.outTradeNo}`);
+                                        }
+                                    } catch (queryError) {
+                                        this.logger.warn(`支付状态兜底查询失败: ${order.outTradeNo}`, queryError?.message);
+                                    }
+                                }),
+                        );
+                    })
+                    .catch((error) => this.logger.error('支付状态兜底任务失败', error)),
+
+                // 4. 处理支付超时的订单
                 // 官方要求：超时后需先调用微信关单 API，再更新本地状态，避免用户支付旧订单触发回调
                 this.bookingRepository
                     .getPaymentTimeoutOrders(now)
@@ -524,6 +560,9 @@ export class BookingService {
 
     /**
      * 查询支付状态
+     * 仅查本地数据库，不请求微信 API。
+     * 微信回调（POST /wechat-pay/notify）会异步更新支付状态，前端轮询只需读数据库即可。
+     * 如果回调延迟，定时任务（每 5 分钟）会兜底同步，无需前端轮询时实时查微信。
      * @param bookingId 订单ID
      * @returns 支付状态
      */
@@ -533,33 +572,11 @@ export class BookingService {
             throw new BadRequestException('订单不存在');
         }
 
-        if (booking.paymentStatus === PaymentStatus.PAID) {
-            return {
-                status: booking.paymentStatus,
-                paidAt: booking.paidAt,
-                transactionId: booking.transactionId,
-            };
-        }
-
-        // 本地未支付但有微信订单号，主动查微信侧状态兜底
-        // 处理 notify 回调延迟导致本地状态滞后的情况
-        if (booking.outTradeNo) {
-            const orderStatus = await this.wechatPayService.queryOrder(booking.outTradeNo);
-
-            if (orderStatus.trade_state === 'SUCCESS') {
-                // 微信侧已支付，主动同步本地状态（兜底，正常由 notify 回调更新）
-                await this.wechatPayService.handlePaymentSuccess(booking.outTradeNo, orderStatus.transaction_id);
-                return {
-                    status: PaymentStatus.PAID,
-                    paidAt: new Date(),
-                    transactionId: orderStatus.transaction_id,
-                };
-            }
-
-            return { status: booking.paymentStatus };
-        }
-
-        return { status: booking.paymentStatus };
+        return {
+            status: booking.paymentStatus,
+            paidAt: booking.paidAt ?? null,
+            transactionId: booking.transactionId ?? null,
+        };
     }
 
     /**

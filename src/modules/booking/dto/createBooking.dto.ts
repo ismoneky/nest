@@ -44,8 +44,8 @@ export class CreateBookingDto {
     @IsNotEmpty()
     travelMode: TravelMode;
 
-    /** 车牌号 (自驾时必填) */
-    @ValidateIf((o) => o.travelMode === TravelMode.SELF_DRIVING)
+    /** 车牌号 (自驾+机动车时必填，非机动车不需要) */
+    @ValidateIf((o) => o.travelMode === TravelMode.SELF_DRIVING && o.vehicleType !== VehicleType.NON_MOTORIZED)
     @IsString()
     @IsNotEmpty({ message: 'License plate is required for self-driving mode' })
     @Matches(/^[京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤青藏川宁琼使领][A-Z][A-HJ-NP-Z0-9]{4,5}[A-HJ-NP-Z0-9挂学警港澳]$/, {
