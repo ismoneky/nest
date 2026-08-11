@@ -1,5 +1,5 @@
 import { Injectable, BadRequestException, ForbiddenException, Logger } from '@nestjs/common';
-import { Cron, CronExpression } from '@nestjs/schedule';
+import { Cron } from '@nestjs/schedule';
 import { DataSource, EntityManager } from 'typeorm';
 import { randomUUID } from 'crypto';
 import { BookingRepository } from '../../repositories/booking.repository';
@@ -8,13 +8,82 @@ import { CreateBookingDto, PassengerDto } from './dto/createBooking.dto';
 import { GetBookingsDto } from './dto/getBookings.dto';
 import { UpdateBookingDto } from './dto/updateBooking.dto';
 import { TimeSlot, TravelMode, VehicleType, BookingStatus, PaymentStatus, RefundStatus, Booking } from '../../entities/booking.entity';
+import { AnomalyType, BookingAnomaly, AnomalyStatus } from '../../entities/booking-anomaly.entity';
 import { SystemConfig } from '../../entities/system-config.entity';
-import { WechatPayService } from '../wechat-pay/wechat-pay.service';
+import { WechatPayService, PaymentRequestError, WechatApiError, OrderQueryResult, CloseOrderResult, PaymentParams } from '../wechat-pay/wechat-pay.service';
 import { SystemConfigService } from '../system-config/system-config.service';
 import { MemberService } from '../member/member.service';
 import { UserProfileRepository } from '../../repositories/user-profile.repository';
 import { FreeEligibilityResult } from './dto/free-eligibility.dto';
 import { normalizeIdCard } from '../../common/utils/id-card.util';
+import { PaymentException, PaymentErrorCode } from '../../common/payment-errors';
+import { isAutoRecoverable, nextAnomalyRetryAt } from './anomaly-policy';
+import { LoggingService } from '../logging/logging.service';
+import { AppLogLevel, AppLogSource, AppLogCategory } from '../../entities/app-log.entity';
+
+/**
+ * 支付准备整体预算（22 秒）。前端 25 秒超时为响应留出余量。
+ */
+const PAYMENT_PREPARATION_DEADLINE_MS = 22 * 1000;
+
+/**
+ * 支付准备成功结果缓存时长（30 秒）
+ */
+const PAYMENT_RESULT_CACHE_TTL_MS = 30 * 1000;
+
+/**
+ * 支付准备结果缓存最大条目数（惰性过期 + 超限时删除最早插入的条目）
+ */
+const PAYMENT_RESULT_CACHE_MAX = 200;
+
+/**
+ * 定时任务单轮运行时间预算（毫秒）。超过预算停止领取新订单，已开始的请求正常收尾。
+ * 设计文档未给具体值，实现取 60 秒（见 implementation-todo.md 实现说明）。
+ */
+const TASK_TIME_BUDGET_MS = 60 * 1000;
+
+/**
+ * 微信下单「明确业务拒绝且未建单」的错误码枚举。
+ * 只有这些码可以走 markPaymentStartRejected（恢复 UNPAID 保留单号）分支；
+ * 其余业务错误一律视为结果未知，不能当作「未建单」（见 implementation-todo.md 待确认问题 3 补充）。
+ */
+const PAYMENT_START_REJECTED_CODES = new Set([
+    'PARAM_ERROR',
+    'INVALID_REQUEST',
+    'NO_AUTH',
+    'MCH_NOT_EXISTS',
+    'APPID_MCHID_NOT_MATCH',
+]);
+
+type RecentPaymentResult = {
+    value: PaymentParams;
+    outTradeNo: string;
+    expiresAt: number;
+};
+
+/**
+ * 全局微信对账并发信号量（后台所有微信任务共享，上限 2）
+ */
+class ReconcileSemaphore {
+    private running = 0;
+    private readonly waiters: (() => void)[] = [];
+
+    constructor(private readonly max: number) {}
+
+    async run<T>(fn: () => Promise<T>): Promise<T> {
+        if (this.running >= this.max) {
+            await new Promise<void>((resolve) => this.waiters.push(resolve));
+        }
+        this.running++;
+        try {
+            return await fn();
+        } finally {
+            this.running--;
+            const next = this.waiters.shift();
+            if (next) next();
+        }
+    }
+}
 
 /**
  * 预约订单业务逻辑层
@@ -23,7 +92,40 @@ import { normalizeIdCard } from '../../common/utils/id-card.util';
 @Injectable()
 export class BookingService {
     private readonly logger = new Logger(BookingService.name);
-    private cronRunning = false;
+
+    // ── 支付 single-flight 与短期结果缓存（进程内，不写库，Nest 重启后自然清空）──
+    private readonly paymentFlights = new Map<string, Promise<PaymentParams>>();
+    private readonly recentPaymentResults = new Map<string, RecentPaymentResult>();
+
+    // ── 定时任务独立运行标记（防止自身重入）──
+    private readonly taskRunning = {
+        payment: false,
+        close: false,
+        refund: false,
+        anomaly: false,
+        anomalyCleanup: false,
+        historical: false,
+    };
+
+    // ── 对账开关与批量/并发配置（payment-reliability-design.md「SQLite 写锁预算」）──
+    // 发现锁等待上升时可先停后台对账（RECONCILIATION_ENABLED=false）或把批量降为 5，
+    // 不影响微信回调主路径
+    private readonly reconciliationEnabled = process.env.RECONCILIATION_ENABLED !== 'false';
+    private readonly reconciliationBatchSize = parseInt(process.env.RECONCILIATION_BATCH_SIZE ?? '20', 10) || 20;
+    private readonly reconciliationConcurrency = parseInt(process.env.RECONCILIATION_CONCURRENCY ?? '2', 10) || 2;
+
+    // ── 后台微信任务全局并发限制（默认上限 2，支付/退款/关单/异常共享）──
+    private readonly reconciliationSemaphore = new ReconcileSemaphore(
+        parseInt(process.env.RECONCILIATION_CONCURRENCY ?? '2', 10) || 2,
+    );
+
+    // ── 单 SQLite writer：外部微信请求并发 2，结果写回始终串行 FIFO ──
+    private writeChain: Promise<unknown> = Promise.resolve();
+    private enqueueWrite(task: () => Promise<unknown>): Promise<unknown> {
+        const result = this.writeChain.then(task, task);
+        this.writeChain = result.catch(() => undefined);
+        return result;
+    }
 
     constructor(
         private readonly bookingRepository: BookingRepository,
@@ -33,6 +135,7 @@ export class BookingService {
         private readonly dataSource: DataSource,
         private readonly memberService: MemberService,
         private readonly userProfileRepository: UserProfileRepository,
+        private readonly loggingService: LoggingService,
     ) {}
 
 
@@ -62,11 +165,22 @@ export class BookingService {
 
         // 检查加上新预约的人数后是否超过限制
         if (currentPeople + createBookingDto.personCount > maxPeople) {
+            // 记录点：容量不足（日志失败不影响业务结果）
+            this.loggingService.write({
+                source: AppLogSource.BACKEND,
+                level: AppLogLevel.WARN,
+                category: AppLogCategory.BOOKING,
+                message: '预约创建失败：容量不足',
+                route: '/bookings',
+                context: { bookingDate: createBookingDto.bookingDate, personCount: createBookingDto.personCount, currentPeople, maxPeople },
+            });
             throw new BadRequestException(`该日期预约人数已达上限，当前剩余名额：${Math.max(0, maxPeople - currentPeople)}`);
         }
 
         // 事务内：原子地判断免费资格并创建订单，避免并发下免费名额超卖
-        return await this.dataSource.transaction(async (entityManager) => {
+        let createdBooking: Booking;
+        try {
+            createdBooking = await this.dataSource.transaction(async (entityManager) => {
             const bookingRepo = entityManager.getRepository(Booking);
             const configRepo = entityManager.getRepository(SystemConfig);
 
@@ -151,7 +265,30 @@ export class BookingService {
             });
 
             return savedBooking;
+            });
+        } catch (error) {
+            // 记录点：预约创建异常（日志失败不影响业务结果）
+            this.loggingService.write({
+                source: AppLogSource.BACKEND,
+                level: AppLogLevel.ERROR,
+                category: AppLogCategory.BOOKING,
+                message: '预约创建异常',
+                route: '/bookings',
+                context: { bookingDate: createBookingDto.bookingDate, error: (error as Error).message },
+            });
+            throw error;
+        }
+
+        // 记录点：预约创建成功（日志失败不影响业务结果）
+        this.loggingService.write({
+            source: AppLogSource.BACKEND,
+            level: AppLogLevel.INFO,
+            category: AppLogCategory.BOOKING,
+            message: '预约创建成功',
+            route: '/bookings',
+            context: { bookingId: createdBooking.bookingId, isFree: createdBooking.isFree, amount: createdBooking.amount },
         });
+        return createdBooking;
     }
 
     /**
@@ -351,7 +488,7 @@ export class BookingService {
     /**
      * 更新预约订单
      * @param bookingId 订单ID
-     * @param updateBookingDto 更新数据
+     * @param updateBookingDto 更新数据对象
      * @returns 更新后的订单
      */
     async updateBooking(bookingId: string, updateBookingDto: UpdateBookingDto) {
@@ -406,163 +543,289 @@ export class BookingService {
         return await this.bookingRepository.getBookingStatsByDate(bookingDate);
     }
 
-    /**
-     * 定时处理过期订单
-     * 每小时执行一次 (减轻服务器压力)
-     */
-    @Cron(CronExpression.EVERY_5_MINUTES)
-    async handleCron() {
-        if (this.cronRunning) {
-            this.logger.warn('上一次定时任务尚未完成，跳过本次执行');
-            return;
-        }
-        this.cronRunning = true;
-        this.logger.debug('Running booking cron job...');
-        const now = new Date();
-        const todayStr = now.toLocaleDateString('sv');
-        const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-
-        try {
-            await Promise.allSettled([
-                // 1. 处理之前日期的未完成订单
-                this.bookingRepository.updatePastBookings(todayStart).catch((error) => this.logger.error('Error updating past bookings', error)),
-
-                // 2. 退款对账：主动查询 REFUNDING 状态的订单，防止回调丢失导致状态卡住
-                this.bookingRepository
-                    .getRefundingOrders()
-                    .then(async (refundingOrders) => {
-                        await Promise.allSettled(
-                            refundingOrders
-                                .filter((order) => !!order.outRefundNo)
-                                .map(async (order) => {
-                                    try {
-                                        const refundStatus = await this.wechatPayService.queryRefund(order.outRefundNo);
-                                        if (refundStatus.status === 'SUCCESS') {
-                                            await this.bookingRepository.updateRefundStatus(order.bookingId, RefundStatus.REFUNDED, undefined, PaymentStatus.REFUNDED);
-                                            this.logger.log(`退款对账同步成功: ${order.outRefundNo}`);
-                                        } else if (refundStatus.status === 'CLOSED' || refundStatus.status === 'ABNORMAL') {
-                                            await this.bookingRepository.updateRefundStatus(order.bookingId, RefundStatus.FAILED, undefined, PaymentStatus.FAILED);
-                                            this.logger.warn(`退款对账异常: ${order.outRefundNo}, 状态: ${refundStatus.status}`);
-                                        }
-                                        // PROCESSING 状态不处理，等下次定时任务继续查
-                                    } catch (queryError) {
-                                        // 微信返回 404（退款单不存在）：退款单可能从未成功创建，
-                                        // 将本地状态标记为 FAILED，避免定时任务反复查询不存在的退款单
-                                        const errMsg = queryError?.message || '';
-                                        if (errMsg.includes('404') || errMsg.includes('RESOURCE_NOT_EXISTS')) {
-                                            await this.bookingRepository.updateRefundStatus(order.bookingId, RefundStatus.FAILED, undefined, PaymentStatus.FAILED);
-                                            this.logger.warn(`退款单不存在，已标记为失败: ${order.outRefundNo}`);
-                                        } else {
-                                            this.logger.warn(`查询退款状态失败: ${order.outRefundNo}`, queryError);
-                                        }
-                                    }
-                                }),
-                        );
-                    })
-                    .catch((error) => this.logger.error('退款对账任务失败', error)),
-
-                // 3. 支付状态兜底：主动查询 PAYING 状态且未超时的订单，防止回调丢失导致状态卡住
-                // getPaymentStatus 改为只查数据库后，此处作为兜底补偿
-                this.bookingRepository
-                    .getPayingOrders(now)
-                    .then(async (payingOrders) => {
-                        await Promise.allSettled(
-                            payingOrders
-                                .filter((order) => !!order.outTradeNo)
-                                .map(async (order) => {
-                                    try {
-                                        const orderStatus = await this.wechatPayService.queryOrder(order.outTradeNo);
-                                        if (orderStatus.trade_state === 'SUCCESS') {
-                                            await this.wechatPayService.handlePaymentSuccess(order.outTradeNo, orderStatus.transaction_id);
-                                            this.logger.log(`支付状态兜底同步成功: ${order.outTradeNo}`);
-                                        }
-                                    } catch (queryError) {
-                                        this.logger.warn(`支付状态兜底查询失败: ${order.outTradeNo}`, queryError?.message);
-                                    }
-                                }),
-                        );
-                    })
-                    .catch((error) => this.logger.error('支付状态兜底任务失败', error)),
-
-                // 4. 处理支付超时的订单
-                // 官方要求：超时后需先调用微信关单 API，再更新本地状态，避免用户支付旧订单触发回调
-                this.bookingRepository
-                    .getPaymentTimeoutOrders(now)
-                    .then(async (timeoutOrders) => {
-                        await Promise.allSettled(
-                            timeoutOrders
-                                .filter((order) => !!order.outTradeNo)
-                                .map((order) =>
-                                    this.wechatPayService.closeOrder(order.outTradeNo).catch((closeError) => this.logger.warn(`关闭超时订单失败: ${order.bookingId}`, closeError)),
-                                ),
-                        );
-                        await this.bookingRepository.updatePaymentTimeoutOrders(now);
-                    })
-                    .catch((error) => this.logger.error('Error updating payment timeout orders', error)),
-            ]);
-        } finally {
-            this.cronRunning = false;
-        }
-    }
+    // ─────────────────────────────────────────────────────────────────────────
+    // 支付发起（single-flight，固定执行顺序 10 步）
+    // ─────────────────────────────────────────────────────────────────────────
 
     /**
      * 初始化支付
      * @param bookingId 订单ID
+     * @param openid 当前 JWT 用户（须为订单所有者）
      * @returns 支付参数
      */
     async initiatePayment(bookingId: string, openid: string) {
+        // 步骤 1：读取订单并验证所有者、免费状态、订单状态和支付期限
         const booking = await this.bookingRepository.getBookingById(bookingId);
-        if (!booking) {
-            throw new BadRequestException('订单不存在');
-        }
-
         if (booking.wechatOpenId !== openid) {
             throw new BadRequestException('无权操作该订单');
         }
+        this.assertPaymentPreconditions(booking);
 
+        // 步骤 2：已支付订单返回稳定「订单已经支付」结果，不返回旧支付参数
+        if (booking.paymentStatus === PaymentStatus.PAID || booking.status === BookingStatus.CONFIRMED) {
+            throw new PaymentException(PaymentErrorCode.ORDER_ALREADY_PAID, '订单已经支付');
+        }
+
+        // 步骤 3：命中未过期的成功结果缓存（须与数据库当前 outTradeNo 一致）
+        const cached = this.recentPaymentResults.get(bookingId);
+        if (cached) {
+            const cacheValid =
+                cached.expiresAt > Date.now() &&
+                booking.status === BookingStatus.PENDING &&
+                booking.paymentStatus === PaymentStatus.PAYING &&
+                booking.paymentExpiredAt != null &&
+                booking.paymentExpiredAt.getTime() > Date.now() &&
+                booking.outTradeNo === cached.outTradeNo;
+            if (cacheValid) {
+                // 记录点：命中短期结果缓存
+                this.loggingService.write({
+                    source: AppLogSource.BACKEND,
+                    level: AppLogLevel.INFO,
+                    category: AppLogCategory.PAYMENT,
+                    message: '支付准备命中短期缓存',
+                    route: `/bookings/${bookingId}/pay`,
+                    context: { bookingId, hitCache: true },
+                });
+                return cached.value;
+            }
+            // 任一条件不满足都立即逐出缓存，不能把已支付/已取消/退款中/已过期订单的旧参数返回前端
+            this.recentPaymentResults.delete(bookingId);
+        }
+
+        // 步骤 4/5：已有 flight 则复用；否则同步创建 Promise 并立即放入 Map
+        const existing = this.paymentFlights.get(bookingId);
+        if (existing) {
+            // 记录点：命中 single-flight（复用第一个请求的 Promise）
+            this.loggingService.write({
+                source: AppLogSource.BACKEND,
+                level: AppLogLevel.INFO,
+                category: AppLogCategory.PAYMENT,
+                message: '支付准备命中 single-flight',
+                route: `/bookings/${bookingId}/pay`,
+                context: { bookingId, hitSingleFlight: true },
+            });
+            return existing;
+        }
+        const flight = this.executePaymentFlight(bookingId).finally(() => {
+            const current = this.paymentFlights.get(bookingId);
+            if (current === flight) {
+                this.paymentFlights.delete(bookingId);
+            }
+        });
+        this.paymentFlights.set(bookingId, flight);
+        return flight;
+    }
+
+    /**
+     * 支付准备公共前置校验（步骤 1 与 flight 内步骤 6 共用）
+     */
+    private assertPaymentPreconditions(booking: Booking) {
         if (booking.isFree) {
             throw new BadRequestException('该订单为免费预约，无需支付');
         }
-
         if (booking.status === BookingStatus.CANCELLED) {
             throw new BadRequestException('订单已取消，无法支付');
         }
-
         if (booking.paymentStatus !== PaymentStatus.UNPAID && booking.paymentStatus !== PaymentStatus.PAYING) {
             throw new BadRequestException('订单状态不允许支付');
         }
-
-        if (booking.paymentExpiredAt && new Date() > booking.paymentExpiredAt) {
+        if (booking.paymentExpiredAt && booking.paymentExpiredAt.getTime() <= Date.now()) {
             throw new BadRequestException('支付已超时');
         }
+    }
 
-        // 每次发起支付都重新下单，生成新的 outTradeNo
-        // 必须先主动关闭旧的微信订单，否则旧单仍处于 USERPAYING 状态，
-        // 微信会拒绝新下单并返回 ORDER_CLOSED 错误。
-        // closeOrder 内部已做容错，旧单已关闭/已支付时不会抛异常。
-        if (booking.outTradeNo) {
-            await this.wechatPayService.closeOrder(booking.outTradeNo);
+    /**
+     * single-flight 内执行支付准备（步骤 6-10）
+     * 22 秒整体预算：关闭旧单与创建支付两个 HTTPS 请求共享同一个 AbortSignal
+     */
+    private async executePaymentFlight(bookingId: string): Promise<PaymentParams> {
+        const controller = new AbortController();
+        const deadline = setTimeout(() => controller.abort(), PAYMENT_PREPARATION_DEADLINE_MS);
+        deadline.unref();
+        const startMs = Date.now();
+        const timings = { queryOldOrderMs: 0, closeOldOrderMs: 0, saveLocalMs: 0, createPaymentMs: 0 };
+
+        try {
+            // 步骤 6：flight 内再次读取订单并执行相同状态校验
+            const booking = await this.bookingRepository.getBookingById(bookingId);
+            this.assertPaymentPreconditions(booking);
+            if (booking.paymentStatus === PaymentStatus.PAID || booking.status === BookingStatus.CONFIRMED) {
+                throw new PaymentException(PaymentErrorCode.ORDER_ALREADY_PAID, '订单已经支付');
+            }
+
+            // 步骤 7：已有 outTradeNo 时先查询微信旧单
+            if (booking.outTradeNo) {
+                const queryStart = Date.now();
+                const query = await this.wechatPayService.queryOrder(booking.outTradeNo);
+                timings.queryOldOrderMs = Date.now() - queryStart;
+                switch (query.state) {
+                    case 'SUCCESS':
+                        // 推进本地已支付并返回稳定结果
+                        await this.bookingRepository.markPaymentSucceeded(booking.outTradeNo, query.transactionId ?? null, new Date());
+                        await this.resolvePaymentAnomalies(bookingId, '支付准备时确认微信已支付', Date.now());
+                        throw new PaymentException(PaymentErrorCode.ORDER_ALREADY_PAID, '订单已经支付');
+                    case 'CLOSED':
+                        // 微信侧已关闭：允许换单
+                        break;
+                    case 'NOT_EXIST':
+                        // 明确不存在：允许换单；但本地 PAYING（本应已创建）记异常
+                        if (booking.paymentStatus === PaymentStatus.PAYING) {
+                            await this.bookingRepository.upsertAnomaly(
+                                bookingId,
+                                AnomalyType.REMOTE_ORDER_NOT_FOUND,
+                                'ORDER_NOT_EXIST',
+                                '本地 PAYING 但微信订单不存在',
+                                nextAnomalyRetryAt(1, Date.now()),
+                                Date.now(),
+                            );
+                        }
+                        break;
+                    case 'NOTPAY':
+                    case 'USERPAYING': {
+                        // 未支付活动态：必须结构化关单，只有明确关闭后才允许换单
+                        const closeStart = Date.now();
+                        const close = await this.wechatPayService.closeOrder(booking.outTradeNo, { signal: controller.signal });
+                        timings.closeOldOrderMs = Date.now() - closeStart;
+                        if (close.kind === 'CLOSED' || close.kind === 'ALREADY_CLOSED') {
+                            break; // 允许换单
+                        }
+                        if (close.kind === 'ALREADY_PAID') {
+                            // 查询/推进本地支付成功并停止创建新单
+                            const paidQuery = await this.wechatPayService.queryOrder(booking.outTradeNo);
+                            await this.bookingRepository.markPaymentSucceeded(booking.outTradeNo, paidQuery.transactionId ?? null, new Date());
+                            await this.resolvePaymentAnomalies(bookingId, '关单时发现已支付', Date.now());
+                            throw new PaymentException(PaymentErrorCode.ORDER_ALREADY_PAID, '订单已经支付');
+                        }
+                        // UNKNOWN：不得继续换单
+                        await this.bookingRepository.markPaymentResultUnknown(bookingId, booking.outTradeNo, close.errorCode ?? 'CLOSE_ORDER_UNKNOWN', Date.now());
+                        throw new PaymentException(PaymentErrorCode.PAYMENT_RESULT_UNKNOWN, '支付准备结果未知，请稍后重试');
+                    }
+                    case 'UNKNOWN':
+                    default:
+                        // 查询或关单结果未知：返回 PAYMENT_RESULT_UNKNOWN
+                        await this.bookingRepository.markPaymentResultUnknown(bookingId, booking.outTradeNo, query.errorCode ?? 'QUERY_ORDER_UNKNOWN', Date.now());
+                        throw new PaymentException(PaymentErrorCode.PAYMENT_RESULT_UNKNOWN, '支付准备结果未知，请稍后重试');
+                }
+            }
+
+            // 步骤 8：生成新 outTradeNo 并用条件 UPDATE 预写 PAYING/新单号/调度字段，成功后才调微信
+            const newOutTradeNo = `${bookingId}${Date.now()}${randomUUID().replace(/-/g, '').substring(0, 6)}`;
+            const now = Date.now();
+            const saveStart = Date.now();
+            const affected = await this.bookingRepository.markPaymentStarting(bookingId, booking.outTradeNo ?? null, newOutTradeNo, now + 5 * 60 * 1000, now);
+            timings.saveLocalMs = Date.now() - saveStart;
+            if (affected === 0) {
+                // 订单已被其他流程推进（如支付成功回调），不能强行覆盖
+                const fresh = await this.bookingRepository.getBookingById(bookingId);
+                if (fresh.paymentStatus === PaymentStatus.PAID || fresh.status === BookingStatus.CONFIRMED) {
+                    throw new PaymentException(PaymentErrorCode.ORDER_ALREADY_PAID, '订单已经支付');
+                }
+                throw new PaymentException(PaymentErrorCode.PAYMENT_RESULT_UNKNOWN, '订单状态已变化，请刷新后重试');
+            }
+
+            // 步骤 9：微信明确返回 prepay_id 后才生成并缓存支付参数
+            let paymentParams: PaymentParams;
+            try {
+                const createStart = Date.now();
+                paymentParams = await this.wechatPayService.createPayment(
+                    newOutTradeNo,
+                    booking.amount,
+                    `预约订单 - ${booking.bookingDate}`,
+                    booking.wechatOpenId,
+                    booking.paymentExpiredAt,
+                    controller.signal,
+                );
+                timings.createPaymentMs = Date.now() - createStart;
+            } catch (error) {
+                if (error instanceof PaymentRequestError) {
+                    // abort/超时：不能证明微信未受理，保持 PAYING + 调度字段，对账接管
+                    await this.bookingRepository.markPaymentResultUnknown(bookingId, newOutTradeNo, error.code, Date.now());
+                    throw new PaymentException(PaymentErrorCode.PAYMENT_RESULT_UNKNOWN, '支付准备超时，请稍后重试');
+                }
+                if (error instanceof WechatApiError) {
+                    const code = error.body?.code;
+                    if (code && PAYMENT_START_REJECTED_CODES.has(code)) {
+                        // 枚举内业务拒绝且确认未建单：恢复 UNPAID 保留单号，安排用户重试
+                        await this.bookingRepository.markPaymentStartRejected(bookingId, newOutTradeNo, code);
+                        throw new PaymentException(PaymentErrorCode.PAYMENT_START_REJECTED, '支付下单被拒绝，请稍后重试');
+                    }
+                    // 枚举外业务错误：无法确认是否建单，视为结果未知
+                    await this.bookingRepository.markPaymentResultUnknown(bookingId, newOutTradeNo, code ?? 'PAYMENT_START_UNKNOWN', Date.now());
+                    throw new PaymentException(PaymentErrorCode.PAYMENT_RESULT_UNKNOWN, '支付准备结果未知，请稍后重试');
+                }
+                // 其他异常（签名失败等）：本地已预写 PAYING + 新单号，保持并对账接管
+                await this.bookingRepository.markPaymentResultUnknown(bookingId, newOutTradeNo, 'PAYMENT_START_UNKNOWN', Date.now());
+                throw error;
+            }
+
+            // 步骤 9 续：缓存成功结果 30 秒（保存 outTradeNo 供命中时与数据库重新比较）
+            this.recentPaymentResults.set(bookingId, {
+                value: paymentParams,
+                outTradeNo: newOutTradeNo,
+                expiresAt: Date.now() + PAYMENT_RESULT_CACHE_TTL_MS,
+            });
+            this.trimRecentPaymentResults();
+            await this.bookingRepository.resolveAnomaly(bookingId, AnomalyType.REMOTE_ORDER_NOT_FOUND, '换单成功', Date.now());
+
+            // 记录点：支付准备成功（阶段耗时、同一 requestId）
+            this.loggingService.write({
+                source: AppLogSource.BACKEND,
+                level: AppLogLevel.INFO,
+                category: AppLogCategory.PAYMENT,
+                message: '支付准备成功',
+                route: `/bookings/${bookingId}/pay`,
+                context: { bookingId, outTradeNo: newOutTradeNo, timings, totalMs: Date.now() - startMs },
+            });
+            return paymentParams;
+        } catch (error) {
+            // 记录点：支付准备失败（稳定错误码与耗时；日志失败不影响业务结果）
+            this.loggingService.write({
+                source: AppLogSource.BACKEND,
+                level: AppLogLevel.ERROR,
+                category: AppLogCategory.PAYMENT,
+                message: '支付准备失败',
+                route: `/bookings/${bookingId}/pay`,
+                context: {
+                    bookingId,
+                    errorCode: error instanceof PaymentException ? error.code : (error as Error)?.message ?? 'UNKNOWN',
+                    timings,
+                    totalMs: Date.now() - startMs,
+                },
+            });
+            throw error;
+        } finally {
+            clearTimeout(deadline);
         }
+    }
 
-        const paymentParams = await this.wechatPayService.createPayment(
-            booking.bookingId,
-            booking.amount,
-            `预约订单 - ${booking.bookingDate}`,
-            booking.wechatOpenId,
-            booking.paymentExpiredAt,
-        );
+    /**
+     * 短期结果缓存最大条目限制（惰性清理：超出时删除最早插入的条目）
+     */
+    private trimRecentPaymentResults() {
+        while (this.recentPaymentResults.size > PAYMENT_RESULT_CACHE_MAX) {
+            const oldestKey = this.recentPaymentResults.keys().next().value;
+            if (oldestKey === undefined) break;
+            this.recentPaymentResults.delete(oldestKey);
+        }
+    }
 
-        // 更新支付状态为支付中（bookingStatus 保持 PENDING，等待微信回调确认）
-        await this.bookingRepository.updatePaymentStatus(bookingId, PaymentStatus.PAYING, paymentParams.outTradeNo);
-
-        return paymentParams;
+    /**
+     * 支付相关异常在成功/明确终态处理时自动标记 RESOLVED
+     */
+    private async resolvePaymentAnomalies(bookingId: string, resolution: string, now: number) {
+        for (const type of [
+            AnomalyType.PAYMENT_QUERY_REPEATED_FAILURE,
+            AnomalyType.REMOTE_ORDER_NOT_FOUND,
+            AnomalyType.PAYMENT_CREATED_LOCAL_SAVE_FAILED,
+        ]) {
+            await this.bookingRepository.resolveAnomaly(bookingId, type, resolution, now);
+        }
     }
 
     /**
      * 查询支付状态
      * 仅查本地数据库，不请求微信 API。
      * 微信回调（POST /wechat-pay/notify）会异步更新支付状态，前端轮询只需读数据库即可。
-     * 如果回调延迟，定时任务（每 5 分钟）会兜底同步，无需前端轮询时实时查微信。
      * @param bookingId 订单ID
      * @returns 支付状态
      */
@@ -579,8 +842,14 @@ export class BookingService {
         };
     }
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // 退款
+    // ─────────────────────────────────────────────────────────────────────────
+
     /**
      * 申请退款
+     * markRefundStarting 条件 UPDATE 落库 REFUNDING + 调度字段后再调微信，
+     * 并发重复提交由条件更新保证只有一次进入 REFUNDING
      * @param bookingId 订单ID
      * @returns 退款结果
      */
@@ -621,49 +890,501 @@ export class BookingService {
             }
         }
 
-        // 幂等保护：先确保退款单号持久化，再发起退款
-        // 使用固定单号（不含时间戳），保证重试时单号不变，避免重复退款
+        // 幂等保护：固定退款单号（不含时间戳），保证重试时单号不变，避免重复退款
         const outRefundNo = booking.outRefundNo ?? `RF${booking.bookingId}`;
-        if (!booking.outRefundNo) {
-            await this.bookingRepository.updateRefundStatus(bookingId, RefundStatus.REFUNDING, outRefundNo, PaymentStatus.REFUNDING);
+
+        // 条件更新：只有 CONFIRMED + PAID + refund NONE/FAILED 才能进入 REFUNDING
+        const affected = await this.bookingRepository.markRefundStarting(bookingId, outRefundNo, Date.now() + 15 * 60 * 1000);
+        if (affected === 0) {
+            const fresh = await this.bookingRepository.getBookingById(bookingId);
+            if (fresh.refundStatus === RefundStatus.REFUNDED) {
+                throw new BadRequestException('订单已退款');
+            }
+            if (fresh.refundStatus === RefundStatus.REFUNDING) {
+                throw new BadRequestException('退款申请处理中，请勿重复提交');
+            }
+            throw new BadRequestException('订单状态不允许退款');
         }
 
-        // 申请退款
-        const refundResult = await this.wechatPayService.refund(booking.outTradeNo, outRefundNo, booking.amount, booking.amount);
-
-        return refundResult;
+        // 申请退款；微信拒绝或结果未知时订单保持 REFUNDING，由退款对账任务接管
+        try {
+            const refundResult = await this.wechatPayService.refund(booking.outTradeNo, outRefundNo, booking.amount, booking.amount);
+            // 记录点：退款申请成功（日志失败不影响业务结果）
+            this.loggingService.write({
+                source: AppLogSource.BACKEND,
+                level: AppLogLevel.INFO,
+                category: AppLogCategory.PAYMENT,
+                message: '退款申请成功',
+                route: `/bookings/${bookingId}/refund`,
+                context: { bookingId, outRefundNo },
+            });
+            return refundResult;
+        } catch (error) {
+            // 记录点：退款申请失败（订单保持 REFUNDING，退款对账任务接管）
+            this.loggingService.write({
+                source: AppLogSource.BACKEND,
+                level: AppLogLevel.WARN,
+                category: AppLogCategory.PAYMENT,
+                message: '退款申请失败',
+                route: `/bookings/${bookingId}/refund`,
+                context: { bookingId, outRefundNo, error: (error as Error).message },
+            });
+            throw error;
+        }
     }
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // 定时任务（按分钟表错峰，Asia/Shanghai，秒固定 0）
+    // ─────────────────────────────────────────────────────────────────────────
+
     /**
-     * 更新支付状态
-     * @param outTradeNo 商户订单号
-     * @param transactionId 微信支付订单号
-     * @param status 支付状态
+     * 支付状态兜底：按 reconcileNextAt 查询到期且未过期的 PAYING 订单，每 5 分钟（00/05/.../55）
      */
-    async updatePaymentStatus(outTradeNo: string, transactionId: string, status: string) {
-        if (status === 'SUCCESS') {
-            // 支付成功：paymentStatus → PAID，bookingStatus → CONFIRMED（预约正式生效）
-            await this.bookingRepository.updatePaymentStatusByOutTradeNo(outTradeNo, PaymentStatus.PAID, BookingStatus.CONFIRMED, transactionId, new Date());
+    @Cron('0 0,5,10,15,20,25,30,35,40,45,50,55 * * * *', { timeZone: 'Asia/Shanghai' })
+    async runPaymentReconciliation() {
+        if (this.taskRunning.payment) return;
+        if (!this.reconciliationEnabled) return;
+        this.taskRunning.payment = true;
+        const startedAt = Date.now();
+        try {
+            const candidates = await this.bookingRepository.findReconcileCandidates('payment', startedAt, this.reconciliationBatchSize);
+            for (const booking of candidates) {
+                if (Date.now() - startedAt > TASK_TIME_BUDGET_MS) break; // 停止领取新订单
+                if (!booking.outTradeNo) continue;
+                await this.reconciliationSemaphore.run(async () => {
+                    const result = await this.wechatPayService.queryOrder(booking.outTradeNo);
+                    // 结果进入批内 FIFO 写回队列，由单 writer 串行提交
+                    this.enqueueWrite(() => this.applyPaymentReconcileResult(booking, result));
+                });
+            }
+            // 等待写回队列排空后才结束
+            await this.writeChain;
+            this.logTask('payment', AppLogLevel.INFO, '完成', { task: 'payment', scanned: candidates.length });
+        } catch (error) {
+            this.logger.error('支付状态兜底任务失败', error);
+            this.logTask('payment', AppLogLevel.ERROR, '失败', { task: 'payment', error: (error as Error).message });
+        } finally {
+            this.taskRunning.payment = false;
         }
     }
 
     /**
-     * 处理支付超时
-     * @param bookingId 订单ID
+     * 支付超时关单：每 5 分钟（02/07/.../57），与支付兜底错开 2 分钟
      */
-    async handlePaymentTimeout(bookingId: string) {
-        // 支付超时：paymentStatus → UNPAID，bookingStatus → CANCELLED
-        await this.bookingRepository.updatePaymentStatus(bookingId, PaymentStatus.UNPAID, null, BookingStatus.CANCELLED);
+    @Cron('0 2,7,12,17,22,27,32,37,42,47,52,57 * * * *', { timeZone: 'Asia/Shanghai' })
+    async runPaymentTimeoutClose() {
+        if (this.taskRunning.close) return;
+        if (!this.reconciliationEnabled) return;
+        this.taskRunning.close = true;
+        const startedAt = Date.now();
+        try {
+            // 发现步骤：把所有已过期的 UNPAID/PAYING 订单标为 close 候选
+            // （设计文档未明示发现步骤，见 implementation-todo.md 待确认问题 1）
+            await this.bookingRepository.markCloseDue(startedAt);
+
+            const candidates = await this.bookingRepository.findReconcileCandidates('close', startedAt, this.reconciliationBatchSize);
+            const processedBookingIds: string[] = [];
+            for (const booking of candidates) {
+                if (Date.now() - startedAt > TASK_TIME_BUDGET_MS) break;
+                if (booking.paymentStatus !== PaymentStatus.UNPAID && booking.paymentStatus !== PaymentStatus.PAYING) continue;
+
+                if (!booking.outTradeNo) {
+                    // 业务规则确认无需再关单（微信侧从未创建）
+                    processedBookingIds.push(booking.bookingId);
+                    continue;
+                }
+
+                await this.reconciliationSemaphore.run(async () => {
+                    const close = await this.wechatPayService.closeOrder(booking.outTradeNo, {
+                        agent: this.wechatPayService.reconciliationAgent,
+                    });
+                    this.enqueueWrite(async () => {
+                        const now = Date.now();
+                        if (close.kind === 'CLOSED' || close.kind === 'ALREADY_CLOSED') {
+                            processedBookingIds.push(booking.bookingId);
+                        } else if (close.kind === 'ALREADY_PAID') {
+                            // 重新查询订单并执行 markPaymentSucceeded，不关闭
+                            const paidQuery = await this.wechatPayService.queryOrder(booking.outTradeNo);
+                            await this.bookingRepository.markPaymentSucceeded(booking.outTradeNo, paidQuery.transactionId ?? null, new Date());
+                            await this.resolvePaymentAnomalies(booking.bookingId, '超时关单时发现已支付', now);
+                        } else {
+                            // UNKNOWN：保留当前状态，markCloseDue 已把 nextAt 置为 now，下一轮重试
+                            this.logger.warn(`超时关单结果未知，保留重试: ${booking.bookingId} code=${close.errorCode ?? ''}`);
+                        }
+                    });
+                });
+            }
+            // 只更新本批已明确处理且当前状态仍符合条件的订单
+            await this.enqueueWrite(() => this.bookingRepository.markPaymentClosed(processedBookingIds, startedAt));
+            await this.writeChain;
+            this.logTask('close', AppLogLevel.INFO, '完成', { task: 'close', scanned: candidates.length, closed: processedBookingIds.length });
+        } catch (error) {
+            this.logger.error('支付超时关单任务失败', error);
+            this.logTask('close', AppLogLevel.ERROR, '失败', { task: 'close', error: (error as Error).message });
+        } finally {
+            this.taskRunning.close = false;
+        }
     }
 
     /**
-     * 更新退款状态
-     * @param bookingId 订单ID
-     * @param refundStatus 退款状态
+     * 退款对账：每 15 分钟（04/19/34/49）
      */
-    async updateRefundStatus(bookingId: string, refundStatus: RefundStatus) {
-        return await this.bookingRepository.updateRefundStatus(bookingId, refundStatus);
+    @Cron('0 4,19,34,49 * * * *', { timeZone: 'Asia/Shanghai' })
+    async runRefundReconciliation() {
+        if (this.taskRunning.refund) return;
+        if (!this.reconciliationEnabled) return;
+        this.taskRunning.refund = true;
+        const startedAt = Date.now();
+        try {
+            const candidates = await this.bookingRepository.findReconcileCandidates('refund', startedAt, this.reconciliationBatchSize);
+            for (const booking of candidates) {
+                if (Date.now() - startedAt > TASK_TIME_BUDGET_MS) break;
+                if (!booking.outRefundNo) continue;
+                await this.reconciliationSemaphore.run(async () => {
+                    const result = await this.wechatPayService.queryRefund(booking.outRefundNo);
+                    this.enqueueWrite(() => this.applyRefundReconcileResult(booking, result));
+                });
+            }
+            await this.writeChain;
+            this.logTask('refund', AppLogLevel.INFO, '完成', { task: 'refund', scanned: candidates.length });
+        } catch (error) {
+            this.logger.error('退款对账任务失败', error);
+            this.logTask('refund', AppLogLevel.ERROR, '失败', { task: 'refund', error: (error as Error).message });
+        } finally {
+            this.taskRunning.refund = false;
+        }
     }
+
+    /**
+     * 异常订单低频重试：每 30 分钟（08/38），每批最多 5 条，
+     * 在全局并发上限内自身最多占 1 个微信请求
+     */
+    @Cron('0 8,38 * * * *', { timeZone: 'Asia/Shanghai' })
+    async runAnomalyRetry() {
+        if (this.taskRunning.anomaly) return;
+        if (!this.reconciliationEnabled) return;
+        this.taskRunning.anomaly = true;
+        const startedAt = Date.now();
+        try {
+            const anomalies = await this.bookingRepository.findOpenAnomalies(startedAt, 5);
+            for (const anomaly of anomalies) {
+                if (Date.now() - startedAt > TASK_TIME_BUDGET_MS) break;
+                if (!isAutoRecoverable(anomaly.type)) continue; // manual：暂停自动请求，等待人工处理
+
+                // 处理前重新读取订单并验证当前业务状态仍然符合该异常
+                let booking: Booking | null = null;
+                try {
+                    booking = await this.bookingRepository.getBookingById(anomaly.bookingId);
+                } catch {
+                    booking = null;
+                }
+                if (!booking) {
+                    await this.enqueueWrite(() =>
+                        this.bookingRepository.resolveAnomaly(anomaly.bookingId, anomaly.type, '订单不存在', Date.now()),
+                    );
+                    continue;
+                }
+
+                await this.reconciliationSemaphore.run(async () => {
+                    this.enqueueWrite(() => this.applyAnomalyRetry(booking, anomaly));
+                });
+            }
+            await this.writeChain;
+            this.logTask('anomaly', AppLogLevel.INFO, '完成', { task: 'anomaly', scanned: anomalies.length });
+        } catch (error) {
+            this.logger.error('异常订单重试任务失败', error);
+            this.logTask('anomaly', AppLogLevel.ERROR, '失败', { task: 'anomaly', error: (error as Error).message });
+        } finally {
+            this.taskRunning.anomaly = false;
+        }
+    }
+
+    /**
+     * 异常记录清理：每周日 03:16（Asia/Shanghai），与日志清理 03:21 相隔 5 分钟。
+     * RESOLVED/IGNORED 在 resolvedAt 后保留 365 天；每批最多 100 条、单轮最多 10 批、批次间隔 100ms。
+     * 只删除异常工作记录，不修改订单。
+     */
+    @Cron('0 16 3 * * 0', { timeZone: 'Asia/Shanghai' })
+    async runAnomalyCleanup() {
+        if (this.taskRunning.anomalyCleanup) return;
+        this.taskRunning.anomalyCleanup = true;
+        const cutoff = Date.now() - 365 * 24 * 60 * 60 * 1000;
+        let totalDeleted = 0;
+        try {
+            for (let batch = 0; batch < 10; batch++) {
+                const deleted = await this.bookingRepository.deleteResolvedAnomalies(cutoff, 100);
+                totalDeleted += deleted;
+                if (deleted < 100) break;
+                await new Promise((resolve) => setTimeout(resolve, 100));
+            }
+            this.logger.log(`异常记录清理完成: 删除 ${totalDeleted} 条`);
+            this.logTask('anomaly-cleanup', AppLogLevel.INFO, '完成', { task: 'anomaly-cleanup', deleted: totalDeleted });
+        } catch (error) {
+            this.logger.error('异常记录清理失败', error);
+            this.logTask('anomaly-cleanup', AppLogLevel.ERROR, '失败', { task: 'anomaly-cleanup', error: (error as Error).message });
+        } finally {
+            this.taskRunning.anomalyCleanup = false;
+        }
+    }
+
+    /**
+     * 历史订单更新：每小时（13 分），不调用微信，保留批量 UPDATE
+     */
+    @Cron('0 13 * * * *', { timeZone: 'Asia/Shanghai' })
+    async runHistoricalBookingUpdate() {
+        if (this.taskRunning.historical) return;
+        this.taskRunning.historical = true;
+        try {
+            const todayStart = new Date(new Date().getFullYear(), new Date().getMonth(), new Date().getDate());
+            await this.bookingRepository.updatePastBookings(todayStart);
+            this.logTask('historical', AppLogLevel.INFO, '完成', { task: 'historical' });
+        } catch (error) {
+            this.logger.error('历史订单更新任务失败', error);
+            this.logTask('historical', AppLogLevel.ERROR, '失败', { task: 'historical', error: (error as Error).message });
+        } finally {
+            this.taskRunning.historical = false;
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 对账结果应用（单 writer FIFO 写回）
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * 定时任务摘要日志（每轮一条，日志失败不影响任务结果）
+     */
+    private logTask(taskName: string, level: AppLogLevel, message: string, context?: unknown) {
+        this.loggingService.write({
+            source: AppLogSource.BACKEND,
+            level,
+            category: AppLogCategory.RUNTIME,
+            message: `定时任务[${taskName}] ${message}`,
+            context: context ?? { task: taskName },
+        });
+    }
+
+    /**
+     * 支付兜底结果应用
+     */
+    private async applyPaymentReconcileResult(booking: Booking, result: OrderQueryResult) {
+        const now = Date.now();
+        switch (result.state) {
+            case 'SUCCESS':
+                await this.bookingRepository.markPaymentSucceeded(booking.outTradeNo, result.transactionId ?? null, new Date());
+                await this.resolvePaymentAnomalies(booking.bookingId, '支付对账确认成功', now);
+                break;
+            case 'CLOSED':
+            case 'REVOKED':
+            case 'PAYERROR':
+                // 微信明确终态失败：按微信终态置 CANCELLED + FAILED，清空调度字段
+                await this.bookingRepository.markPaymentFailed(booking.bookingId, booking.outTradeNo, PaymentStatus.FAILED, BookingStatus.CANCELLED);
+                await this.resolvePaymentAnomalies(booking.bookingId, '支付对账确认微信终态失败', now);
+                break;
+            case 'NOTPAY':
+            case 'USERPAYING':
+                // 仍在正常处理中：保留状态，5 分钟后重查
+                await this.bookingRepository.reschedulePaymentCheck(booking.bookingId, booking.outTradeNo, now + 5 * 60 * 1000, now);
+                break;
+            case 'NOT_EXIST':
+                // 本地 PAYING 但微信侧无单：升级异常，暂停正常通道
+                await this.bookingRepository.escalateReconciliationAnomaly(
+                    booking.bookingId,
+                    AnomalyType.REMOTE_ORDER_NOT_FOUND,
+                    'ORDER_NOT_EXIST',
+                    '本地 PAYING 但微信订单不存在',
+                    nextAnomalyRetryAt(1, now),
+                );
+                break;
+            case 'UNKNOWN':
+            default:
+                // 临时错误：attempts 加一，连续三次后升级异常
+                await this.bookingRepository.markPaymentResultUnknown(booking.bookingId, booking.outTradeNo, result.errorCode ?? 'QUERY_ORDER_UNKNOWN', now);
+                const fresh = await this.bookingRepository.getBookingById(booking.bookingId);
+                if (fresh.paymentStatus === PaymentStatus.PAYING && fresh.reconcileAttempts >= 3) {
+                    await this.bookingRepository.escalateReconciliationAnomaly(
+                        fresh.bookingId,
+                        AnomalyType.PAYMENT_QUERY_REPEATED_FAILURE,
+                        result.errorCode ?? 'QUERY_ORDER_UNKNOWN',
+                        '支付查询连续失败',
+                        nextAnomalyRetryAt(fresh.reconcileAttempts, now),
+                    );
+                }
+                break;
+        }
+    }
+
+    /**
+     * 退款对账结果应用
+     */
+    private async applyRefundReconcileResult(booking: Booking, result: any) {
+        const now = Date.now();
+        switch (result.state) {
+            case 'SUCCESS':
+                await this.bookingRepository.markRefundSucceeded(booking.bookingId, booking.outRefundNo, new Date());
+                await this.bookingRepository.resolveAnomaly(booking.bookingId, AnomalyType.REFUND_QUERY_REPEATED_FAILURE, '退款对账确认成功', now);
+                break;
+            case 'CLOSED':
+            case 'ABNORMAL':
+            case 'NOT_EXIST':
+                // 微信明确终态失败或退款单不存在：标记失败，清空调度字段
+                await this.bookingRepository.markRefundFailed(booking.bookingId, booking.outRefundNo);
+                await this.bookingRepository.resolveAnomaly(booking.bookingId, AnomalyType.REFUND_QUERY_REPEATED_FAILURE, '退款对账确认终态失败', now);
+                break;
+            case 'PROCESSING':
+                // 仍在处理中：15 分钟后再查
+                await this.bookingRepository.rescheduleRefundCheck(booking.bookingId, booking.outRefundNo, now + 15 * 60 * 1000, now);
+                break;
+            case 'UNKNOWN':
+            default:
+                // 临时错误：attempts 加一，连续三次后升级异常
+                await this.bookingRepository.markRefundResultUnknown(booking.bookingId, booking.outRefundNo, result.errorCode ?? 'QUERY_REFUND_UNKNOWN', now);
+                const fresh = await this.bookingRepository.getBookingById(booking.bookingId);
+                if (fresh.refundStatus === RefundStatus.REFUNDING && fresh.reconcileAttempts >= 3) {
+                    await this.bookingRepository.escalateReconciliationAnomaly(
+                        fresh.bookingId,
+                        AnomalyType.REFUND_QUERY_REPEATED_FAILURE,
+                        result.errorCode ?? 'QUERY_REFUND_UNKNOWN',
+                        '退款查询连续失败',
+                        nextAnomalyRetryAt(fresh.reconcileAttempts, now),
+                    );
+                }
+                break;
+        }
+    }
+
+    /**
+     * 异常通道重试：按异常类型重新执行一次对应查询并应用结果；
+     * 明确终态 → 应用并 RESOLVED；处理中/未知 → 按退避时间重排
+     */
+    private async applyAnomalyRetry(booking: Booking, anomaly: BookingAnomaly) {
+        const now = Date.now();
+        const stateChanged = async (resolution: string) => {
+            await this.bookingRepository.resolveAnomaly(booking.bookingId, anomaly.type, resolution, now);
+        };
+        const backoff = () => this.bookingRepository.rescheduleAnomalyRetry(booking.bookingId, anomaly.type, nextAnomalyRetryAt(anomaly.occurrenceCount, now));
+
+        switch (anomaly.type) {
+            case AnomalyType.PAYMENT_QUERY_REPEATED_FAILURE: {
+                if (booking.paymentStatus !== PaymentStatus.PAYING || !booking.outTradeNo) {
+                    await stateChanged('订单状态已变化');
+                    return;
+                }
+                const r = await this.wechatPayService.queryOrder(booking.outTradeNo);
+                if (r.state === 'SUCCESS') {
+                    await this.bookingRepository.markPaymentSucceeded(booking.outTradeNo, r.transactionId ?? null, new Date());
+                    await this.resolvePaymentAnomalies(booking.bookingId, '异常通道重试确认支付成功', now);
+                } else if (r.state === 'CLOSED' || r.state === 'REVOKED' || r.state === 'PAYERROR') {
+                    await this.bookingRepository.markPaymentFailed(booking.bookingId, booking.outTradeNo, PaymentStatus.FAILED, BookingStatus.CANCELLED);
+                    await this.resolvePaymentAnomalies(booking.bookingId, '异常通道重试确认微信终态失败', now);
+                } else {
+                    await backoff();
+                }
+                return;
+            }
+            case AnomalyType.REFUND_QUERY_REPEATED_FAILURE: {
+                if (booking.refundStatus !== RefundStatus.REFUNDING || !booking.outRefundNo) {
+                    await stateChanged('订单状态已变化');
+                    return;
+                }
+                const r = await this.wechatPayService.queryRefund(booking.outRefundNo);
+                if (r.state === 'SUCCESS') {
+                    await this.bookingRepository.markRefundSucceeded(booking.bookingId, booking.outRefundNo, new Date());
+                    await this.bookingRepository.resolveAnomaly(booking.bookingId, anomaly.type, '异常通道重试确认退款成功', now);
+                } else if (r.state === 'CLOSED' || r.state === 'ABNORMAL' || r.state === 'NOT_EXIST') {
+                    await this.bookingRepository.markRefundFailed(booking.bookingId, booking.outRefundNo);
+                    await this.bookingRepository.resolveAnomaly(booking.bookingId, anomaly.type, '异常通道重试确认退款终态', now);
+                } else {
+                    await backoff();
+                }
+                return;
+            }
+            case AnomalyType.CLOSE_ORDER_REPEATED_FAILURE: {
+                if (booking.paymentStatus !== PaymentStatus.UNPAID && booking.paymentStatus !== PaymentStatus.PAYING) {
+                    await stateChanged('订单状态已变化');
+                    return;
+                }
+                if (!booking.outTradeNo) {
+                    await stateChanged('无微信单号，无需关单');
+                    return;
+                }
+                const r = await this.wechatPayService.closeOrder(booking.outTradeNo, { agent: this.wechatPayService.reconciliationAgent });
+                if (r.kind === 'CLOSED' || r.kind === 'ALREADY_CLOSED') {
+                    await this.bookingRepository.markPaymentClosed([booking.bookingId], now);
+                    await stateChanged('异常通道重试关单成功');
+                } else if (r.kind === 'ALREADY_PAID') {
+                    const paidQuery = await this.wechatPayService.queryOrder(booking.outTradeNo);
+                    await this.bookingRepository.markPaymentSucceeded(booking.outTradeNo, paidQuery.transactionId ?? null, new Date());
+                    await this.resolvePaymentAnomalies(booking.bookingId, '异常通道重试关单时发现已支付', now);
+                } else {
+                    await backoff();
+                }
+                return;
+            }
+            case AnomalyType.REMOTE_ORDER_NOT_FOUND: {
+                // 本地 PAYING 但微信曾查不到单：重查一次；仍不存在则退避（人工介入）
+                if (booking.paymentStatus !== PaymentStatus.PAYING || !booking.outTradeNo) {
+                    await stateChanged('订单状态已变化');
+                    return;
+                }
+                const r = await this.wechatPayService.queryOrder(booking.outTradeNo);
+                if (r.state === 'SUCCESS') {
+                    await this.bookingRepository.markPaymentSucceeded(booking.outTradeNo, r.transactionId ?? null, new Date());
+                    await this.resolvePaymentAnomalies(booking.bookingId, '异常通道重试确认微信已支付', now);
+                } else if (r.state !== 'NOT_EXIST' && r.state !== 'UNKNOWN') {
+                    await this.bookingRepository.markPaymentFailed(booking.bookingId, booking.outTradeNo, PaymentStatus.FAILED, BookingStatus.CANCELLED);
+                    await this.resolvePaymentAnomalies(booking.bookingId, '异常通道重试确认微信终态', now);
+                } else {
+                    await backoff();
+                }
+                return;
+            }
+            case AnomalyType.LOCAL_REMOTE_STATUS_MISMATCH: {
+                // 本地与微信终态冲突：重查对齐
+                if (!booking.outTradeNo) {
+                    await stateChanged('无微信单号');
+                    return;
+                }
+                const r = await this.wechatPayService.queryOrder(booking.outTradeNo);
+                if (r.state === 'SUCCESS') {
+                    await this.bookingRepository.markPaymentSucceeded(booking.outTradeNo, r.transactionId ?? null, new Date());
+                    await this.resolvePaymentAnomalies(booking.bookingId, '异常通道重试确认支付成功', now);
+                } else if (r.state === 'CLOSED' || r.state === 'REVOKED' || r.state === 'PAYERROR') {
+                    await this.bookingRepository.markPaymentFailed(booking.bookingId, booking.outTradeNo, PaymentStatus.FAILED, BookingStatus.CANCELLED);
+                    await this.resolvePaymentAnomalies(booking.bookingId, '异常通道重试确认微信终态', now);
+                } else {
+                    await backoff();
+                }
+                return;
+            }
+            case AnomalyType.PAYMENT_CREATED_LOCAL_SAVE_FAILED: {
+                // 微信下单成功但本地保存失败：检查订单是否已被回调/其他流程推进
+                if (booking.paymentStatus === PaymentStatus.PAID || booking.status === BookingStatus.CONFIRMED) {
+                    await stateChanged('订单已被推进');
+                } else if (booking.paymentStatus === PaymentStatus.PAYING && booking.outTradeNo) {
+                    const r = await this.wechatPayService.queryOrder(booking.outTradeNo);
+                    if (r.state === 'SUCCESS') {
+                        await this.bookingRepository.markPaymentSucceeded(booking.outTradeNo, r.transactionId ?? null, new Date());
+                        await this.resolvePaymentAnomalies(booking.bookingId, '异常通道重试确认支付成功', now);
+                    } else if (r.state === 'CLOSED' || r.state === 'REVOKED' || r.state === 'PAYERROR') {
+                        await this.bookingRepository.markPaymentFailed(booking.bookingId, booking.outTradeNo, PaymentStatus.FAILED, BookingStatus.CANCELLED);
+                        await this.resolvePaymentAnomalies(booking.bookingId, '异常通道重试确认微信终态', now);
+                    } else {
+                        await backoff();
+                    }
+                } else {
+                    await backoff();
+                }
+                return;
+            }
+            default:
+                // manual 等类型不在此处理（调用方已跳过）
+                return;
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 核验
+    // ─────────────────────────────────────────────────────────────────────────
 
     /**
      * 核验订单（管理员扫码）
@@ -680,10 +1401,29 @@ export class BookingService {
         const booking = await this.bookingRepository.getBookingById(bookingId);
 
         if (booking.status !== BookingStatus.CONFIRMED) {
+            // 记录点：核验失败（日志失败不影响业务结果）
+            this.loggingService.write({
+                source: AppLogSource.BACKEND,
+                level: AppLogLevel.WARN,
+                category: AppLogCategory.BOOKING,
+                message: '预约核验失败',
+                route: `/bookings/${bookingId}/verify`,
+                context: { bookingId, currentStatus: booking.status },
+            });
             throw new BadRequestException(`订单状态不可核验，当前状态：${booking.status}`);
         }
 
-        return await this.bookingRepository.updateBooking(bookingId, { status: BookingStatus.COMPLETED } as any);
+        const updated = await this.bookingRepository.updateBooking(bookingId, { status: BookingStatus.COMPLETED } as any);
+        // 记录点：核验成功
+        this.loggingService.write({
+            source: AppLogSource.BACKEND,
+            level: AppLogLevel.INFO,
+            category: AppLogCategory.BOOKING,
+            message: '预约核验成功',
+            route: `/bookings/${bookingId}/verify`,
+            context: { bookingId },
+        });
+        return updated;
     }
 
     /**

@@ -8,6 +8,7 @@ import { GetBookingStatsDto } from './dto/getBookingStats.dto';
 import { UpdateBookingDto } from './dto/updateBooking.dto';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { BookingStatus } from '../../entities/booking.entity';
+import { PaymentException } from '../../common/payment-errors';
 import { IsEnum, IsOptional } from 'class-validator';
 
 class GetBookingCountDto {
@@ -177,10 +178,14 @@ export class BookingController {
                 data: paymentParams,
             });
         } catch (error) {
+            // 稳定错误码契约（待设计确认，见 implementation-todo.md 待确认问题 6）：
+            // 保持现有响应结构不变，附 errorCode 字段供前端按码分支（已支付/超时/结果未知等）
+            const errorCode = error instanceof PaymentException ? error.code : undefined;
             return res.status(HttpStatus.BAD_REQUEST).send({
                 success: false,
                 message: 'Failed to initiate payment',
                 error: error.message,
+                ...(errorCode ? { errorCode } : {}),
             });
         }
     }

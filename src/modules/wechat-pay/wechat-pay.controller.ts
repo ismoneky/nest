@@ -2,6 +2,8 @@ import { Controller, Post, Get, Param, Body, Headers, HttpStatus, Res, RawBodyRe
 import { ValidationPipe } from '@nestjs/common';
 import { Request, Response } from 'express';
 import { WechatPayService } from './wechat-pay.service';
+import { LoggingService } from '../logging/logging.service';
+import { AppLogLevel, AppLogSource, AppLogCategory } from '../../entities/app-log.entity';
 
 /**
  * 微信支付回调控制器
@@ -12,6 +14,7 @@ export class WechatPayController {
 
     constructor(
         private readonly wechatPayService: WechatPayService,
+        private readonly loggingService: LoggingService,
     ) {}
 
     /**
@@ -67,9 +70,26 @@ export class WechatPayController {
                 if (result) {
                     await this.wechatPayService.handlePaymentSuccess(result.outTradeNo, result.transactionId);
                     this.logger.log(`支付回调处理成功: ${result.outTradeNo}`);
+                    // 记录点：支付回调处理成功（日志失败不影响业务结果）
+                    this.loggingService.write({
+                        source: AppLogSource.BACKEND,
+                        level: AppLogLevel.INFO,
+                        category: AppLogCategory.PAYMENT,
+                        message: '支付回调处理成功',
+                        route: '/wechat-pay/notify',
+                        context: { outTradeNo: result.outTradeNo },
+                    });
                 }
             } catch (error) {
                 this.logger.error('支付回调业务处理失败', error);
+                this.loggingService.write({
+                    source: AppLogSource.BACKEND,
+                    level: AppLogLevel.ERROR,
+                    category: AppLogCategory.PAYMENT,
+                    message: '支付回调业务处理失败',
+                    route: '/wechat-pay/notify',
+                    context: { error: (error as Error).message },
+                });
             }
         });
     }
@@ -102,9 +122,26 @@ export class WechatPayController {
                 if (result) {
                     await this.wechatPayService.handleRefundCallback(result.outTradeNo, result.refundStatus);
                     this.logger.log(`退款回调处理完成: ${result.outTradeNo}, 状态: ${result.refundStatus}`);
+                    // 记录点：退款回调处理结果（日志失败不影响业务结果）
+                    this.loggingService.write({
+                        source: AppLogSource.BACKEND,
+                        level: AppLogLevel.INFO,
+                        category: AppLogCategory.PAYMENT,
+                        message: '退款回调处理完成',
+                        route: '/wechat-pay/refund-notify',
+                        context: { outTradeNo: result.outTradeNo, refundStatus: result.refundStatus },
+                    });
                 }
             } catch (error) {
                 this.logger.error('退款回调业务处理失败', error);
+                this.loggingService.write({
+                    source: AppLogSource.BACKEND,
+                    level: AppLogLevel.ERROR,
+                    category: AppLogCategory.PAYMENT,
+                    message: '退款回调业务处理失败',
+                    route: '/wechat-pay/refund-notify',
+                    context: { error: (error as Error).message },
+                });
             }
         });
     }

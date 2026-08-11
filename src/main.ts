@@ -14,16 +14,14 @@ if (!global.crypto) {
 }
 
 import { AppModule } from './app.module';
-import { HttpExceptionFilter } from './filters/http-exception.filter';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule, {
     // 保留原始请求体，用于微信支付回调验签
     rawBody: true,
+    // 日志批量上报请求体最大 192 KiB（logging-design.md「批量上报」），默认 100kb 不够
+    bodyParser: { json: { limit: '192kb' } },
   });
-
-  // 启用全局异常过滤器,防止未捕获异常导致服务器崩溃
-  app.useGlobalFilters(new HttpExceptionFilter());
 
   // 启用全局验证管道,防止无效数据导致内存问题
   app.useGlobalPipes(

@@ -1,5 +1,17 @@
 # Schema 迁移方案
 
+> **⚠️ 本方案已废弃，不采用。**
+>
+> 决策：**不引入 TypeORM migration runner**（不创建 `data-source.ts`、`migrations/` 目录、`migration:*` 脚本，也不启用 `migrationsRun`）。原因：
+>
+> - 生产环境 `synchronize=false` 下，schema 变更本来就靠手工执行 SQL；引入 runner 反而增加一整套维护面（迁移文件、生成/审阅/执行流程、`migrations` 表）。
+> - `migrationsRun: true` 有风险：迁移失败会导致应用启动失败（整个支付服务起不来），不如手工 SQL 可控。
+> - 本项目为单实例小系统，SQLite 手工加列/建表简单直接，历史可控（SQL 全部记录在文档中）。
+>
+> 现有生产数据不受影响：**所有 schema 变更 SQL 见 `docs/implementation-todo.md`「生产 schema 变更 SQL（手工执行）」**，上线时在数据库上手工执行即可。`app.module.ts` 保持 `synchronize: NODE_ENV !== 'production'`（生产 false，开发 true），不启用任何迁移相关配置。
+>
+> 以下正文为原方案，仅作历史存档，不按它实施。
+
 ## 背景
 
 当前后端使用 TypeORM，但生产环境 `synchronize=false`（见 `src/app.module.ts:32`），且没有 migration runner、`data-source.ts` 或 `migration:*` npm 脚本。这意味着生产环境的 schema 变更（加列、加索引、建表）不会自动生效，必须由明确的迁移机制执行。

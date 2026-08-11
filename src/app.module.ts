@@ -23,15 +23,22 @@ import { SystemConfig } from './entities/system-config.entity';
 import { AdminApplication } from './entities/admin-application.entity';
 import { Feedback } from './entities/feedback.entity';
 import { Member } from './entities/member.entity';
+import { BookingAnomaly } from './entities/booking-anomaly.entity';
+import { AppLog } from './entities/app-log.entity';
+import { LoggingModule } from './modules/logging/logging.module';
+import { HttpExceptionFilter } from './filters/http-exception.filter';
+import { APP_FILTER } from '@nestjs/core';
 
 @Module({
     imports: [
         TypeOrmModule.forRoot({
             type: 'sqlite',
             database: process.env.DATABASE_PATH || 'data/app.db',
+            // 生产环境（NODE_ENV=production）synchronize=false：schema 变更通过手工 SQL 执行，
+            // SQL 见 docs/implementation-todo.md「生产 schema 变更 SQL（手工执行）」
             synchronize: process.env.NODE_ENV !== 'production',
             logging: process.env.DATABASE_LOGGING === 'true',
-            entities: [User, UserProfile, Admin, Booking, Announcement, SystemConfig, AdminApplication, Feedback, Member],
+            entities: [User, UserProfile, Admin, Booking, Announcement, SystemConfig, AdminApplication, Feedback, Member, BookingAnomaly],
             // WAL 模式：读写不互斥，显著提升并发性能
             // busy_timeout：写锁冲突时等待 5 秒而非立即报错
             // synchronous=NORMAL：WAL 模式下安全且更快的同步级别
@@ -43,7 +50,18 @@ import { Member } from './entities/member.entity';
                 ],
             },
         }),
+        // 日志库独立 DataSource（logs.db）：只注册 AppLog，synchronize 无条件关闭，
+        // 建表走手工 SQL（docs/implementation-todo.md「生产 schema 变更 SQL」第 5 节）
+        TypeOrmModule.forRoot({
+            name: 'logs',
+            type: 'sqlite',
+            database: process.env.LOG_DATABASE_PATH || 'data/logs.db',
+            synchronize: false,
+            logging: process.env.DATABASE_LOGGING === 'true',
+            entities: [AppLog],
+        }),
         ScheduleModule.forRoot(),
+        LoggingModule,
         UserModule,
         BookingModule,
         AdminModule,
@@ -55,6 +73,10 @@ import { Member } from './entities/member.entity';
         MemberModule,
     ],
     controllers: [AppController],
-    providers: [AppService],
+    providers: [
+        AppService,
+        // 全局异常过滤器（可注入日志服务，未处理异常写入 app_logs）
+        { provide: APP_FILTER, useClass: HttpExceptionFilter },
+    ],
 })
 export class AppModule {}

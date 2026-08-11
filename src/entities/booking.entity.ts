@@ -187,6 +187,26 @@ export class Booking {
     @Column({ type: 'integer', nullable: true, transformer: timestampTransformer })
     paymentExpiredAt: Date;
 
+    /** 对账任务类型（payment | refund | close，null 表示无待处理对账） */
+    @Column({ type: 'varchar', nullable: true })
+    reconcileKind: string;
+
+    /** 下次对账时间（毫秒 epoch；null 表示未排期，不当作到期） */
+    @Column({ type: 'integer', nullable: true })
+    reconcileNextAt: number;
+
+    /** 连续对账失败次数 */
+    @Column({ type: 'integer', default: 0 })
+    reconcileAttempts: number;
+
+    /** 最近对账时间（毫秒 epoch） */
+    @Column({ type: 'integer', nullable: true })
+    reconcileLastAt: number;
+
+    /** 最近对账稳定错误码 */
+    @Column({ type: 'varchar', nullable: true })
+    reconcileLastErrorCode: string;
+
     /** 创建时间 */
     @Column({ type: 'integer', transformer: timestampTransformer, default: () => `${Date.now()}` })
     createdAt: Date;
