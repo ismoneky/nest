@@ -96,7 +96,7 @@ Map 的键使用 `bookingId`。每个请求在读取缓存或 flight 之前都�
 
 | 触发者 | Booking Service 动作 | 期望旧状态 | 同一原子更新的新状态与调度字段 |
 | --- | --- | --- | --- |
-| 用户发起支付 | `markPaymentStarting` | `PENDING + UNPAID/PAYING` 且未过期；旧 `outTradeNo` 与步骤 7 读取值相同，首次为 NULL | `PENDING + PAYING`，写新 `outTradeNo`，`reconcileKind=payment`，`reconcileNextAt=now+5min`，attempts 清零 |
+| 用户发起支付 | `markPaymentStarting` | `PENDING + UNPAID/PAYING` 且未过期；旧 `outTradeNo` 与步骤 7 读取值相同（首次为 NULL，被拒后带号 `UNPAID` 换单时为保留的旧号） | `PENDING + PAYING`，写新 `outTradeNo`，`reconcileKind=payment`，`reconcileNextAt=now+5min`，attempts 清零 |
 | 微信明确拒绝且未建单 | `markPaymentStartRejected` | `PAYING + 相同 outTradeNo` | `UNPAID`，保留该 `outTradeNo`，清空 payment 调度字段，保留稳定错误码；下次重试先查询该单号 |
 | 微信请求结果未知 | `markPaymentResultUnknown` | `PAYING + 相同 outTradeNo` | 保持 `PAYING`，`reconcileKind=payment`，`reconcileNextAt=now`，attempts 加一 |
 | 支付成功回调 | `markPaymentSucceeded` | 非支付终态且 `outTradeNo` 相同 | `CONFIRMED + PAID`，写 transactionId/paidAt，清空全部调度字段 |
@@ -112,6 +112,10 @@ Map 的键使用 `bookingId`。每个请求在读取缓存或 flight 之前都�
 所有回调和对账动作都必须带 `outTradeNo/outRefundNo + expectedStatus` 条件。affected rows 为 0 表示订单已被其他流程推进，应重新读取后按幂等结果结束，不能强行覆盖。人工处理异常时也必须调用上述命名动作，不能直接编辑异常表或通用更新订单状态。
 
 `markPaymentStarting` 接受旧状态 `PAYING` 的前提是步骤 7 已经取得微信旧单的明确结果并确认允许换单；接受带旧 `outTradeNo` 的 `UNPAID` 也必须满足同一前提。只有不带 `outTradeNo` 的首次 `UNPAID` 可以跳过步骤 7。结果未知时不得调用该动作。
+
+微信回调为最高优先级确认。当本地预判（`markPaymentStartRejected` 或 `markPaymentResultUnknown`）与随后到达的支付成功回调冲突时，以回调为准：只要 `markPaymentSucceeded` 的条件（非支付终态且 `outTradeNo` 相同）满足，就必须把订单推进到 `CONFIRMED + PAID`，覆盖此前的预判结论。被拒保留的 `outTradeNo` 在回调到达时同样适用该规则。
+
+步骤 7 调用 `closeOrder` 明确关闭旧单后，到步骤 8 `markPaymentStarting` 落库新号之前，仍可能被支付成功回调抢先（旧号其实被用户付了）。此时 `markPaymentStarting` 的条件 UPDATE 因订单已被回调改为 `CONFIRMED + PAID` 而返回 affected=0，按上述"affected=0 重新读取后按幂等结果结束"处理，改走 `markPaymentSucceeded` 路径，不得强行换单。
 
 ## 小程序可恢复锁
 
@@ -322,7 +326,7 @@ PAYMENT_CREATED_LOCAL_SAVE_FAILED
 - 外部微信请求可以并发 2 个，但处理结果按完成顺序进入批内 FIFO，写回 SQLite 时由单 writer 串行提交，不对一批结果再次 `Promise.all` 并发写库。外部 worker 可以继续获取后续结果，只有入库动作排队；任务结束前必须等待 FIFO 排空。
 - 每批最多 20 个正常订单、5 个异常订单；完成一批即释放执行权，不在一轮任务中循环清空全部积压。
 - 结构化日志不得加入订单状态事务；业务事务提交后再交给独立 `logs.db` 的日志写入队列。
-- 定时任务必须错峰，日志清理不得与支付对账、退款对账和超时关单同一分钟启动。
+- 定时任务必须错峰。日志清理每日 `03:21`（Asia/Shanghai）启动，落在支付兜底/关单/退款/异常/历史订单所有启动分钟并集之外；异常表清理每周日 `03:16`，两者相隔 5 分钟，互不重叠。两类清理均不与对账任务同一分钟启动。
 - 提供 `RECONCILIATION_ENABLED`、`RECONCILIATION_BATCH_SIZE` 和 `RECONCILIATION_CONCURRENCY` 配置。发现锁等待上升时可先停后台对账或把批量降为 5，不影响微信回调主路径。
 
 上线前后使用现有 SQLite 支付竞争诊断和同一组业务压测对比。验收要求：加入日志写入和对账任务后，用户支付压测 p95 相对无后台任务基线增长不超过 20%，不出现 `SQLITE_BUSY`，单次订单/调度状态写事务 p95 不超过 50ms。任何一项不满足都先降低后台批量和日志刷盘频率，本期不以开启 WAL 掩盖问题。
