@@ -2,7 +2,7 @@
 
 ## 目标
 
-为当前小型预约系统提供一个低运维成本的日志入口，覆盖后端业务日志、小程序运行日志和管理后台查询。日志保存在现有 SQLite 数据库中，不引入外部日志平台，也不改变预约、支付或认证架构。
+为当前小型预约系统提供一个低运维成本的日志入口，覆盖后端业务日志、小程序运行日志和管理后台查询。日志保存在新增的独立 SQLite 文件 `logs.db` 中，不引入外部日志平台，也不改变预约、支付或认证架构。线上现有业务数据库是 `prod.db`，本方案不改名、不搬迁、不修改它的表结构。
 
 本设计跨越三个仓库：
 
@@ -29,7 +29,7 @@
 
 ## 数据模型
 
-新增 `app_logs` 表：
+在独立的 `logs.db` 中新增 `app_logs` 表。`bookingId`、`requestId` 等关联字段只保存为普通字符串，不与 `prod.db` 建立外键，也不做跨库 JOIN：
 
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
@@ -73,6 +73,26 @@ interface AppLogWriter {
 内部 `write/writeMany` 在日志成功进入内存队列后即可 resolve，不代表已经落盘，业务调用方不得等待 SQLite。只有小程序上报接口调用 `persistClientBatch` 并等待对应批次真实提交后，才能向客户端确认 `acceptedLogIds`。
 
 所有 SQLite 日志写入通过一个进程内 writer 队列串行执行，同一时刻最多一个日志事务。`writeMany` 每次最多接受 20 条；更多数据必须由调用方拆批。后端业务日志队列最多保存 500 条，达到 20 条或最老日志等待 5 秒时触发一次刷盘，每次用一条批量 INSERT 写入最多 20 条。后端队列满时复用小程序队列的级别淘汰顺序，优先保留较新且级别更高的日志。
+
+Nest 使用两个 TypeORM DataSource：
+
+- 默认 DataSource 继续读取现有 `DATABASE_PATH`；线上保持 `DATABASE_PATH=data/prod.db`，原有实体和 Repository 不改连接。
+- 名为 `logs` 的 DataSource 读取新增的 `LOG_DATABASE_PATH`，线上建议 `LOG_DATABASE_PATH=data/logs.db`，只注册 `AppLog` 实体。
+- `LoggingModule` 必须显式使用 `TypeOrmModule.forFeature([AppLog], 'logs')` 和命名为 `logs` 的 Repository，避免日志误写入 `prod.db`。
+- 两个 DataSource 都维持本期现有 SQLite journal/synchronous 策略，不借本次改动启用 WAL 或修改 `synchronous`。
+
+### 初始化与迁移边界
+
+本次涉及的是**新日志库初始化**，不涉及现有业务库或业务数据迁移：
+
+- `prod.db` 已在线上存在。本次不复制、不重建、不重命名、不新增日志表，也不修改其 schema。
+- `logs.db` 当前不存在，首次上线前必须通过独立、可重复执行的初始化命令创建 `app_logs` 表和索引；这就是本次所说的“初始化”。
+- 生产环境两个 DataSource 均保持 `synchronize: false`。初始化命令使用明确的建表/建索引版本文件，不依赖 TypeORM 在应用启动时自动改表。
+- 初始化命令只能连接 `LOG_DATABASE_PATH`，并在执行前拒绝 `LOG_DATABASE_PATH === DATABASE_PATH`，防止配置错误触碰 `prod.db`。
+- 初始化完成后，应用启动时只校验 `logs.db` 的 schema 版本和必需表/索引。校验失败时禁用 SQLite 日志并回退到 Nest stdout，不影响预约和支付服务启动。
+- 以后如果 `app_logs` 结构变化，才需要对 `logs.db` 执行版本化 schema migration。它仍然只升级日志库，不表示把 `prod.db` 数据迁走。
+
+因此，本期部署只多一步“初始化一个空的 `logs.db`”；没有旧日志需要搬运，也没有针对 `prod.db` 的数据库迁移。
 
 首批记录点：
 
@@ -218,19 +238,20 @@ GET /admin/logs/stats?start=2026-08-10&end=2026-08-11
 - 每日低峰期执行一次删除：`createdAt < now - 30 days`。
 - 每批最多删除 200 条，批次间隔至少 100ms，每日单轮最多执行 10 批；剩余过期日志下一日继续，避免长事务阻塞 SQLite。
 - 清理任务记录删除数量和耗时；清理失败仅记录后端原生日志，下一日重试。
+- 独立监控 `logs.db` 文件大小；默认达到 512 MiB 时输出限频告警并优先执行过期日志清理。阈值通过配置调整，不影响 `prod.db`。
 
 ## SQLite 写锁预算
 
-本期不启用 WAL。`app_logs` 和支付可靠性设计中的 `booking_anomalies` 都位于现有 SQLite，因此新增表本身虽然不会锁库，新增写入会与订单状态更新竞争唯一 writer。日志设计按以下预算约束落地：
+本期不启用 WAL。`app_logs` 位于独立的 `logs.db`，它的 SQLite 文件锁不会直接阻塞 `prod.db` 的订单写事务；支付可靠性设计中的 `booking_anomalies` 仍留在 `prod.db`，以便与订单状态变更保持同库事务一致性。两个数据库仍共享同一块磁盘、Node 进程和 libuv 线程池，因此独立文件降低的是数据库写锁耦合，不等于完全资源隔离。日志设计按以下预算约束落地：
 
 - 日志绝不参与预约、支付、退款的业务事务；业务提交后才入 writer 队列。
 - 后端业务请求不等待日志刷盘。日志队列已满时按级别淘汰并输出一次限频的 Nest stdout 告警，不能阻塞主流程。
 - 小程序批量上报需要等待日志持久化后才确认，但所有批次进入同一个串行 writer；最多 20 条一批，不并发开启多个 SQLite 日志事务。
 - writer 遇到 `SQLITE_BUSY` 不在 libuv worker 上追加长时间重试。客户端请求返回 503 并退避；后端非关键日志保留在内存队列等待下一轮，超过 30 秒仍无法写入时按队列淘汰规则处理。
-- 日志清理、异常订单低频重试和支付对账必须错峰。清理任务达到 200 条批量或当轮时间预算后立即提交并让出 writer。
+- 日志清理不再持有 `prod.db` 文件锁，但仍与支付对账共享磁盘和进程资源。清理任务达到 200 条批量或当轮时间预算后立即提交并让出日志 writer；高峰期仍避免与支付对账同时进行大批量工作。
 - 提供 `APP_LOG_SQLITE_ENABLED` 开关。发现写锁等待或支付 p95 恶化时可停止 SQLite 日志持久化，后端继续输出 Nest stdout，小程序上报返回 503 并保留本地队列。
 
-上线前后使用相同的支付并发场景同时注入小程序日志批次。验收要求：开启日志持久化后，用户支付 p95 相对关闭日志时增长不超过 20%，不出现 `SQLITE_BUSY`，日志批量事务 p95 不超过 50ms。超过任一边界时先把日志批量从 20 降到 10、延长刷盘间隔或关闭 SQLite 日志，不以启用 WAL 作为本期补救。
+上线前后使用相同的支付并发场景同时注入小程序日志批次。验收要求：开启日志持久化后，用户支付 p95 相对关闭日志时增长不超过 20%，`prod.db` 不因日志写入出现 `SQLITE_BUSY`，日志批量事务 p95 不超过 50ms。超过任一边界时先把日志批量从 20 降到 10、延长刷盘间隔或关闭 SQLite 日志，不以启用 WAL 作为本期补救。
 
 ## 错误处理
 
@@ -251,11 +272,17 @@ GET /admin/logs/stats?start=2026-08-10&end=2026-08-11
 - 日志中不存在明文 token、身份证、手机号、完整 OpenID 或支付密钥。
 - 超过 30 天的日志会被分批清理。
 - 日志存储不可用时，预约和支付接口仍按原业务结果返回。
+- `DATABASE_PATH=data/prod.db` 与 `LOG_DATABASE_PATH=data/logs.db` 时，所有 `app_logs` 写入只出现在 `logs.db`，`prod.db` 不新增 `app_logs` 表。
+- 将两个路径误配为同一文件时，日志库初始化命令必须拒绝执行。
+- 删除或损坏 `logs.db` 时，日志功能降级到 stdout，但 `prod.db` 中的预约和支付仍可正常工作。
 - 日志与异常订单写入同时启用后，支付竞争压测仍满足写锁预算中的 p95 和 `SQLITE_BUSY` 边界。
 
 ## 上线顺序
 
-1. 在 `nest` 增加日志表、写入模块、批量上报、后台查询和清理任务。
-2. 在 `admin` 增加日志管理页面。
-3. 在 `fctl` 增加 logger、本地队列和批量上报，先接入全局异常、网络错误和支付流程。
-4. 观察日志量与 SQLite 写入耗时，再逐步增加业务记录点。
+1. 保持线上 `DATABASE_PATH=data/prod.db` 不变，新增 `LOG_DATABASE_PATH=data/logs.db`；备份策略中分别处理两个文件，不要求跨库同一时点快照。
+2. 部署 `nest` 的日志库初始化命令并只对 `LOG_DATABASE_PATH` 执行，创建空的 `logs.db`、`app_logs` 表和索引；验证 `prod.db` 文件校验值/修改时间未被初始化命令改变。
+3. 在 `nest` 增加命名为 `logs` 的 DataSource、写入模块、批量上报、后台查询和清理任务；先保持 `APP_LOG_SQLITE_ENABLED=false` 验证服务启动与业务接口。
+4. 开启日志持久化并执行支付并发验收，确认日志只写入 `logs.db`，再接入后端记录点。
+5. 在 `admin` 增加日志管理页面。
+6. 在 `fctl` 增加 logger、本地队列和批量上报，先接入全局异常、网络错误和支付流程。
+7. 观察日志量与 SQLite 写入耗时，再逐步增加业务记录点。
