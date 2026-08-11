@@ -2,7 +2,7 @@
 
 ## 目标
 
-在保持单 Nest 实例、SQLite 和现有微信支付接入方式不变的前提下，降低重复点击、网络重试和后台对账并发造成的支付卡顿。设计只增加小范围的并发控制和任务调度，不引入 PaymentAttempt 表、队列服务或新的数据库。
+在保持单 Nest 实例、SQLite 和现有微信支付接入方式不变的前提下，降低重复点击、网络重试和后台对账并发造成的支付卡顿。设计只增加小范围的并发控制、任务调度字段和异常订单记录，不引入 PaymentAttempt 表、队列服务或新的数据库。
 
 本设计跨越两个仓库：
 
@@ -106,10 +106,11 @@ Map 的键使用 `bookingId`。每个请求在读取缓存或 flight 之前都�
 
 | 任务 | 周期 | 单批上限 | 微信并发 | 说明 |
 | --- | --- | --- | --- | --- |
-| 支付状态兜底 | 5 分钟 | 20 | 2 | 仅查询最近 30 分钟、未过期的 `PAYING` 订单 |
+| 支付状态兜底 | 5 分钟 | 20 | 2 | 按 `reconcileNextAt` 查询到期且未过期的 `PAYING` 订单 |
 | 支付超时关单 | 5 分钟 | 20 | 2 | 与支付兜底错开至少 2 分钟，关单后批量更新本地状态 |
 | 退款对账 | 15 分钟 | 20 | 2 | 与支付任务错开执行，处理 `REFUNDING` |
 | 历史订单更新 | 每小时 | 数据库批量更新 | 0 | 不调用微信，避开上述任务启动分钟 |
+| 异常订单低频重试 | 30 分钟 | 5 | 1 | 仅处理 `OPEN` 且 `nextRetryAt` 已到期的可自动恢复异常 |
 
 每个任务使用独立的进程内运行标记，防止自身重入。当前只有一个 Nest 实例，因此本阶段不增加数据库 job lease；未来出现多实例时再改为持久租约。
 
@@ -121,6 +122,120 @@ Map 的键使用 `bookingId`。每个请求在读取缓存或 flight 之前都�
 - 本批未处理的订单留到下一次任务，不在同一轮无限追赶积压。
 - 单个订单失败不终止整批；错误进入结构化日志。
 - 每个任务设置运行时间预算，超过预算停止领取新订单，已开始的请求正常收尾。
+
+### 精准候选查询
+
+当前微信相关任务并非无条件读取整张订单表，但会一次取出所有符合状态的记录：退款任务取全部 `REFUNDING`，支付任务取最近 30 分钟且未过期的全部 `PAYING`，超时任务取全部已过期的 `UNPAID/PAYING`。这些查询都缺少批量上限。历史订单任务是单条条件 UPDATE，不调用微信，可以继续保留批量更新。
+
+订单增加一组通用调度字段：
+
+```text
+reconcileKind             payment | refund | close | null
+reconcileNextAt           integer nullable
+reconcileAttempts         integer default 0
+reconcileLastAt           integer nullable
+reconcileLastErrorCode    varchar nullable
+```
+
+支付和退款不会在同一订单上同时进行，因此本阶段共用一组调度字段，不为每类流程重复增加列。
+
+正常对账候选使用固定条件：
+
+```text
+业务状态仍符合
+AND reconcileKind = 当前任务类型
+AND reconcileNextAt <= 当前时间
+ORDER BY reconcileNextAt ASC, id ASC
+LIMIT 20
+```
+
+不得使用“只查最近一天”之类的绝对时间窗口丢弃旧订单。服务停机、部署失败或异常持续数日后，未解决订单仍必须能够进入对账；缩小范围依赖状态、下次执行时间、索引和批量上限，而不是直接忽略较老记录。
+
+状态进入 `PAYING` 或 `REFUNDING` 时必须同时初始化对应调度字段。上线迁移负责为已有 `PAYING/REFUNDING` 记录补齐 `reconcileKind/reconcileNextAt`，之后正常查询不把 `reconcileNextAt IS NULL` 当作到期，以便人工暂停异常订单。
+
+处理结果更新：
+
+- 微信返回成功终态：更新订单业务状态并清空调度字段。
+- 微信仍在正常处理中：保留业务状态，设置下一次执行时间。
+- 临时网络错误：增加 `reconcileAttempts`，记录稳定错误码，并按退避时间设置下一次执行。
+- 达到异常条件：写入异常订单表并清空订单上的正常通道调度字段；可自动恢复的异常由异常通道降低重试频率，需要人工处理的异常暂停自动请求。
+
+新增索引：
+
+```text
+(reconcileKind, reconcileNextAt)
+(paymentStatus, paymentExpiredAt)
+(status, bookingDate)
+```
+
+历史订单仍使用 `bookingDate < today AND status = CONFIRMED` 的单条 UPDATE。`(status, bookingDate)` 复合索引用于缩小更新范围；不能只更新“昨天”，否则停机多日后会漏掉更早订单。
+
+### 超时关单的更新边界
+
+当前实现先查询全部超时订单并逐个关单，最后执行一条按时间和状态过滤的全量 UPDATE。加入 `LIMIT 20` 后不能继续使用这条全量 UPDATE，否则未进入本批、尚未调用微信关单的订单也会被标成失败。
+
+每批必须记录实际完成处理的 `bookingId`，并且只对这些 ID 做条件更新：
+
+```sql
+UPDATE bookings
+SET status = 'cancelled',
+    paymentStatus = 'failed',
+    reconcileKind = NULL,
+    reconcileNextAt = NULL
+WHERE bookingId IN (:processedBookingIds)
+  AND paymentStatus IN ('unpaid', 'paying')
+  AND paymentExpiredAt < :now;
+```
+
+只有微信明确关单成功、明确已经关闭，或业务规则确认无需再关单的订单才能进入 `processedBookingIds`。网络超时和不确定错误保留原状态并安排重试。条件中的当前支付状态用于防止支付成功回调刚完成后又被超时任务覆盖。
+
+当前 `closeOrder` 会吞掉所有微信错误并返回成功语义，调用者无法区分“已经关闭”和“网络状态未知”。实现时必须将其改为结构化结果，例如 `CLOSED / ALREADY_CLOSED / ALREADY_PAID / UNKNOWN`；后台任务只有收到前三类明确结果并重新检查本地状态后才能更新订单，`UNKNOWN` 必须重试或进入异常通道。
+
+## 异常订单记录
+
+新增 `booking_anomalies` 表，记录持续异常和需要人工关注的订单。订单表仍是预约、支付和退款状态的唯一事实来源；异常表不能反向充当第二套订单状态机。
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `id` | integer | 自增主键 |
+| `bookingId` | varchar | 关联订单编号 |
+| `type` | varchar | 稳定异常类型 |
+| `status` | varchar | `OPEN`、`RESOLVED` 或 `IGNORED` |
+| `firstSeenAt` | integer | 首次发现时间 |
+| `lastSeenAt` | integer | 最近发生时间 |
+| `occurrenceCount` | integer | 累计发生次数 |
+| `lastErrorCode` | varchar nullable | 过滤后的稳定错误码 |
+| `lastErrorSummary` | varchar nullable | 不含敏感数据的错误摘要 |
+| `nextRetryAt` | integer nullable | 异常通道的低频重试时间 |
+| `resolvedAt` | integer nullable | 解决时间 |
+| `resolution` | varchar nullable | 自动恢复或人工处理说明 |
+
+同一 `bookingId + type` 只保留一条记录。相同异常再次出现时增加 `occurrenceCount` 并更新 `lastSeenAt`；已解决异常再次出现时重新打开并保留历史累计次数。
+
+索引包括唯一 `(bookingId, type)` 和查询索引 `(status, nextRetryAt)`。
+
+首批异常类型：
+
+```text
+PAYMENT_QUERY_REPEATED_FAILURE
+REFUND_QUERY_REPEATED_FAILURE
+CLOSE_ORDER_REPEATED_FAILURE
+PAYING_WITHOUT_OUT_TRADE_NO
+REMOTE_ORDER_NOT_FOUND
+LOCAL_REMOTE_STATUS_MISMATCH
+PAYMENT_CREATED_LOCAL_SAVE_FAILED
+```
+
+进入异常表的规则：
+
+- 普通网络错误连续失败三次后创建或更新异常，避免一次瞬时超时污染异常列表。
+- `PAYING` 但缺少 `outTradeNo` 时立即记录。
+- 微信明确返回订单不存在、本地和微信终态冲突，或微信下单成功但本地保存失败时立即记录。
+- 可自动恢复的异常由独立异常任务按 `status=OPEN AND nextRetryAt<=now` 每批最多取 5 条，以 30 分钟起步、最长 2 小时的退避时间低频重试。处理前必须重新读取订单并验证当前业务状态仍然符合该异常；异常表只充当低频工作清单，不覆盖订单事实。
+- 无法安全自动决定状态的异常暂停自动重试，等待人工处理。
+- 后续对账成功时自动标记 `RESOLVED` 并写入解决说明。
+
+`app_logs` 用于回答“发生过什么”，按既定保留周期清理；`booking_anomalies` 用于回答“现在还有哪些订单需要处理”，不能随普通日志一起过期删除。后续管理后台日志入口增加“异常订单”独立列表，默认只显示 `OPEN`。
 
 ### HTTPS Agent 隔离
 
@@ -144,6 +259,7 @@ Map 的键使用 `bookingId`。每个请求在读取缓存或 flight 之前都�
 - 扫描数量、实际处理数量、成功数、失败数、跳过数。
 - 微信请求 p50/p95 或最小/最大耗时。
 - Agent 排队时间、任务总耗时和是否达到批量/时间上限。
+- 新增、重复出现、自动解决和人工忽略的异常订单数量。
 
 日志不得包含完整 OpenID、支付签名、证书、token 或微信回调原始密文。日志存储失败不得改变支付或对账业务结果。
 
@@ -153,6 +269,7 @@ Map 的键使用 `bookingId`。每个请求在读取缓存或 flight 之前都�
 - 第一次调用失败后 flight 立即清理，用户可以重新发起。
 - 前端超时不把订单标记为支付失败，只显示“支付准备超时，请稍后重试”。
 - 定时任务查询微信失败时保留当前本地状态，下一周期重试；只有微信明确返回终态时才更新本地终态。
+- 异常订单写入失败时不得猜测或覆盖订单状态；保留原业务状态并输出 Nest 原生日志。
 - 后台对账不得在用户查询接口中同步执行。
 
 ## 不包含
@@ -171,15 +288,20 @@ Map 的键使用 `bookingId`。每个请求在读取缓存或 flight 之前都�
 - 前端支付准备超过 25 秒后恢复按钮，不出现永久 loading。
 - 后台对账同时运行时，用户支付不会进入后台 Agent 的 socket 队列。
 - 任一定时任务同时最多存在两个微信请求，单批最多处理 20 条。
-- 四类定时任务不会在同一分钟启动。
-- 支付成功回调仍是主要确认路径，支付兜底最迟在下一轮五分钟任务中处理。
-- 退款兜底最迟在下一轮十五分钟任务中处理。
+- 超时关单只更新本批已明确处理且当前状态仍符合条件的订单。
+- 服务停机数日后重新启动，遗留的 `PAYING/REFUNDING` 订单仍能按 `reconcileNextAt` 进入处理，不因创建时间较早而遗漏。
+- 同一订单的同类异常重复出现时只更新一条 `booking_anomalies`，不会持续插入重复记录。
+- 连续三次临时失败后异常变为 `OPEN`，成功恢复后自动变为 `RESOLVED`。
+- 五类定时任务不会在同一分钟启动。
+- 支付成功回调仍是主要确认路径；无任务积压时，支付兜底最迟在下一轮五分钟任务中处理。
+- 无任务积压时，退款兜底最迟在下一轮十五分钟任务中处理；存在积压时按 `reconcileNextAt, id` 从旧到新推进，并在日志中暴露待处理数量。
 
 ## 上线顺序
 
-1. 先拆分定时任务、增加批量上限和并发上限，不改变外部接口。
-2. 将用户支付与后台对账切换到独立 HTTPS Agent。
-3. 后端增加 single-flight、22 秒整体预算和 30 秒成功结果缓存。
-4. 小程序增加 `paymentLaunching`、25 秒超时和模块级重复调用保护。
-5. 接入已设计的结构化日志，观察命中 single-flight、Agent 排队和各阶段耗时。
-6. 使用并发测试验证验收标准，再逐步上线。
+1. 增加对账调度字段、复合索引和 `booking_anomalies`，迁移时补齐已有待处理订单。
+2. 拆分定时任务，改为精准候选查询、批量上限 20 和微信并发上限 2；超时关单只更新本批明确处理的 ID。
+3. 将用户支付与后台对账切换到独立 HTTPS Agent。
+4. 后端增加 single-flight、22 秒整体预算和 30 秒成功结果缓存。
+5. 小程序增加 `paymentLaunching`、25 秒超时和模块级重复调用保护。
+6. 接入已设计的结构化日志和异常订单管理入口，观察对账积压、异常数量、single-flight 命中及 Agent 排队。
+7. 使用迁移、并发、重试和停机恢复测试验证验收标准，再逐步上线。
