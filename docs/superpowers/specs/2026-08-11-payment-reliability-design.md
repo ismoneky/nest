@@ -67,23 +67,51 @@ Map 的键使用 `bookingId`。每个请求在读取缓存或 flight 之前都�
 
 1. 读取订单并验证所有者、免费状态、订单状态和支付期限。
 2. 已支付订单返回稳定的“订单已经支付”结果，不返回旧支付参数。
-3. 若存在未过期的成功结果缓存，且缓存的 `outTradeNo` 与订单当前值一致，直接返回缓存。
+3. 只有订单同时满足 `status=PENDING`、`paymentStatus=PAYING`、未超过 `paymentExpiredAt`，并且缓存 `outTradeNo` 与订单当前值一致时，才能返回未过期的成功结果缓存。任一条件不满足都立即逐出缓存并按当前订单状态响应，不能把已支付、已取消、退款中或已过期订单的旧支付参数返回前端。
 4. 若 `paymentFlights` 中已有该订单，返回已有 Promise。
 5. 同步创建新的 Promise 并立即放入 Map，避免两个请求在第一次 `await` 前同时穿过检查。
-6. 执行现有流程：必要时关闭旧单、向微信创建新单、保存本地 `PAYING/outTradeNo`。
-7. 只有微信下单和本地状态保存都成功后，才缓存支付参数 30 秒。
-8. 无论成功、失败或超时，都在 `finally` 中删除对应 flight；删除前确认 Map 中仍是当前 Promise，避免误删后继任务。
+6. flight 内再次读取订单并执行相同状态校验，避免第一次读取后订单状态已经变化。
+7. 若订单已经是 `PAYING`、没有可用缓存且存在 `outTradeNo`，必须先查询微信旧单：成功则推进本地已支付；仍未支付或已关闭时才允许明确关闭/结束旧单后创建新单；查询结果未知时返回 `PAYMENT_RESULT_UNKNOWN`。不能因为内存缓存丢失或到期就直接关闭旧单。
+8. 确认可以创建新单后，由 Booking Service 生成新的 `outTradeNo`。使用条件 UPDATE 先把新的 `PAYING/outTradeNo` 和支付对账调度字段写入本地，再把这个明确单号传给微信下单；微信适配层不再自行生成单号。
+9. 微信明确返回 `prepay_id` 后才生成并缓存支付参数 30 秒。缓存值必须同时保存 `outTradeNo`，供每次命中时和数据库重新比较。
+10. 无论成功、失败或超时，都在 `finally` 中删除对应 flight；删除前确认 Map 中仍是当前 Promise，避免误删后继任务。
 
 ### 超时与恢复
 
 - 单次微信 HTTP 请求继续使用 10 秒超时。
-- 后端支付准备的整体预算为 22 秒，覆盖一次旧单关闭、一次微信下单和本地更新，并确保前端 25 秒超时之前有时间接收响应。
-- 整体超时实现必须能够中止当前 HTTPS Request；不能只用不会取消底层工作的 `Promise.race`。
+- 每个 flight 创建一个共享 `AbortController` 和 22 秒 deadline timer。关闭旧单和创建支付两个 HTTPS Request 都必须接收同一个 `AbortSignal`，并将其传入 `https.request({ signal })`；deadline 到达时调用 `controller.abort()`，不能只使用不会取消底层工作的 `Promise.race`。
+- `request()` 收到 abort 后必须销毁当前 request，并统一转换成稳定错误 `PAYMENT_PREPARATION_TIMEOUT`。关闭旧单阶段被 abort 后不得继续创建新单。
+- 微信创建支付请求一旦发出，abort 或网络断开只能说明本地没有拿到确定响应，不能证明微信没有受理。由于新的 `outTradeNo` 已经提前落库，此时订单保持 `PAYING`，设置 `reconcileKind=payment`、`reconcileNextAt=now`，返回 `PAYMENT_RESULT_UNKNOWN`，禁止立即关闭并创建另一个新单。
+- 微信明确返回业务拒绝且能够确认没有创建支付单时，使用条件 UPDATE 把订单恢复为 `UNPAID` 并安排用户重试；不确定错误不能执行该回退。
+- 微信已明确返回 `prepay_id` 后，即使 22 秒 deadline 恰好到达，也必须完成本地结果确认和短期缓存写入；该阶段不再把成功结果降级成“未创建”。本地操作应保持为短小的单行更新，前端 25 秒超时为响应留出余量。
 - 任何异常路径都执行 `finally` 清理 flight。
 - 30 秒成功缓存使用惰性过期清理，并设置最大条目数，避免 Map 长期增长。
 - Nest 重启会丢失 flight 和短期缓存，这是本阶段接受的限制；数据库中的 `outTradeNo` 和定时对账继续承担恢复职责。
 
-如果微信下单成功但本地 `PAYING/outTradeNo` 保存失败，不得把结果放入缓存。该情况记录高优先级结构化日志，后续由持久 PaymentAttempt 方案彻底解决；本阶段不扩大数据库模型。
+新的 `outTradeNo` 在请求微信前已经通过条件 UPDATE 落库，因此不再保留“微信下单成功后才保存本地单号”的窗口。如果预写本地状态失败，不得调用微信；如果微信结果未知，则使用已落库单号对账。
+
+### 支付与调度字段转换协议
+
+订单业务状态和 `reconcile*` 字段必须在同一条条件 UPDATE 或同一 SQLite 事务中改变。Repository 只提供带期望状态条件的原子更新，不决定业务转换；WechatPay Service 只负责微信协议、验签和 HTTP，不直接写 Booking。转换决策统一由 Booking Service 中的命名动作完成，Controller 和定时方法只能调用这些动作。
+
+| 触发者 | Booking Service 动作 | 期望旧状态 | 同一原子更新的新状态与调度字段 |
+| --- | --- | --- | --- |
+| 用户发起支付 | `markPaymentStarting` | `PENDING + UNPAID/PAYING` 且未过期 | `PENDING + PAYING`，写新 `outTradeNo`，`reconcileKind=payment`，`reconcileNextAt=now+5min`，attempts 清零 |
+| 微信明确拒绝且未建单 | `markPaymentStartRejected` | `PAYING + 相同 outTradeNo` | `UNPAID`，清空 payment 调度字段，保留稳定错误码 |
+| 微信请求结果未知 | `markPaymentResultUnknown` | `PAYING + 相同 outTradeNo` | 保持 `PAYING`，`reconcileKind=payment`，`reconcileNextAt=now`，attempts 加一 |
+| 支付成功回调 | `markPaymentSucceeded` | 非支付终态且 `outTradeNo` 相同 | `CONFIRMED + PAID`，写 transactionId/paidAt，清空全部调度字段 |
+| 支付对账仍未支付 | `reschedulePaymentCheck` | `PAYING + 相同 outTradeNo` | 保持业务状态，`reconcileNextAt=now+5min`，清空本次临时错误 |
+| 支付对账明确终态失败 | `markPaymentFailed` | `PAYING + 相同 outTradeNo` | 按微信终态设为 `FAILED/CANCELLED`，清空调度字段 |
+| 支付到期待关单 | `markCloseDue` | `UNPAID/PAYING` 且已过期 | 保持业务状态，`reconcileKind=close`，`reconcileNextAt=now` |
+| 微信明确关单 | `markPaymentClosed` | `UNPAID/PAYING + 相同 outTradeNo` 且已过期 | `CANCELLED + FAILED`，清空调度字段 |
+| 用户申请退款 | `markRefundStarting` | `CONFIRMED + PAID + refund NONE/FAILED` | `REFUNDING`，写 outRefundNo，`reconcileKind=refund`，`reconcileNextAt=now+15min`，attempts 清零 |
+| 退款回调或对账成功 | `markRefundSucceeded` | `REFUNDING + 相同 outRefundNo` | 退款成功终态，写 refundedAt，清空调度字段 |
+| 退款仍处理中 | `rescheduleRefundCheck` | `REFUNDING + 相同 outRefundNo` | 保持业务状态，`reconcileNextAt=now+15min` |
+| 达到异常阈值 | `escalateReconciliationAnomaly` | 当前状态仍符合异常类型 | 同一事务 upsert anomaly，并清空正常通道调度字段 |
+
+所有回调和对账动作都必须带 `outTradeNo/outRefundNo + expectedStatus` 条件。affected rows 为 0 表示订单已被其他流程推进，应重新读取后按幂等结果结束，不能强行覆盖。人工处理异常时也必须调用上述命名动作，不能直接编辑异常表或通用更新订单状态。
+
+`markPaymentStarting` 接受旧状态 `PAYING` 的前提是步骤 7 已经取得微信旧单的明确结果并确认允许换单；结果未知时不得调用该动作。
 
 ## 小程序可恢复锁
 
@@ -95,7 +123,7 @@ Map 的键使用 `bookingId`。每个请求在读取缓存或 flight 之前都�
 2. 支付接口单独使用 25 秒请求超时，不沿用通用的 60 秒超时。
 3. 获取参数成功后进入 `uni.requestPayment`；获取失败或超时则提示用户并恢复按钮。
 4. `finally` 必须释放 `paymentLaunching`，页面卸载时也清理本地定时器。
-5. 支付接口超时后先查询一次本地支付状态，再允许用户重试。若本地仍为 `PAYING`，重试请求可命中后端 30 秒结果缓存；缓存到期后再按正常流程关闭旧单并创建新单。
+5. 支付接口超时后先查询一次本地支付状态，再允许用户重试。若本地仍为 `PAYING`，重试请求优先命中后端 30 秒结果缓存；没有缓存时由后端先查询现有 `outTradeNo`，只有微信状态明确后才能决定复用、关单或新建，前端不能自行把 `PAYING` 当成失败。
 6. `handlePayment` 模块按 `bookingId` 维护前端进行中的 Promise，避免预约表单页和订单详情页在短时间内重复触发。
 
 该锁只覆盖“准备支付”阶段，最长约 25 秒。它不会依赖微信回调释放，也不会让按钮因订单长期处于 `PAYING` 而永久禁用。
@@ -272,6 +300,21 @@ PAYMENT_CREATED_LOCAL_SAVE_FAILED
 - 异常订单写入失败时不得猜测或覆盖订单状态；保留原业务状态并输出 Nest 原生日志。
 - 后台对账不得在用户查询接口中同步执行。
 
+## SQLite 写锁预算
+
+本期明确不调整 WAL；SQLite 仍只有一个 writer。新增调度字段、`booking_anomalies` 和日志表会增加写放大，因此“表很小”不能作为忽略锁竞争的理由。本设计通过减少写次数、缩短事务和错开后台写入来接受这一约束：
+
+- 订单状态与 `reconcile*` 字段必须合并为同一条 UPDATE，禁止先改业务状态、再单独更新五个调度字段。
+- 异常升级使用一个短事务完成 anomaly upsert 和订单调度字段清理；普通第一次、第二次临时失败只更新订单计数，不写异常表。
+- 微信 HTTP 请求绝不放在 SQLite 事务内。先完成外部查询，再按确定结果执行单行条件更新。
+- 外部微信请求可以并发 2 个，但处理结果写回 SQLite 时按固定顺序串行提交，不对一批结果再次 `Promise.all` 并发写库。
+- 每批最多 20 个正常订单、5 个异常订单；完成一批即释放执行权，不在一轮任务中循环清空全部积压。
+- 结构化日志不得加入订单状态事务；业务事务提交后再交给日志写入队列。
+- 定时任务必须错峰，日志清理不得与支付对账、退款对账和超时关单同一分钟启动。
+- 提供 `RECONCILIATION_ENABLED`、`RECONCILIATION_BATCH_SIZE` 和 `RECONCILIATION_CONCURRENCY` 配置。发现锁等待上升时可先停后台对账或把批量降为 5，不影响微信回调主路径。
+
+上线前后使用现有 SQLite 支付竞争诊断和同一组业务压测对比。验收要求：加入日志写入和对账任务后，用户支付压测 p95 相对无后台任务基线增长不超过 20%，不出现 `SQLITE_BUSY`，单次订单/调度状态写事务 p95 不超过 50ms。任何一项不满足都先降低后台批量和日志刷盘频率，本期不以开启 WAL 掩盖问题。
+
 ## 不包含
 
 - PaymentAttempt/RefundAttempt 新表和跨进程持久幂等。
@@ -279,6 +322,7 @@ PAYMENT_CREATED_LOCAL_SAVE_FAILED
 - 修改订单、支付、退款状态枚举。
 - 以 WAL 或更换数据库代替支付并发控制。
 - 自动调整任务周期或动态扩容 Agent。
+- 启用 WAL 或修改 `synchronous`；这些配置保持现状，另行验证后决策。
 
 ## 验收标准
 
