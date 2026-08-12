@@ -18,6 +18,7 @@ import { FreeEligibilityResult } from './dto/free-eligibility.dto';
 import { normalizeIdCard } from '../../common/utils/id-card.util';
 import { PaymentException, PaymentErrorCode } from '../../common/payment-errors';
 import { isAutoRecoverable, nextAnomalyRetryAt } from './anomaly-policy';
+import { BookingDashboardResponse } from '../admin/interfaces/booking-dashboard.interface';
 import { LoggingService } from '../logging/logging.service';
 import { AppLogLevel, AppLogSource, AppLogCategory } from '../../entities/app-log.entity';
 
@@ -555,6 +556,28 @@ export class BookingService {
      */
     async getBookingStatsByDate(bookingDate: string) {
         return await this.bookingRepository.getBookingStatsByDate(bookingDate);
+    }
+
+    /**
+     * 经营统计聚合（管理员看板）
+     * 校验日期范围：startDate <= endDate，最长 366 天；通过后转发 repository。
+     */
+    async getBookingDashboard(startDate: string, endDate: string): Promise<BookingDashboardResponse> {
+        const start = startDate.length >= 10 ? startDate.substring(0, 10) : startDate;
+        const end = endDate.length >= 10 ? endDate.substring(0, 10) : endDate;
+        if (start > end) {
+            throw new BadRequestException('开始日期不能晚于结束日期');
+        }
+        // 计算天数差（含起止），纯日期比较避免时区
+        const [sy, sm, sd] = start.split('-').map(Number);
+        const [ey, em, ed] = end.split('-').map(Number);
+        const startMs = new Date(sy, sm - 1, sd).getTime();
+        const endMs = new Date(ey, em - 1, ed).getTime();
+        const days = Math.floor((endMs - startMs) / 86400000) + 1;
+        if (days > 366) {
+            throw new BadRequestException('统计日期范围不能超过366天');
+        }
+        return await this.bookingRepository.getBookingDashboard(start, end);
     }
 
     // ─────────────────────────────────────────────────────────────────────────

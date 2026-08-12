@@ -4,6 +4,7 @@ import { AdminService } from './admin.service';
 import { BookingService } from '../booking/booking.service';
 import { LoginDto } from './dto/login.dto';
 import { GetBookingsAdminDto } from './dto/get-bookings-admin.dto';
+import { GetBookingDashboardDto } from './dto/get-booking-dashboard.dto';
 import { AdminAuthGuard } from '../../common/guards/admin-jwt-auth.guard';
 
 @Controller('admin')
@@ -61,6 +62,21 @@ export class AdminController {
                 total: result.total,
                 totalPages: result.totalPages,
             },
+        });
+    }
+
+    /**
+     * 经营统计看板
+     * GET /admin/bookings/dashboard?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD
+     * 所有统计以预约游玩日期 bookingDate 为筛选条件，起止日期均包含。
+     */
+    @Get('bookings/dashboard')
+    @UseGuards(AdminAuthGuard)
+    async getBookingDashboard(@Query() query: GetBookingDashboardDto, @Res() res: Response) {
+        const data = await this.bookingService.getBookingDashboard(query.startDate, query.endDate);
+        return res.status(HttpStatus.OK).send({
+            success: true,
+            data,
         });
     }
 }

@@ -1,13 +1,14 @@
 import { Injectable, InternalServerErrorException, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, Not, LessThan, Like } from 'typeorm';
-import { Booking, BookingStatus, PaymentStatus, RefundStatus } from '../entities/booking.entity';
+import { Booking, BookingStatus, PaymentStatus, RefundStatus, TravelMode } from '../entities/booking.entity';
 import { BookingAnomaly, AnomalyType, AnomalyStatus } from '../entities/booking-anomaly.entity';
 import { CreateBookingDto } from '../modules/booking/dto/createBooking.dto';
 import { GetBookingsDto } from '../modules/booking/dto/getBookings.dto';
 import { UpdateBookingDto } from '../modules/booking/dto/updateBooking.dto';
 import { DataSource, EntityManager } from 'typeorm';
 import { randomUUID } from 'crypto';
+import { BookingDashboardResponse } from '../modules/admin/interfaces/booking-dashboard.interface';
 
 /**
  * 对账任务类型
@@ -860,4 +861,187 @@ export class BookingRepository {
             .andWhere('status = :status', { status: AnomalyStatus.OPEN })
             .execute()).affected ?? 0;
     }
+
+    /**
+     * 经营统计聚合（按预约游玩日期 bookingDate 筛选）
+     *
+     * 口径（与设计 1.3 一致）：
+     * - 有效预约状态：confirmed、completed
+     * - 实收金额：paymentStatus=paid 且状态为 confirmed/completed 的 amount 之和
+     * - 自驾车辆数：有效订单中 travelMode=selfDriving 且 licensePlate 非空，一单一车
+     * - 状态分布：范围内全部订单按五种状态计数
+     * - 出行方式分布：仅统计有效订单
+     * - dailyTrend：按 bookingDate 分组，无数据日期补 0，保证连续
+     *
+     * SQLite bookingDate 为纯日期字符串，直接用 >= / <= 比较，不转 Date。
+     */
+    async getBookingDashboard(startDate: string, endDate: string): Promise<BookingDashboardResponse> {
+        try {
+            // 截取为 YYYY-MM-DD，纯字符串比较
+            const start = startDate.length >= 10 ? startDate.substring(0, 10) : startDate;
+            const end = endDate.length >= 10 ? endDate.substring(0, 10) : endDate;
+
+            const validStatuses: BookingStatus[] = [BookingStatus.CONFIRMED, BookingStatus.COMPLETED];
+            const allStatuses: BookingStatus[] = [
+                BookingStatus.PENDING,
+                BookingStatus.CONFIRMED,
+                BookingStatus.COMPLETED,
+                BookingStatus.CANCELLED,
+                BookingStatus.REFUNDED,
+            ];
+            const allTravelModes: TravelMode[] = [TravelMode.SCENIC_BUS, TravelMode.SELF_DRIVING, TravelMode.TOUR_GROUP];
+
+            // 1) summary：有效订单数 / 总人数 / 自驾车辆数 / 实收金额 / 免费&收费人数
+            const summaryRow = await this.bookingRepository
+                .createQueryBuilder('booking')
+                .select('COUNT(*)', 'validOrderCount')
+                .addSelect('SUM(booking.personCount)', 'totalPeople')
+                .addSelect("SUM(CASE WHEN booking.travelMode = :selfDriving AND booking.licensePlate IS NOT NULL AND booking.licensePlate != '' THEN 1 ELSE 0 END)", 'selfDrivingVehicleCount')
+                .addSelect("SUM(CASE WHEN booking.paymentStatus = :paid THEN COALESCE(booking.amount, 0) ELSE 0 END)", 'receivedAmount')
+                .addSelect("SUM(CASE WHEN booking.isFree = 1 THEN booking.personCount ELSE 0 END)", 'freePeople')
+                .addSelect("SUM(CASE WHEN booking.isFree = 0 THEN booking.personCount ELSE 0 END)", 'paidPeople')
+                .where('booking.bookingDate >= :start', { start })
+                .andWhere('booking.bookingDate <= :end', { end })
+                .andWhere('booking.status IN (:...validStatuses)', { validStatuses })
+                .setParameter('selfDriving', TravelMode.SELF_DRIVING)
+                .setParameter('paid', PaymentStatus.PAID)
+                .getRawOne();
+
+            // 2) statusDistribution：范围内全部订单按状态计数（不排除任何状态）
+            const statusRows = await this.bookingRepository
+                .createQueryBuilder('booking')
+                .select('booking.status', 'status')
+                .addSelect('COUNT(*)', 'orderCount')
+                .where('booking.bookingDate >= :start', { start })
+                .andWhere('booking.bookingDate <= :end', { end })
+                .groupBy('booking.status')
+                .getRawMany<{ status: BookingStatus; orderCount: string | number }>();
+
+            const statusMap = new Map<BookingStatus, number>();
+            for (const row of statusRows) {
+                statusMap.set(row.status, toNumber(row.orderCount));
+            }
+            const statusDistribution = allStatuses.map((s) => ({
+                status: s,
+                orderCount: statusMap.get(s) ?? 0,
+            }));
+
+            // 3) travelModeDistribution：仅统计有效订单，返回订单数与人数
+            const travelModeRows = await this.bookingRepository
+                .createQueryBuilder('booking')
+                .select('booking.travelMode', 'travelMode')
+                .addSelect('COUNT(*)', 'orderCount')
+                .addSelect('SUM(booking.personCount)', 'peopleCount')
+                .where('booking.bookingDate >= :start', { start })
+                .andWhere('booking.bookingDate <= :end', { end })
+                .andWhere('booking.status IN (:...validStatuses)', { validStatuses })
+                .groupBy('booking.travelMode')
+                .getRawMany<{ travelMode: TravelMode; orderCount: string | number; peopleCount: string | number }>();
+
+            const travelModeMap = new Map<TravelMode, { orderCount: number; peopleCount: number }>();
+            for (const row of travelModeRows) {
+                travelModeMap.set(row.travelMode, {
+                    orderCount: toNumber(row.orderCount),
+                    peopleCount: toNumber(row.peopleCount),
+                });
+            }
+            const travelModeDistribution = allTravelModes.map((m) => ({
+                travelMode: m,
+                orderCount: travelModeMap.get(m)?.orderCount ?? 0,
+                peopleCount: travelModeMap.get(m)?.peopleCount ?? 0,
+            }));
+
+            // 4) dailyTrend：按 bookingDate 分组的有效订单聚合，再补齐无数据日期
+            const dailyRows = await this.bookingRepository
+                .createQueryBuilder('booking')
+                .select('booking.bookingDate', 'date')
+                .addSelect('COUNT(*)', 'validOrderCount')
+                .addSelect('SUM(booking.personCount)', 'peopleCount')
+                .addSelect("SUM(CASE WHEN booking.travelMode = :selfDriving AND booking.licensePlate IS NOT NULL AND booking.licensePlate != '' THEN 1 ELSE 0 END)", 'selfDrivingVehicleCount')
+                .addSelect("SUM(CASE WHEN booking.paymentStatus = :paid THEN COALESCE(booking.amount, 0) ELSE 0 END)", 'receivedAmount')
+                .where('booking.bookingDate >= :start', { start })
+                .andWhere('booking.bookingDate <= :end', { end })
+                .andWhere('booking.status IN (:...validStatuses)', { validStatuses })
+                .setParameter('selfDriving', TravelMode.SELF_DRIVING)
+                .setParameter('paid', PaymentStatus.PAID)
+                .groupBy('booking.bookingDate')
+                .orderBy('booking.bookingDate', 'ASC')
+                .getRawMany<{
+                    date: string;
+                    validOrderCount: string | number;
+                    peopleCount: string | number;
+                    selfDrivingVehicleCount: string | number;
+                    receivedAmount: string | number;
+                }>();
+
+            const dailyMap = new Map<string, { validOrderCount: number; peopleCount: number; selfDrivingVehicleCount: number; receivedAmount: number }>();
+            for (const row of dailyRows) {
+                // SQLite date 列读出可能是 'YYYY-MM-DD' 或 Date 对象，统一截取前 10 位
+                const dateStr = String(row.date).substring(0, 10);
+                dailyMap.set(dateStr, {
+                    validOrderCount: toNumber(row.validOrderCount),
+                    peopleCount: toNumber(row.peopleCount),
+                    selfDrivingVehicleCount: toNumber(row.selfDrivingVehicleCount),
+                    receivedAmount: toNumber(row.receivedAmount),
+                });
+            }
+
+            const dailyTrend = fillDateRange(start, end).map((dateStr) => ({
+                date: dateStr,
+                validOrderCount: dailyMap.get(dateStr)?.validOrderCount ?? 0,
+                peopleCount: dailyMap.get(dateStr)?.peopleCount ?? 0,
+                selfDrivingVehicleCount: dailyMap.get(dateStr)?.selfDrivingVehicleCount ?? 0,
+                receivedAmount: dailyMap.get(dateStr)?.receivedAmount ?? 0,
+            }));
+
+            return {
+                range: { startDate: start, endDate: end },
+                summary: {
+                    validOrderCount: toNumber(summaryRow?.validOrderCount),
+                    totalPeople: toNumber(summaryRow?.totalPeople),
+                    selfDrivingVehicleCount: toNumber(summaryRow?.selfDrivingVehicleCount),
+                    receivedAmount: toNumber(summaryRow?.receivedAmount),
+                    freePeople: toNumber(summaryRow?.freePeople),
+                    paidPeople: toNumber(summaryRow?.paidPeople),
+                },
+                statusDistribution,
+                travelModeDistribution,
+                dailyTrend,
+            };
+        } catch (error) {
+            throw new InternalServerErrorException(error instanceof Error ? error.message : 'Failed to get booking dashboard');
+        }
+    }
+}
+
+/**
+ * 安全转 number：SQLite 聚合结果可能是字符串或 null，统一转有限 number，null/NaN 返回 0
+ */
+function toNumber(value: unknown): number {
+    if (value == null || value === '') return 0;
+    const n = Number(value);
+    return Number.isFinite(n) ? n : 0;
+}
+
+/**
+ * 生成 [start, end] 内的连续自然日（YYYY-MM-DD），纯日期迭代，升序
+ */
+function fillDateRange(start: string, end: string): string[] {
+    const result: string[] = [];
+    // 解析 YYYY-MM-DD，避免 Date 时区偏移
+    const [sy, sm, sd] = start.split('-').map(Number);
+    const [ey, em, ed] = end.split('-').map(Number);
+    let current = new Date(sy, sm - 1, sd);
+    const last = new Date(ey, em - 1, ed);
+    // 安全上限，避免异常输入导致死循环
+    let guard = 0;
+    while (current <= last && guard < 1000) {
+        const y = current.getFullYear();
+        const m = String(current.getMonth() + 1).padStart(2, '0');
+        const d = String(current.getDate()).padStart(2, '0');
+        result.push(`${y}-${m}-${d}`);
+        current.setDate(current.getDate() + 1);
+        guard++;
+    }
+    return result;
 }
