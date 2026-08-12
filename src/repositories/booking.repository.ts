@@ -593,6 +593,29 @@ export class BookingRepository {
             .execute()).affected ?? 0;
     }
 
+    /**
+     * markCloseResultUnknown：关单结果未知（网络超时/解析失败）→ 保持业务状态，
+     * reconcileKind=close、reconcileNextAt 重排到下一关单轮、attempts 加一、记录稳定错误码。
+     * 与 markPaymentResultUnknown 对称的关单临时失败计数（设计表格未列，见 implementation-todo.md）。
+     */
+    async markCloseResultUnknown(bookingId: string, errorCode: string, nextAt: number, now: number): Promise<number> {
+        return (await this.bookingRepository
+            .createQueryBuilder()
+            .update(Booking)
+            .set({
+                reconcileKind: 'close',
+                reconcileNextAt: nextAt,
+                reconcileLastAt: now,
+                reconcileAttempts: () => '"reconcileAttempts" + 1',
+                reconcileLastErrorCode: errorCode,
+            })
+            .where('bookingId = :bookingId', { bookingId })
+            .andWhere('paymentStatus IN (:...statuses)', {
+                statuses: [PaymentStatus.UNPAID, PaymentStatus.PAYING],
+            })
+            .execute()).affected ?? 0;
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // 退款转换协议条件更新
     // ─────────────────────────────────────────────────────────────────────────
@@ -656,7 +679,8 @@ export class BookingRepository {
             .update(Booking)
             .set({
                 refundStatus: RefundStatus.FAILED,
-                paymentStatus: PaymentStatus.FAILED,
+                // paymentStatus 保持 PAID：支付仍有效，仅退款失败，允许用户重试
+                // （initiateRefund 要求 paymentStatus=PAID；markRefundStarting 允许 refundStatus=FAILED 重入）
                 reconcileKind: null,
                 reconcileNextAt: null,
                 reconcileAttempts: 0,
@@ -771,14 +795,23 @@ export class BookingRepository {
      * 没有 resolvedAt 的非 OPEN 记录视为数据异常并保留，不能按 lastSeenAt 猜测删除。
      */
     async deleteResolvedAnomalies(cutoff: number, limit = 100): Promise<number> {
-        return (await this.anomalyRepository
-            .createQueryBuilder()
-            .delete()
-            .where('status IN (:...statuses)', { statuses: [AnomalyStatus.RESOLVED, AnomalyStatus.IGNORED] })
-            .andWhere('resolvedAt IS NOT NULL')
-            .andWhere('resolvedAt < :cutoff', { cutoff })
-            .limit(limit)
-            .execute()).affected ?? 0;
+        // SQLite 不支持 DELETE ... LIMIT，用子查询限定每批条数，保证短事务。
+        // sqlite3 驱动的 .query() 对 DELETE 返回空数组（无 affected/changes），必须用事务
+        // 固定同一连接，DELETE 后立即 SELECT changes() 取删除行数。
+        return this.dataSource.transaction(async (em) => {
+            await em.query(
+                `DELETE FROM booking_anomalies WHERE id IN (
+                    SELECT id FROM booking_anomalies
+                    WHERE status IN ('RESOLVED', 'IGNORED')
+                      AND resolvedAt IS NOT NULL
+                      AND resolvedAt < ?
+                    ORDER BY id ASC LIMIT ?
+                )`,
+                [cutoff, limit],
+            );
+            const rows: any[] = await em.query(`SELECT changes() AS count`);
+            return rows[0]?.count ?? 0;
+        });
     }
 
     /**

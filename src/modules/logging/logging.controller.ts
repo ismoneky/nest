@@ -148,6 +148,7 @@ export class LoggingController {
             level: log.level,
             category: log.category,
             message: log.message,
+            logId: log.logId,
             sessionId: log.sessionId,
             route: log.route,
             context: log.context,

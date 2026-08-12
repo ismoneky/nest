@@ -6,6 +6,7 @@ dotenv.config();
 
 import { ValidationPipe } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
+import { json } from 'express';
 import * as crypto from 'crypto';
 
 // Polyfill global.crypto for Node.js < 19
@@ -16,12 +17,19 @@ if (!global.crypto) {
 import { AppModule } from './app.module';
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule, {
-    // 保留原始请求体，用于微信支付回调验签
-    rawBody: true,
-    // 日志批量上报请求体最大 192 KiB（logging-design.md「批量上报」），默认 100kb 不够
-    bodyParser: { json: { limit: '192kb' } },
-  });
+  // NestJS 10 的 NestApplicationOptions.bodyParser 只接受 boolean，没有 rawBody 选项（v11 才有）。
+  // 这里关闭内置 bodyParser，手动挂 express json()，并通过 verify 回调缓存原始请求体字节，
+  // 供微信支付回调验签使用（JSON 重新序列化会改变字段顺序导致验签失败）。
+  // 请求体上限 192 KiB（logging-design.md「批量上报」默认 100kb 不够）。
+  const app = await NestFactory.create(AppModule, { bodyParser: false });
+  app.use(json({
+    limit: '192kb',
+    verify: (req: any, _res, buf: Buffer) => {
+      if (buf) {
+        req.rawBody = buf;
+      }
+    },
+  }));
 
   // 启用全局验证管道,防止无效数据导致内存问题
   app.useGlobalPipes(

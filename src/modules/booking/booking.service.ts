@@ -62,6 +62,20 @@ type RecentPaymentResult = {
 };
 
 /**
+ * 异常通道重试查询阶段的动作描述符：把「微信查询结果」转成「要对库做什么」，
+ * 让微信 HTTP 在并发槽内完成（queryAnomalyAction），写库动作进单 writer FIFO（applyAnomalyAction）。
+ */
+type AnomalyRetryAction =
+    | { kind: 'noop' }
+    | { kind: 'backoff' }
+    | { kind: 'resolve'; resolution: string }
+    | { kind: 'paymentSucceeded'; transactionId: string | null; resolution: string }
+    | { kind: 'paymentFailed'; resolution: string }
+    | { kind: 'paymentClosed'; resolution: string }
+    | { kind: 'refundSucceeded'; resolution: string }
+    | { kind: 'refundFailed'; resolution: string };
+
+/**
  * 全局微信对账并发信号量（后台所有微信任务共享，上限 2）
  */
 class ReconcileSemaphore {
@@ -559,12 +573,14 @@ export class BookingService {
         if (booking.wechatOpenId !== openid) {
             throw new BadRequestException('无权操作该订单');
         }
-        this.assertPaymentPreconditions(booking);
-
-        // 步骤 2：已支付订单返回稳定「订单已经支付」结果，不返回旧支付参数
+        // 步骤 2：已支付订单返回稳定「订单已经支付」结果，不返回旧支付参数。
+        // 必须在通用前置校验之前判断：assertPaymentPreconditions 对非 UNPAID/PAYING 状态
+        // 会抛普通 BadRequestException（'订单状态不允许支付'），PAID 会命中那条，导致前端拿不到
+        // ORDER_ALREADY_PAID 稳定错误码，只能显示通用失败文案。
         if (booking.paymentStatus === PaymentStatus.PAID || booking.status === BookingStatus.CONFIRMED) {
             throw new PaymentException(PaymentErrorCode.ORDER_ALREADY_PAID, '订单已经支付');
         }
+        this.assertPaymentPreconditions(booking);
 
         // 步骤 3：命中未过期的成功结果缓存（须与数据库当前 outTradeNo 一致）
         const cached = this.recentPaymentResults.get(bookingId);
@@ -646,17 +662,35 @@ export class BookingService {
         const timings = { queryOldOrderMs: 0, closeOldOrderMs: 0, saveLocalMs: 0, createPaymentMs: 0 };
 
         try {
-            // 步骤 6：flight 内再次读取订单并执行相同状态校验
+            // 步骤 6：flight 内再次读取订单并执行相同状态校验。
+            // 已支付判断同样必须在通用前置校验之前，理由同步骤 2。
             const booking = await this.bookingRepository.getBookingById(bookingId);
-            this.assertPaymentPreconditions(booking);
             if (booking.paymentStatus === PaymentStatus.PAID || booking.status === BookingStatus.CONFIRMED) {
                 throw new PaymentException(PaymentErrorCode.ORDER_ALREADY_PAID, '订单已经支付');
             }
+            this.assertPaymentPreconditions(booking);
+            // PAYING 但缺 outTradeNo：状态机不应产生（markPaymentStarting 原子写入 PAYING+outTradeNo），
+            // 仅历史数据或外部错误修改会出现。记人工异常并按未知结果返回，避免盲目新建单号。
+            if (booking.paymentStatus === PaymentStatus.PAYING && !booking.outTradeNo) {
+                await this.bookingRepository.upsertAnomaly(
+                    bookingId,
+                    AnomalyType.PAYING_WITHOUT_OUT_TRADE_NO,
+                    'PAYING_WITHOUT_OUT_TRADE_NO',
+                    '本地 PAYING 但缺少 outTradeNo',
+                    null,
+                    Date.now(),
+                );
+                throw new PaymentException(PaymentErrorCode.PAYMENT_RESULT_UNKNOWN, '订单状态异常，请联系客服');
+            }
 
             // 步骤 7：已有 outTradeNo 时先查询微信旧单
+            // 用户交互路径必须用 interactiveAgent（设计「HTTPS Agent 隔离」），避免被后台对账 Agent 排队
             if (booking.outTradeNo) {
                 const queryStart = Date.now();
-                const query = await this.wechatPayService.queryOrder(booking.outTradeNo);
+                const query = await this.wechatPayService.queryOrder(booking.outTradeNo, {
+                    agent: this.wechatPayService.interactiveAgent,
+                    signal: controller.signal,
+                });
                 timings.queryOldOrderMs = Date.now() - queryStart;
                 switch (query.state) {
                     case 'SUCCESS':
@@ -690,8 +724,11 @@ export class BookingService {
                             break; // 允许换单
                         }
                         if (close.kind === 'ALREADY_PAID') {
-                            // 查询/推进本地支付成功并停止创建新单
-                            const paidQuery = await this.wechatPayService.queryOrder(booking.outTradeNo);
+                            // 查询/推进本地支付成功并停止创建新单（交互 Agent + 同一 AbortSignal）
+                            const paidQuery = await this.wechatPayService.queryOrder(booking.outTradeNo, {
+                                agent: this.wechatPayService.interactiveAgent,
+                                signal: controller.signal,
+                            });
                             await this.bookingRepository.markPaymentSucceeded(booking.outTradeNo, paidQuery.transactionId ?? null, new Date());
                             await this.resolvePaymentAnomalies(bookingId, '关单时发现已支付', Date.now());
                             throw new PaymentException(PaymentErrorCode.ORDER_ALREADY_PAID, '订单已经支付');
@@ -753,9 +790,11 @@ export class BookingService {
                     await this.bookingRepository.markPaymentResultUnknown(bookingId, newOutTradeNo, code ?? 'PAYMENT_START_UNKNOWN', Date.now());
                     throw new PaymentException(PaymentErrorCode.PAYMENT_RESULT_UNKNOWN, '支付准备结果未知，请稍后重试');
                 }
-                // 其他异常（签名失败等）：本地已预写 PAYING + 新单号，保持并对账接管
+                // 其他异常（ECONNRESET、签名失败等）：本地已预写 PAYING + 新单号，保持并对账接管。
+                // 统一转成稳定错误码 PAYMENT_RESULT_UNKNOWN，避免向 controller 泄漏非稳定 error。
                 await this.bookingRepository.markPaymentResultUnknown(bookingId, newOutTradeNo, 'PAYMENT_START_UNKNOWN', Date.now());
-                throw error;
+                this.logger.warn(`支付下单其他异常，已转结果未知: ${bookingId} ${(error as Error)?.message}`);
+                throw new PaymentException(PaymentErrorCode.PAYMENT_RESULT_UNKNOWN, '支付准备结果未知，请稍后重试');
             }
 
             // 步骤 9 续：缓存成功结果 30 秒（保存 outTradeNo 供命中时与数据库重新比较）
@@ -948,15 +987,35 @@ export class BookingService {
         const startedAt = Date.now();
         try {
             const candidates = await this.bookingRepository.findReconcileCandidates('payment', startedAt, this.reconciliationBatchSize);
+            // 并发 2：不在循环内 await semaphore.run（那会退化为串行）。为每个候选发一个并发分片，
+            // 收集后 Promise.all 等待；微信请求并发 2，结果按完成顺序进入单 writer FIFO 写回。
+            const inflight: Promise<void>[] = [];
             for (const booking of candidates) {
                 if (Date.now() - startedAt > TASK_TIME_BUDGET_MS) break; // 停止领取新订单
-                if (!booking.outTradeNo) continue;
-                await this.reconciliationSemaphore.run(async () => {
-                    const result = await this.wechatPayService.queryOrder(booking.outTradeNo);
-                    // 结果进入批内 FIFO 写回队列，由单 writer 串行提交
-                    this.enqueueWrite(() => this.applyPaymentReconcileResult(booking, result));
-                });
+                if (!booking.outTradeNo) {
+                    // PAYING 但缺 outTradeNo：历史数据或状态被外部错误修改，立即记人工异常并暂停正常通道
+                    inflight.push(
+                        (this.enqueueWrite(() =>
+                            this.bookingRepository.upsertAnomaly(
+                                booking.bookingId,
+                                AnomalyType.PAYING_WITHOUT_OUT_TRADE_NO,
+                                'PAYING_WITHOUT_OUT_TRADE_NO',
+                                '本地 PAYING 但缺少 outTradeNo',
+                                null, // 人工处理，不自动重试
+                                Date.now(),
+                            ),
+                        ) as Promise<void>),
+                    );
+                    continue;
+                }
+                inflight.push(
+                    this.reconciliationSemaphore.run(async () => {
+                        const result = await this.wechatPayService.queryOrder(booking.outTradeNo);
+                        this.enqueueWrite(() => this.applyPaymentReconcileResult(booking, result));
+                    }),
+                );
             }
+            await Promise.allSettled(inflight);
             // 等待写回队列排空后才结束
             await this.writeChain;
             this.logTask('payment', AppLogLevel.INFO, '完成', { task: 'payment', scanned: candidates.length });
@@ -984,6 +1043,9 @@ export class BookingService {
 
             const candidates = await this.bookingRepository.findReconcileCandidates('close', startedAt, this.reconciliationBatchSize);
             const processedBookingIds: string[] = [];
+            // 并发 2：不在循环内 await semaphore.run（那会退化为串行）。微信请求并发 2，
+            // 结果按完成顺序进入单 writer FIFO 写回。微信 HTTP 必须在 enqueueWrite 之外执行。
+            const inflight: Promise<void>[] = [];
             for (const booking of candidates) {
                 if (Date.now() - startedAt > TASK_TIME_BUDGET_MS) break;
                 if (booking.paymentStatus !== PaymentStatus.UNPAID && booking.paymentStatus !== PaymentStatus.PAYING) continue;
@@ -994,26 +1056,58 @@ export class BookingService {
                     continue;
                 }
 
-                await this.reconciliationSemaphore.run(async () => {
-                    const close = await this.wechatPayService.closeOrder(booking.outTradeNo, {
-                        agent: this.wechatPayService.reconciliationAgent,
-                    });
-                    this.enqueueWrite(async () => {
-                        const now = Date.now();
-                        if (close.kind === 'CLOSED' || close.kind === 'ALREADY_CLOSED') {
-                            processedBookingIds.push(booking.bookingId);
-                        } else if (close.kind === 'ALREADY_PAID') {
-                            // 重新查询订单并执行 markPaymentSucceeded，不关闭
-                            const paidQuery = await this.wechatPayService.queryOrder(booking.outTradeNo);
-                            await this.bookingRepository.markPaymentSucceeded(booking.outTradeNo, paidQuery.transactionId ?? null, new Date());
-                            await this.resolvePaymentAnomalies(booking.bookingId, '超时关单时发现已支付', now);
-                        } else {
-                            // UNKNOWN：保留当前状态，markCloseDue 已把 nextAt 置为 now，下一轮重试
-                            this.logger.warn(`超时关单结果未知，保留重试: ${booking.bookingId} code=${close.errorCode ?? ''}`);
+                inflight.push(
+                    this.reconciliationSemaphore.run(async () => {
+                        const close = await this.wechatPayService.closeOrder(booking.outTradeNo, {
+                            agent: this.wechatPayService.reconciliationAgent,
+                        });
+                        // ALREADY_PAID 时先在并发槽内完成补查（微信 HTTP 不进写链），再写库
+                        let paidTransactionId: string | null = null;
+                        let isAlreadyPaid = false;
+                        if (close.kind === 'ALREADY_PAID') {
+                            isAlreadyPaid = true;
+                            const paidQuery = await this.wechatPayService.queryOrder(booking.outTradeNo, {
+                                agent: this.wechatPayService.reconciliationAgent,
+                            });
+                            paidTransactionId = paidQuery.transactionId ?? null;
                         }
-                    });
-                });
+                        this.enqueueWrite(async () => {
+                            const now = Date.now();
+                            if (close.kind === 'CLOSED' || close.kind === 'ALREADY_CLOSED') {
+                                processedBookingIds.push(booking.bookingId);
+                            } else if (isAlreadyPaid) {
+                                // 重新查询订单并执行 markPaymentSucceeded，不关闭
+                                await this.bookingRepository.markPaymentSucceeded(booking.outTradeNo, paidTransactionId, new Date());
+                                await this.resolvePaymentAnomalies(booking.bookingId, '超时关单时发现已支付', now);
+                            } else {
+                                // UNKNOWN：保留当前状态，attempts 加一，下一关单轮（+2min）重试；
+                                // 连续 3 次未知升级异常，暂停正常通道由异常任务接管
+                                const nextAt = now + 2 * 60 * 1000;
+                                await this.bookingRepository.markCloseResultUnknown(
+                                    booking.bookingId,
+                                    close.errorCode ?? 'CLOSE_ORDER_UNKNOWN',
+                                    nextAt,
+                                    now,
+                                );
+                                const fresh = await this.bookingRepository.getBookingById(booking.bookingId);
+                                if (
+                                    (fresh.paymentStatus === PaymentStatus.UNPAID || fresh.paymentStatus === PaymentStatus.PAYING)
+                                    && fresh.reconcileAttempts >= 3
+                                ) {
+                                    await this.bookingRepository.escalateReconciliationAnomaly(
+                                        fresh.bookingId,
+                                        AnomalyType.CLOSE_ORDER_REPEATED_FAILURE,
+                                        close.errorCode ?? 'CLOSE_ORDER_UNKNOWN',
+                                        '关单连续失败',
+                                        nextAnomalyRetryAt(fresh.reconcileAttempts, now),
+                                    );
+                                }
+                            }
+                        });
+                    }),
+                );
             }
+            await Promise.allSettled(inflight);
             // 只更新本批已明确处理且当前状态仍符合条件的订单
             await this.enqueueWrite(() => this.bookingRepository.markPaymentClosed(processedBookingIds, startedAt));
             await this.writeChain;
@@ -1037,14 +1131,20 @@ export class BookingService {
         const startedAt = Date.now();
         try {
             const candidates = await this.bookingRepository.findReconcileCandidates('refund', startedAt, this.reconciliationBatchSize);
+            // 并发 2：不在循环内 await semaphore.run（那会退化为串行）。微信请求并发 2，
+            // 结果按完成顺序进入单 writer FIFO 写回。
+            const inflight: Promise<void>[] = [];
             for (const booking of candidates) {
                 if (Date.now() - startedAt > TASK_TIME_BUDGET_MS) break;
                 if (!booking.outRefundNo) continue;
-                await this.reconciliationSemaphore.run(async () => {
-                    const result = await this.wechatPayService.queryRefund(booking.outRefundNo);
-                    this.enqueueWrite(() => this.applyRefundReconcileResult(booking, result));
-                });
+                inflight.push(
+                    this.reconciliationSemaphore.run(async () => {
+                        const result = await this.wechatPayService.queryRefund(booking.outRefundNo);
+                        this.enqueueWrite(() => this.applyRefundReconcileResult(booking, result));
+                    }),
+                );
             }
+            await Promise.allSettled(inflight);
             await this.writeChain;
             this.logTask('refund', AppLogLevel.INFO, '完成', { task: 'refund', scanned: candidates.length });
         } catch (error) {
@@ -1086,7 +1186,10 @@ export class BookingService {
                 }
 
                 await this.reconciliationSemaphore.run(async () => {
-                    this.enqueueWrite(() => this.applyAnomalyRetry(booking, anomaly));
+                    // 微信 HTTP 必须在 enqueueWrite 之外执行（设计「微信请求绝不放在 SQLite 事务内」、
+                    // 「外部并发 2 + SQLite 写入 1」）：先在并发槽内完成查询，再把结果写入交给单 writer FIFO。
+                    const action = await this.queryAnomalyAction(booking, anomaly);
+                    this.enqueueWrite(() => this.applyAnomalyAction(booking, anomaly, action));
                 });
             }
             await this.writeChain;
@@ -1253,131 +1356,141 @@ export class BookingService {
     }
 
     /**
-     * 异常通道重试：按异常类型重新执行一次对应查询并应用结果；
-     * 明确终态 → 应用并 RESOLVED；处理中/未知 → 按退避时间重排
+     * 异常通道重试的查询阶段：按异常类型发一次微信请求，返回「要应用什么动作」的描述符。
+     * 微信 HTTP 在此阶段执行（位于 reconciliationSemaphore 并发槽内、enqueueWrite 之外），
+     * 不阻塞单 writer 写链。仅查询，不写库。
      */
-    private async applyAnomalyRetry(booking: Booking, anomaly: BookingAnomaly) {
-        const now = Date.now();
-        const stateChanged = async (resolution: string) => {
-            await this.bookingRepository.resolveAnomaly(booking.bookingId, anomaly.type, resolution, now);
-        };
-        const backoff = () => this.bookingRepository.rescheduleAnomalyRetry(booking.bookingId, anomaly.type, nextAnomalyRetryAt(anomaly.occurrenceCount, now));
-
+    private async queryAnomalyAction(booking: Booking, anomaly: BookingAnomaly): Promise<AnomalyRetryAction> {
         switch (anomaly.type) {
             case AnomalyType.PAYMENT_QUERY_REPEATED_FAILURE: {
                 if (booking.paymentStatus !== PaymentStatus.PAYING || !booking.outTradeNo) {
-                    await stateChanged('订单状态已变化');
-                    return;
+                    return { kind: 'resolve', resolution: '订单状态已变化' };
                 }
                 const r = await this.wechatPayService.queryOrder(booking.outTradeNo);
                 if (r.state === 'SUCCESS') {
-                    await this.bookingRepository.markPaymentSucceeded(booking.outTradeNo, r.transactionId ?? null, new Date());
-                    await this.resolvePaymentAnomalies(booking.bookingId, '异常通道重试确认支付成功', now);
-                } else if (r.state === 'CLOSED' || r.state === 'REVOKED' || r.state === 'PAYERROR') {
-                    await this.bookingRepository.markPaymentFailed(booking.bookingId, booking.outTradeNo, PaymentStatus.FAILED, BookingStatus.CANCELLED);
-                    await this.resolvePaymentAnomalies(booking.bookingId, '异常通道重试确认微信终态失败', now);
-                } else {
-                    await backoff();
+                    return { kind: 'paymentSucceeded', transactionId: r.transactionId ?? null, resolution: '异常通道重试确认支付成功' };
                 }
-                return;
+                if (r.state === 'CLOSED' || r.state === 'REVOKED' || r.state === 'PAYERROR') {
+                    return { kind: 'paymentFailed', resolution: '异常通道重试确认微信终态失败' };
+                }
+                return { kind: 'backoff' };
             }
             case AnomalyType.REFUND_QUERY_REPEATED_FAILURE: {
                 if (booking.refundStatus !== RefundStatus.REFUNDING || !booking.outRefundNo) {
-                    await stateChanged('订单状态已变化');
-                    return;
+                    return { kind: 'resolve', resolution: '订单状态已变化' };
                 }
                 const r = await this.wechatPayService.queryRefund(booking.outRefundNo);
                 if (r.state === 'SUCCESS') {
-                    await this.bookingRepository.markRefundSucceeded(booking.bookingId, booking.outRefundNo, new Date());
-                    await this.bookingRepository.resolveAnomaly(booking.bookingId, anomaly.type, '异常通道重试确认退款成功', now);
-                } else if (r.state === 'CLOSED' || r.state === 'ABNORMAL' || r.state === 'NOT_EXIST') {
-                    await this.bookingRepository.markRefundFailed(booking.bookingId, booking.outRefundNo);
-                    await this.bookingRepository.resolveAnomaly(booking.bookingId, anomaly.type, '异常通道重试确认退款终态', now);
-                } else {
-                    await backoff();
+                    return { kind: 'refundSucceeded', resolution: '异常通道重试确认退款成功' };
                 }
-                return;
+                if (r.state === 'CLOSED' || r.state === 'ABNORMAL' || r.state === 'NOT_EXIST') {
+                    return { kind: 'refundFailed', resolution: '异常通道重试确认退款终态' };
+                }
+                return { kind: 'backoff' };
             }
             case AnomalyType.CLOSE_ORDER_REPEATED_FAILURE: {
                 if (booking.paymentStatus !== PaymentStatus.UNPAID && booking.paymentStatus !== PaymentStatus.PAYING) {
-                    await stateChanged('订单状态已变化');
-                    return;
+                    return { kind: 'resolve', resolution: '订单状态已变化' };
                 }
                 if (!booking.outTradeNo) {
-                    await stateChanged('无微信单号，无需关单');
-                    return;
+                    return { kind: 'resolve', resolution: '无微信单号，无需关单' };
                 }
                 const r = await this.wechatPayService.closeOrder(booking.outTradeNo, { agent: this.wechatPayService.reconciliationAgent });
                 if (r.kind === 'CLOSED' || r.kind === 'ALREADY_CLOSED') {
-                    await this.bookingRepository.markPaymentClosed([booking.bookingId], now);
-                    await stateChanged('异常通道重试关单成功');
-                } else if (r.kind === 'ALREADY_PAID') {
-                    const paidQuery = await this.wechatPayService.queryOrder(booking.outTradeNo);
-                    await this.bookingRepository.markPaymentSucceeded(booking.outTradeNo, paidQuery.transactionId ?? null, new Date());
-                    await this.resolvePaymentAnomalies(booking.bookingId, '异常通道重试关单时发现已支付', now);
-                } else {
-                    await backoff();
+                    return { kind: 'paymentClosed', resolution: '异常通道重试关单成功' };
                 }
-                return;
+                if (r.kind === 'ALREADY_PAID') {
+                    const paidQuery = await this.wechatPayService.queryOrder(booking.outTradeNo);
+                    return { kind: 'paymentSucceeded', transactionId: paidQuery.transactionId ?? null, resolution: '异常通道重试关单时发现已支付' };
+                }
+                return { kind: 'backoff' };
             }
             case AnomalyType.REMOTE_ORDER_NOT_FOUND: {
-                // 本地 PAYING 但微信曾查不到单：重查一次；仍不存在则退避（人工介入）
+                // 本地 PAYING 但微信曾查不到单：重查一次；仍不存在或未知则退避（人工介入）
                 if (booking.paymentStatus !== PaymentStatus.PAYING || !booking.outTradeNo) {
-                    await stateChanged('订单状态已变化');
-                    return;
+                    return { kind: 'resolve', resolution: '订单状态已变化' };
                 }
                 const r = await this.wechatPayService.queryOrder(booking.outTradeNo);
                 if (r.state === 'SUCCESS') {
-                    await this.bookingRepository.markPaymentSucceeded(booking.outTradeNo, r.transactionId ?? null, new Date());
-                    await this.resolvePaymentAnomalies(booking.bookingId, '异常通道重试确认微信已支付', now);
-                } else if (r.state !== 'NOT_EXIST' && r.state !== 'UNKNOWN') {
-                    await this.bookingRepository.markPaymentFailed(booking.bookingId, booking.outTradeNo, PaymentStatus.FAILED, BookingStatus.CANCELLED);
-                    await this.resolvePaymentAnomalies(booking.bookingId, '异常通道重试确认微信终态', now);
-                } else {
-                    await backoff();
+                    return { kind: 'paymentSucceeded', transactionId: r.transactionId ?? null, resolution: '异常通道重试确认微信已支付' };
                 }
-                return;
+                if (r.state === 'CLOSED' || r.state === 'REVOKED' || r.state === 'PAYERROR') {
+                    // 仅对明确支付终态失败置 FAILED/CANCELLED
+                    return { kind: 'paymentFailed', resolution: '异常通道重试确认微信终态' };
+                }
+                // NOT_EXIST/UNKNOWN/NOTPAY/USERPAYING/REFUND：仍活动或不确定，按退避重排，不能取消进行中的支付
+                return { kind: 'backoff' };
             }
             case AnomalyType.LOCAL_REMOTE_STATUS_MISMATCH: {
                 // 本地与微信终态冲突：重查对齐
                 if (!booking.outTradeNo) {
-                    await stateChanged('无微信单号');
-                    return;
+                    return { kind: 'resolve', resolution: '无微信单号' };
                 }
                 const r = await this.wechatPayService.queryOrder(booking.outTradeNo);
                 if (r.state === 'SUCCESS') {
-                    await this.bookingRepository.markPaymentSucceeded(booking.outTradeNo, r.transactionId ?? null, new Date());
-                    await this.resolvePaymentAnomalies(booking.bookingId, '异常通道重试确认支付成功', now);
-                } else if (r.state === 'CLOSED' || r.state === 'REVOKED' || r.state === 'PAYERROR') {
-                    await this.bookingRepository.markPaymentFailed(booking.bookingId, booking.outTradeNo, PaymentStatus.FAILED, BookingStatus.CANCELLED);
-                    await this.resolvePaymentAnomalies(booking.bookingId, '异常通道重试确认微信终态', now);
-                } else {
-                    await backoff();
+                    return { kind: 'paymentSucceeded', transactionId: r.transactionId ?? null, resolution: '异常通道重试确认支付成功' };
                 }
-                return;
+                if (r.state === 'CLOSED' || r.state === 'REVOKED' || r.state === 'PAYERROR') {
+                    return { kind: 'paymentFailed', resolution: '异常通道重试确认微信终态' };
+                }
+                return { kind: 'backoff' };
             }
             case AnomalyType.PAYMENT_CREATED_LOCAL_SAVE_FAILED: {
                 // 微信下单成功但本地保存失败：检查订单是否已被回调/其他流程推进
                 if (booking.paymentStatus === PaymentStatus.PAID || booking.status === BookingStatus.CONFIRMED) {
-                    await stateChanged('订单已被推进');
-                } else if (booking.paymentStatus === PaymentStatus.PAYING && booking.outTradeNo) {
+                    return { kind: 'resolve', resolution: '订单已被推进' };
+                }
+                if (booking.paymentStatus === PaymentStatus.PAYING && booking.outTradeNo) {
                     const r = await this.wechatPayService.queryOrder(booking.outTradeNo);
                     if (r.state === 'SUCCESS') {
-                        await this.bookingRepository.markPaymentSucceeded(booking.outTradeNo, r.transactionId ?? null, new Date());
-                        await this.resolvePaymentAnomalies(booking.bookingId, '异常通道重试确认支付成功', now);
-                    } else if (r.state === 'CLOSED' || r.state === 'REVOKED' || r.state === 'PAYERROR') {
-                        await this.bookingRepository.markPaymentFailed(booking.bookingId, booking.outTradeNo, PaymentStatus.FAILED, BookingStatus.CANCELLED);
-                        await this.resolvePaymentAnomalies(booking.bookingId, '异常通道重试确认微信终态', now);
-                    } else {
-                        await backoff();
+                        return { kind: 'paymentSucceeded', transactionId: r.transactionId ?? null, resolution: '异常通道重试确认支付成功' };
                     }
-                } else {
-                    await backoff();
+                    if (r.state === 'CLOSED' || r.state === 'REVOKED' || r.state === 'PAYERROR') {
+                        return { kind: 'paymentFailed', resolution: '异常通道重试确认微信终态' };
+                    }
                 }
-                return;
+                return { kind: 'backoff' };
             }
             default:
                 // manual 等类型不在此处理（调用方已跳过）
+                return { kind: 'noop' };
+        }
+    }
+
+    /**
+     * 异常通道重试的写库阶段：把查询阶段返回的动作应用到 DB（位于 enqueueWrite 内，单 writer 串行）。
+     */
+    private async applyAnomalyAction(booking: Booking, anomaly: BookingAnomaly, action: AnomalyRetryAction) {
+        const now = Date.now();
+        switch (action.kind) {
+            case 'resolve':
+                await this.bookingRepository.resolveAnomaly(booking.bookingId, anomaly.type, action.resolution, now);
+                return;
+            case 'backoff':
+                await this.bookingRepository.rescheduleAnomalyRetry(booking.bookingId, anomaly.type, nextAnomalyRetryAt(anomaly.occurrenceCount, now));
+                return;
+            case 'paymentSucceeded':
+                await this.bookingRepository.markPaymentSucceeded(booking.outTradeNo, action.transactionId, new Date());
+                await this.resolvePaymentAnomalies(booking.bookingId, action.resolution, now);
+                return;
+            case 'paymentFailed':
+                await this.bookingRepository.markPaymentFailed(booking.bookingId, booking.outTradeNo, PaymentStatus.FAILED, BookingStatus.CANCELLED);
+                await this.resolvePaymentAnomalies(booking.bookingId, action.resolution, now);
+                return;
+            case 'refundSucceeded':
+                await this.bookingRepository.markRefundSucceeded(booking.bookingId, booking.outRefundNo, new Date());
+                await this.bookingRepository.resolveAnomaly(booking.bookingId, anomaly.type, action.resolution, now);
+                return;
+            case 'refundFailed':
+                await this.bookingRepository.markRefundFailed(booking.bookingId, booking.outRefundNo);
+                await this.bookingRepository.resolveAnomaly(booking.bookingId, anomaly.type, action.resolution, now);
+                return;
+            case 'paymentClosed':
+                await this.bookingRepository.markPaymentClosed([booking.bookingId], now);
+                await this.bookingRepository.resolveAnomaly(booking.bookingId, anomaly.type, action.resolution, now);
+                return;
+            case 'noop':
+            default:
                 return;
         }
     }

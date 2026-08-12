@@ -16,6 +16,8 @@ export type LogEntry = {
     level: AppLogLevel;
     category: AppLogCategory;
     message: string;
+    /** 客户端携带的 logId（用于重传幂等）；未提供时由后端生成 */
+    logId?: string;
     sessionId?: string;
     route?: string;
     context?: unknown;
@@ -108,6 +110,17 @@ export class LoggingService implements AppLogWriter, OnModuleInit {
             this.logger.warn('APP_LOG_SQLITE_ENABLED=false，SQLite 日志持久化已禁用');
             return;
         }
+        // 禁止把 LOG_DATABASE_PATH 与 DATABASE_PATH 配成同一文件：日志写放大争用 prod.db 写锁，
+        // 违反设计「logs.db 独立文件避免直接争用 prod.db 的文件写锁」
+        const logPath = process.env.LOG_DATABASE_PATH || 'data/logs.db';
+        const prodPath = process.env.DATABASE_PATH || 'data/app.db';
+        if (logPath === prodPath) {
+            this.sqliteEnabled = false;
+            this.logger.error(
+                `LOG_DATABASE_PATH 与 DATABASE_PATH 相同（${logPath}），禁止同库写日志，SQLite 日志已禁用并回退 stdout。请配置独立的 logs.db 路径。`,
+            );
+            return;
+        }
         try {
             const table = await this.appLogRepository.manager.query(
                 `SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'app_logs'`,
@@ -186,7 +199,12 @@ export class LoggingService implements AppLogWriter, OnModuleInit {
     private buildRow(entry: LogEntry): AppLog {
         const filtered = filterContext(entry.context);
         const row = new AppLog();
-        row.logId = `L${randomUUID().replace(/-/g, '').substring(0, 20)}`;
+        // 保留客户端 logId（批量重传幂等：INSERT OR IGNORE 按唯一索引去重）；
+        // 客户端未提供或格式非法时由后端生成，保证总有合法 logId。
+        const logId = typeof entry.logId === 'string' && entry.logId.length > 0 && entry.logId.length <= 64
+            ? entry.logId
+            : `L${randomUUID().replace(/-/g, '').substring(0, 20)}`;
+        row.logId = logId;
         row.source = entry.source;
         row.level = entry.level;
         row.category = entry.category;
@@ -323,7 +341,7 @@ export class LoggingService implements AppLogWriter, OnModuleInit {
      * SQLite 日志禁用时的回退：Nest stdout（限频）
      */
     private logToStdout(entry: LogEntry) {
-        if (this.logger.isLevelEnabled(entry.level as any)) {
+        if (Logger.isLevelEnabled(entry.level as any)) {
             const line = `[${entry.source}/${entry.category}] ${entry.message}`;
             switch (entry.level) {
                 case AppLogLevel.ERROR:
@@ -424,13 +442,17 @@ export class LoggingService implements AppLogWriter, OnModuleInit {
         const startedAt = Date.now();
         try {
             for (let batch = 0; batch < 10; batch++) {
-                const result = await this.appLogRepository
-                    .createQueryBuilder()
-                    .delete()
-                    .where('createdAt < :cutoff', { cutoff })
-                    .limit(200)
-                    .execute();
-                const deleted = result.affected ?? 0;
+                // SQLite 不支持 DELETE ... LIMIT，用子查询限定每批 200 条，保证短事务。
+                // sqlite3 驱动的 .query() 对 DELETE 返回空数组（无 affected/changes），必须用事务
+                // 固定同一连接，DELETE 后立即 SELECT changes() 取删除行数。
+                const deleted = await this.appLogRepository.manager.transaction(async (em) => {
+                    await em.query(
+                        `DELETE FROM app_logs WHERE id IN (SELECT id FROM app_logs WHERE createdAt < ? ORDER BY id ASC LIMIT 200)`,
+                        [cutoff],
+                    );
+                    const rows: any[] = await em.query(`SELECT changes() AS count`);
+                    return rows[0]?.count ?? 0;
+                });
                 totalDeleted += deleted;
                 if (deleted < 200) {
                     break;
@@ -446,9 +468,11 @@ export class LoggingService implements AppLogWriter, OnModuleInit {
     }
 
     /**
-     * 每小时检查 logs.db 文件大小：达到阈值输出限频告警并优先执行过期日志清理
+     * 每小时检查 logs.db 文件大小：达到阈值输出限频告警并优先执行过期日志清理。
+     * 定在 :23（Asia/Shanghai），避开所有对账任务启动分钟（见 booking.service.ts 分钟表）；
+     * 触发 runLogCleanup 时也不与对账同分钟（设计「两类清理均不与对账任务同一分钟启动」）。
      */
-    @Cron('0 5 * * * *', { timeZone: 'Asia/Shanghai' })
+    @Cron('0 23 * * * *', { timeZone: 'Asia/Shanghai' })
     async checkLogDbSize() {
         if (!this.sqliteEnabled) {
             return;

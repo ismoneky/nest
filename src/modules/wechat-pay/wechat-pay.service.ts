@@ -2,6 +2,7 @@ import { Injectable, BadRequestException, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { Booking, BookingStatus, PaymentStatus, RefundStatus } from '../../entities/booking.entity';
+import { AnomalyType } from '../../entities/booking-anomaly.entity';
 import { BookingRepository } from '../../repositories/booking.repository';
 import { readFileSync } from 'fs';
 import { join } from 'path';
@@ -430,7 +431,7 @@ export class WechatPayService {
      * 官方文档：GET /v3/pay/transactions/out-trade-no/{out_trade_no}?mchid={mchid}
      * 返回结构化结果，不抛异常
      */
-    async queryOrder(outTradeNo: string): Promise<OrderQueryResult> {
+    async queryOrder(outTradeNo: string, opts?: { agent?: https.Agent; signal?: AbortSignal }): Promise<OrderQueryResult> {
         this.assertInitialized();
 
         try {
@@ -438,7 +439,7 @@ export class WechatPayService {
                 'GET',
                 `/v3/pay/transactions/out-trade-no/${outTradeNo}?mchid=${this.mchid}`,
                 undefined,
-                { agent: this.reconciliationAgent },
+                { agent: opts?.agent ?? this.reconciliationAgent, signal: opts?.signal },
             );
             const state = this.mapTradeState(data.trade_state);
             return { state, tradeState: data.trade_state, transactionId: data.transaction_id };
@@ -605,13 +606,31 @@ export class WechatPayService {
     /**
      * 支付成功后更新本地订单状态（幂等：仅对非支付终态执行，清空调度字段）
      * 等价于转换协议 markPaymentSucceeded，条件更新失败（affected=0）表示已被其他流程推进，忽略。
+     * 回调为最高优先级确认：成功后自动 RESOLVED 支付相关 OPEN 异常（PAYMENT_QUERY_REPEATED_FAILURE、
+     * REMOTE_ORDER_NOT_FOUND、PAYMENT_CREATED_LOCAL_SAVE_FAILED），与对账/异常通道路径一致。
      */
     async handlePaymentSuccess(outTradeNo: string, transactionId: string): Promise<void> {
         await this.bookingRepo.markPaymentSucceeded(outTradeNo, transactionId, new Date());
+        // 按订单号反查 bookingId 后 RESOLVED 支付相关异常（条件 UPDATE，affected=0 无副作用）
+        try {
+            const booking = await this.bookingRepo.getBookingByOutTradeNo(outTradeNo);
+            const now = Date.now();
+            for (const type of [
+                AnomalyType.PAYMENT_QUERY_REPEATED_FAILURE,
+                AnomalyType.REMOTE_ORDER_NOT_FOUND,
+                AnomalyType.PAYMENT_CREATED_LOCAL_SAVE_FAILED,
+            ]) {
+                await this.bookingRepo.resolveAnomaly(booking.bookingId, type, '支付成功回调确认', now);
+            }
+        } catch {
+            // 订单不存在等异常不影响已完成的 markPaymentSucceeded
+        }
     }
 
     /**
      * 退款回调后更新本地退款状态（幂等）
+     * 成功/终态失败后自动 RESOLVED 退款相关 OPEN 异常（REFUND_QUERY_REPEATED_FAILURE），
+     * 与退款对账路径一致。
      */
     async handleRefundCallback(outTradeNo: string, refundStatus: string): Promise<void> {
         let booking: Booking;
@@ -621,10 +640,13 @@ export class WechatPayService {
             return; // 订单不存在，幂等忽略
         }
 
+        const now = Date.now();
         if (refundStatus === 'SUCCESS') {
             await this.bookingRepo.markRefundSucceeded(booking.bookingId, booking.outRefundNo, new Date());
+            await this.bookingRepo.resolveAnomaly(booking.bookingId, AnomalyType.REFUND_QUERY_REPEATED_FAILURE, '退款成功回调确认', now);
         } else if (refundStatus === 'ABNORMAL' || refundStatus === 'CLOSED') {
             await this.bookingRepo.markRefundFailed(booking.bookingId, booking.outRefundNo);
+            await this.bookingRepo.resolveAnomaly(booking.bookingId, AnomalyType.REFUND_QUERY_REPEATED_FAILURE, '退款回调确认终态失败', now);
         }
     }
 
