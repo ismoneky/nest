@@ -19,20 +19,6 @@ function makeIdCard(birth: string, seq = '001'): string {
     return prefix + checkCodes[sum % 11];
 }
 
-function flattenErrors(errors: any[], path = ''): { path: string; messages: string[] }[] {
-    const out: { path: string; messages: string[] }[] = [];
-    for (const err of errors) {
-        const p = path ? `${path}.${err.property}` : err.property;
-        if (err.constraints) {
-            out.push({ path: p, messages: Object.values(err.constraints) });
-        }
-        if (err.children?.length) {
-            out.push(...flattenErrors(err.children, p));
-        }
-    }
-    return out;
-}
-
 const ADULT_CARD = makeIdCard('19900101');
 const BOOKING_DATE = '2026-08-13';
 const BOOKING_BASE = { bookingDate: BOOKING_DATE, travelMode: 'scenicBus', personCount: 2 };
@@ -76,17 +62,28 @@ describe('PassengerDto 结构校验（preview 与 create 共用）', () => {
         expect(instance.passengers[0].idCardUnavailable).toBe(false);
     });
 
-    it('传入非空但格式错误的身份证在 DTO 层被拒绝', () => {
-        const instance = plainToInstance(CreateBookingDto, {
-            ...BOOKING_BASE,
-            passengers: [
-                { name: '张三', phone: '13800000001', idCard: ADULT_CARD },
-                { name: '儿童', phone: '13800000002', idCard: '123456', passengerType: 'child' },
-            ],
-        });
-        const flat = flattenErrors(validateSync(instance));
-        const idCardErr = flat.find((e) => e.path === 'passengers.1.idCard');
-        expect(idCardErr?.messages).toContain('身份证号格式不正确');
+    it('身份证格式问题全部由业务层返回稳定 ID_CARD_INVALID（DTO 不再拦截）', () => {
+        const cases = [
+            { name: '17位', idCard: '11010119900101123' },
+            { name: '非法日期', idCard: '110101199013011234' },
+            { name: '校验码错误', idCard: '110101199001011230' },
+            { name: '非字符串', idCard: 123456789 },
+        ];
+        for (const c of cases) {
+            const instance = plainToInstance(CreateBookingDto, {
+                ...BOOKING_BASE,
+                passengers: [
+                    { name: '张三', phone: '13800000001', idCard: ADULT_CARD },
+                    { name: '儿童', phone: '13800000002', idCard: c.idCard, passengerType: 'child' },
+                ],
+            });
+            // DTO 结构层不再抢先生成无 code 的格式错误
+            expect(validateSync(instance)).toHaveLength(0);
+            // 业务层统一返回稳定错误码
+            expect(() => validatePassengerBusinessRules(instance.passengers, BOOKING_DATE)).toThrowError(
+                expect.objectContaining({ code: PassengerErrorCode.ID_CARD_INVALID }),
+            );
+        }
     });
 
     it('unavailable=true 且身份证非空：DTO 跳过格式校验，业务抛 UNAVAILABLE_NOT_ALLOWED', () => {

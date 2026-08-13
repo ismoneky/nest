@@ -184,6 +184,10 @@ export function validatePassengerBusinessRules(passengers: PassengerPricingInput
         const p = passengers[i] ?? {};
         const passengerType = normalizePassengerType(p.passengerType);
         const idCardUnavailable = p.idCardUnavailable === true;
+        // 字段已提供但不是字符串（DTO 不再拦截类型）：统一返回稳定错误码
+        if (p.idCard != null && typeof p.idCard !== 'string') {
+            throw new PassengerBusinessException(PassengerErrorCode.ID_CARD_INVALID, '身份证号格式不正确');
+        }
         const rawIdCard = typeof p.idCard === 'string' ? p.idCard.trim() : '';
         const hasIdCard = rawIdCard.length > 0;
         const idCard = rawIdCard.toUpperCase();

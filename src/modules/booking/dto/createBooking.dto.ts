@@ -3,9 +3,6 @@ import { Transform, Type } from 'class-transformer';
 import { TimeSlot, TravelMode, VehicleType } from '../../../entities/booking.entity';
 import { PassengerType } from '../passenger-pricing';
 
-/** 身份证基础格式（18 位）；出生日期真实性、校验码等严格校验由 passenger-pricing 业务函数负责 */
-const ID_CARD_PATTERN = /^[1-9]\d{5}(18|19|20)\d{2}(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])\d{3}[\dXx]$/;
-
 export class PassengerDto {
     @IsString()
     @IsNotEmpty({ message: '姓名不能为空' })
@@ -17,13 +14,12 @@ export class PassengerDto {
     phone: string;
 
     /**
-     * 身份证：DTO 只约束「传入非空时必须满足基础格式」；
-     * 必填、成人/联系人免填限制、严格校验（真实日期+校验码）与年龄类型一致
-     * 全部由 passenger-pricing 业务函数处理并返回稳定错误码。
+     * 身份证：DTO 只保留字段白名单（@IsOptional 使其通过 whitelist 保留）；
+     * 必填、成人/联系人免填限制、格式/真实日期/校验码与年龄类型一致
+     * 全部由 passenger-pricing 业务函数处理并统一返回稳定错误码，
+     * 避免 DTO 层抢先生成无 code 的普通 400。
      */
-    @ValidateIf((o) => o.idCardUnavailable !== true && o.idCard != null && o.idCard !== '')
-    @IsString()
-    @Matches(ID_CARD_PATTERN, { message: '身份证号格式不正确' })
+    @IsOptional()
     idCard?: string;
 
     /** 人员类型：旧客户端缺失或为 null 时按 adult 处理 */
