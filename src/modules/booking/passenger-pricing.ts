@@ -222,12 +222,13 @@ export function validatePassengerBusinessRules(passengers: PassengerPricingInput
             throw new PassengerBusinessException(PassengerErrorCode.ID_CARD_INVALID, '身份证号格式不正确');
         }
 
-        // 儿童/老人类型与年龄必须一致；不一致不得静默改为普通收费
+        // 儿童/老人类型与年龄必须一致；不一致不得静默改为普通收费。
+        // 年龄值为负（出生年份晚于预约年份）属于无效身份/类型组合，必须拒绝
         if (hasIdCard && (passengerType === PassengerType.CHILD || passengerType === PassengerType.SENIOR)) {
             const age = calculateYearAge(idCard, bookingDate);
             const isChild = passengerType === PassengerType.CHILD;
             const label = isChild ? '7岁及以下儿童' : '70岁及以上老人';
-            const ageOk = age !== null && (isChild ? age <= CHILD_MAX_AGE : age >= SENIOR_MIN_AGE);
+            const ageOk = age !== null && age >= 0 && (isChild ? age <= CHILD_MAX_AGE : age >= SENIOR_MIN_AGE);
             if (!ageOk) {
                 throw new PassengerBusinessException(PassengerErrorCode.TYPE_AGE_MISMATCH, `身份证年龄不符合${label}条件`);
             }
@@ -258,7 +259,8 @@ export function calculateAgePricing(passengers: PassengerPricingInput[], booking
         } else if (isSpecial && validateChineseIdCard(idCard)) {
             const age = calculateYearAge(idCard, bookingDate);
             ageValue = age;
-            if (age !== null && (passengerType === PassengerType.CHILD ? age <= CHILD_MAX_AGE : age >= SENIOR_MIN_AGE)) {
+            // 年龄值必须 >= 0：未来出生年份即使漏过前置校验也不得获得年龄免费
+            if (age !== null && age >= 0 && (passengerType === PassengerType.CHILD ? age <= CHILD_MAX_AGE : age >= SENIOR_MIN_AGE)) {
                 ageFree = true;
                 pricingReason = passengerType === PassengerType.CHILD ? 'child_age_free' : 'senior_age_free';
             }

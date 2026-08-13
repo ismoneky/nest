@@ -118,6 +118,12 @@ describe('extractBirthYear / calculateYearAge', () => {
         expect(calculateYearAge(child, '2027-01-01')).toBe(8);
     });
 
+    it('未来出生年份（校验码正确）得到负年龄', () => {
+        const futureCard = makeIdCard('20300101'); // 校验码正确，但出生年份晚于预约年份
+        expect(validateChineseIdCard(futureCard)).toBe(true);
+        expect(calculateYearAge(futureCard, BOOKING_2026)).toBe(-4);
+    });
+
     it('预约日期无有效年份或身份证非法时返回 null', () => {
         const child = makeIdCard('20190101');
         expect(calculateYearAge(child, '')).toBeNull();
@@ -135,6 +141,18 @@ describe('validatePassengerBusinessRules', () => {
     it('2018 年出生 → 年龄 8 → 儿童类型不符，抛 TYPE_AGE_MISMATCH', () => {
         const passengers = [adult(), { name: '儿童', phone: '13800000002', idCard: makeIdCard('20180101'), passengerType: PassengerType.CHILD }];
         expect(() => validatePassengerBusinessRules(passengers, BOOKING_2026)).toThrowError(
+            expect.objectContaining({ code: PassengerErrorCode.TYPE_AGE_MISMATCH }),
+        );
+    });
+
+    it('未来出生年份（校验码正确）：儿童/老人类型均抛 TYPE_AGE_MISMATCH', () => {
+        const futureCard = makeIdCard('20300101');
+        const futureChild = [adult(), { name: '未来儿童', phone: '13800000002', idCard: futureCard, passengerType: PassengerType.CHILD }];
+        expect(() => validatePassengerBusinessRules(futureChild, BOOKING_2026)).toThrowError(
+            expect.objectContaining({ code: PassengerErrorCode.TYPE_AGE_MISMATCH }),
+        );
+        const futureSenior = [adult(), { name: '未来老人', phone: '13800000002', idCard: futureCard, passengerType: PassengerType.SENIOR }];
+        expect(() => validatePassengerBusinessRules(futureSenior, BOOKING_2026)).toThrowError(
             expect.objectContaining({ code: PassengerErrorCode.TYPE_AGE_MISMATCH }),
         );
     });
@@ -321,6 +339,18 @@ describe('calculateAgePricing', () => {
         expect(contact.ageFree).toBe(false);
         expect(contact.finalCharged).toBe(true);
         expect(contact.pricingReason).toBe('regular');
+        expect(summary.ageFreePeople).toBe(0);
+        expect(summary.chargedPeople).toBe(2);
+    });
+
+    it('未来出生年份即使漏过前置校验也不得获得年龄免费（防御）', () => {
+        const futureCard = makeIdCard('20300101');
+        const summary = calculateAgePricing(
+            [adult(), { name: '未来儿童', phone: '13800000002', idCard: futureCard, passengerType: PassengerType.CHILD }],
+            BOOKING_2026,
+        );
+        expect(summary.passengerPricing[1].ageValue).toBe(-4);
+        expect(summary.passengerPricing[1].ageFree).toBe(false);
         expect(summary.ageFreePeople).toBe(0);
         expect(summary.chargedPeople).toBe(2);
     });
