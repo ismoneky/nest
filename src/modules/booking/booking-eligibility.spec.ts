@@ -7,7 +7,7 @@ import { Booking, BookingStatus, PaymentStatus, RefundStatus, TimeSlot, TravelMo
 import { BookingAnomaly } from '../../entities/booking-anomaly.entity';
 import { SystemConfig } from '../../entities/system-config.entity';
 import { BookingRepository } from '../../repositories/booking.repository';
-import { BookingService, composeOrderPricing } from './booking.service';
+import { BookingService, beijingDateStr, composeOrderPricing } from './booking.service';
 import { MemberService } from '../member/member.service';
 import { WechatPayService } from '../wechat-pay/wechat-pay.service';
 import { SystemConfigService } from '../system-config/system-config.service';
@@ -40,9 +40,24 @@ const CHILD_8_CARD = makeIdCard('20180101'); // 2026 年预约时年龄 8
 const SENIOR_70_CARD = makeIdCard('19560101'); // 2026 年预约时年龄 70
 const UNIT_PRICE = 10000;
 const BOOKING_DATE = '2026-09-01'; // 非今天，避免干扰每日免费分支
-const TODAY = new Date().toISOString().substring(0, 10);
+// 与服务端同一“当天”口径（北京时间），避免测试机时区导致误判
+const TODAY = beijingDateStr();
 
 const adult = (overrides: any = {}) => ({ name: '张三', phone: '13800000001', idCard: ADULT_CARD, ...overrides });
+
+describe('beijingDateStr（每日免费的“当天”口径）', () => {
+    it('北京时间凌晨（UTC 前一天 16:00 之后）应算作北京时间第二天', () => {
+        // 2026-08-13T16:30Z = 北京时间 2026-08-14 00:30
+        expect(beijingDateStr(new Date('2026-08-13T16:30:00Z'))).toBe('2026-08-14');
+        // 2026-08-13T15:59Z = 北京时间 2026-08-13 23:59，仍属 13 号
+        expect(beijingDateStr(new Date('2026-08-13T15:59:00Z'))).toBe('2026-08-13');
+    });
+
+    it('北京时间正午口径与服务器时区无关', () => {
+        // 2026-08-14T04:00Z = 北京时间 2026-08-14 12:00
+        expect(beijingDateStr(new Date('2026-08-14T04:00:00Z'))).toBe('2026-08-14');
+    });
+});
 
 describe('composeOrderPricing 纯函数（优惠顺序与金额公式）', () => {
     it('所有人均年龄免费：金额 0、isFree=true、freeReason=age', () => {

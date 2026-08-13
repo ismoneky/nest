@@ -109,6 +109,18 @@ class ReconcileSemaphore {
 }
 
 /**
+ * 北京时间（UTC+8）日期字符串 YYYY-MM-DD。
+ * “当天”的业务口径（每日免费名额、预约是否当天）以北京时间为准：
+ * 直接 new Date().toISOString() 取的是 UTC 日期，服务器时区非 UTC+8 时，
+ * 会在北京时间 00:00–08:00 期间把当天误判为前一天。
+ * 实现为 UTC 时刻 +8 小时后取 ISO 日期，与服务器本地时区无关。
+ */
+export function beijingDateStr(now: Date = new Date()): string {
+    const beijing = new Date(now.getTime() + 8 * 60 * 60 * 1000);
+    return beijing.toISOString().substring(0, 10);
+}
+
+/**
  * 组合订单级定价：整单免费（会员/每日名额）优先于人员级年龄定价。
  * 纯函数：入参为人员级年龄定价摘要，出参为最终金额、免费来源与每位人员的计费快照。
  * 优惠顺序固定：月卡会员整单免费 → 每日免费名额整单免费 → 儿童/老人人员级年龄免费。
@@ -428,9 +440,10 @@ export class BookingService {
         const freeLimit = paymentConfig.freeQuotaLimit ?? 100;
 
         // 2. 是否今天（仅预约日期为今天时才参与每日免费）
-        // 用纯日期字符串比较，避免 new Date() 产生的 ISO 字符串与 SQLite date 列不一致
+        // 用纯日期字符串比较，避免 new Date() 产生的 ISO 字符串与 SQLite date 列不一致；
+        // “今天”按北京时间（UTC+8）取，避免 UTC 日期在北京时间凌晨跨天误判
         const targetDateStr = bookingDate.length >= 10 ? bookingDate.substring(0, 10) : bookingDate;
-        const todayDateStr = new Date().toISOString().substring(0, 10); // YYYY-MM-DD
+        const todayDateStr = beijingDateStr(); // YYYY-MM-DD，北京时间口径
         const bookingIsToday = targetDateStr === todayDateStr;
         // SQLite date 列只存日期，用纯日期字符串做范围查询
         const todayStart = todayDateStr;
