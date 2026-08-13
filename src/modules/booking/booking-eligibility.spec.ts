@@ -283,6 +283,43 @@ describe('determineFreeEligibility / createBooking 集成', () => {
         ).rejects.toMatchObject({ code: PassengerErrorCode.LIMIT_EXCEEDED });
     });
 
+    it('8 人小型客车 create 被拒绝；10 人摆渡车允许、11 人拒绝', async () => {
+        // 8 人小型客车超限
+        await expect(
+            service.createBooking({
+                passengers: Array.from({ length: 8 }, () => adult()) as any,
+                bookingDate: BOOKING_DATE,
+                travelMode: 'selfDriving',
+                vehicleType: 'smallCar',
+                licensePlate: '豫A12345',
+                personCount: 8,
+                wechatOpenId: 'user-limit3',
+            } as any),
+        ).rejects.toMatchObject({ code: PassengerErrorCode.LIMIT_EXCEEDED });
+
+        // 11 人景区摆渡车超限
+        await expect(
+            service.createBooking({
+                passengers: Array.from({ length: 11 }, () => adult()) as any,
+                bookingDate: BOOKING_DATE,
+                travelMode: 'scenicBus',
+                personCount: 11,
+                wechatOpenId: 'user-limit4',
+            } as any),
+        ).rejects.toMatchObject({ code: PassengerErrorCode.LIMIT_EXCEEDED });
+
+        // 10 人景区摆渡车允许进入正常费用预览（上限内）
+        const result = await service.determineFreeEligibility(
+            'user-limit5',
+            Array.from({ length: 10 }, () => adult()),
+            BOOKING_DATE,
+            TravelMode.SCENIC_BUS,
+        );
+        expect(result.isFree).toBe(false);
+        expect(result.amount).toBe(10 * UNIT_PRICE);
+        expect(result.chargedPeople).toBe(10);
+    });
+
     it('personCount !== passengers.length：create 返回稳定人数不一致错误', async () => {
         await expect(
             service.createBooking({
