@@ -1,6 +1,10 @@
 import { IsDateString, IsEnum, IsInt, IsNotEmpty, IsOptional, IsString, IsBoolean, Matches, Min, ValidateIf, ValidateNested, ArrayMinSize, IsArray } from 'class-validator';
-import { Type } from 'class-transformer';
+import { Transform, Type } from 'class-transformer';
 import { TimeSlot, TravelMode, VehicleType } from '../../../entities/booking.entity';
+import { PassengerType } from '../passenger-pricing';
+
+/** 身份证基础格式（18 位）；出生日期真实性、校验码等严格校验由 passenger-pricing 业务函数负责 */
+const ID_CARD_PATTERN = /^[1-9]\d{5}(18|19|20)\d{2}(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])\d{3}[\dXx]$/;
 
 export class PassengerDto {
     @IsString()
@@ -12,10 +16,26 @@ export class PassengerDto {
     @Matches(/^1[3-9]\d{9}$/, { message: '手机号格式不正确' })
     phone: string;
 
+    /**
+     * 身份证：DTO 只约束「传入非空时必须满足基础格式」；
+     * 必填、成人/联系人免填限制、严格校验（真实日期+校验码）与年龄类型一致
+     * 全部由 passenger-pricing 业务函数处理并返回稳定错误码。
+     */
+    @ValidateIf((o) => o.idCardUnavailable !== true && o.idCard != null && o.idCard !== '')
     @IsString()
-    @IsNotEmpty({ message: '身份证号不能为空' })
-    @Matches(/^[1-9]\d{5}(18|19|20)\d{2}(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])\d{3}[\dXx]$/, { message: '身份证号格式不正确' })
-    idCard: string;
+    @Matches(ID_CARD_PATTERN, { message: '身份证号格式不正确' })
+    idCard?: string;
+
+    /** 人员类型：旧客户端缺失或为 null 时按 adult 处理 */
+    @Transform(({ value }) => value ?? PassengerType.ADULT)
+    @IsEnum(PassengerType)
+    passengerType: PassengerType = PassengerType.ADULT;
+
+    /** 暂时无法提供身份证（仅儿童/老人允许为 true，业务函数校验）；只认字面量 true */
+    @Transform(({ value }) => value === true)
+    @IsBoolean()
+    @IsOptional()
+    idCardUnavailable = false;
 }
 
 /**
