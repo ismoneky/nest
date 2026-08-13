@@ -24,6 +24,7 @@ export class HttpExceptionFilter implements ExceptionFilter {
         let status = HttpStatus.INTERNAL_SERVER_ERROR;
         let message = 'Internal server error';
         let error = 'Internal Server Error';
+        let code: unknown;
         let isUnhandled = false;
 
         // 处理 HTTP 异常
@@ -37,6 +38,7 @@ export class HttpExceptionFilter implements ExceptionFilter {
                 const responseObj = exceptionResponse as any;
                 message = responseObj.message || message;
                 error = responseObj.error || error;
+                code = responseObj.code;
             }
             // 仅 5xx 视为需要记录的未处理异常；4xx 属于正常业务分支，不记录
             isUnhandled = status >= 500;
@@ -77,6 +79,9 @@ export class HttpExceptionFilter implements ExceptionFilter {
             message,
             path: request.url,
             timestamp: new Date().toISOString(),
+            // 仅当异常响应自带稳定业务错误码时透传（如乘客业务错误码），
+            // 不改变已有非乘客异常的响应字段
+            ...(code !== undefined ? { code } : {}),
         });
     }
 }
