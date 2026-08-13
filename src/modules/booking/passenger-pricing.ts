@@ -1,4 +1,5 @@
 import { PassengerBusinessException, PassengerErrorCode } from '../../common/passenger-business.exception';
+import { TravelMode, VehicleType } from '../../entities/booking.entity';
 
 /**
  * 人员类型、年龄计算与人员级定价纯函数。
@@ -130,6 +131,43 @@ export function calculateYearAge(idCard: string, bookingDate: string): number | 
         return null;
     }
     return parseInt(match[1], 10) - birthYear;
+}
+
+/**
+ * 车型人数上限口径：自驾摩托 2 人、自驾小型客车 7 人、非机动车/摆渡车及其他出行方式 10 人。
+ * 与前端 fctl/utils/passenger-pricing.js 的 getPassengerLimit 保持完全一致；
+ * 前端只用于交互提示，后端才是安全边界。
+ */
+export function getPassengerLimit(
+    travelMode?: TravelMode | string | null,
+    vehicleType?: VehicleType | string | null,
+): number {
+    if (travelMode === TravelMode.SELF_DRIVING && vehicleType === VehicleType.WHEEL_MOTORCYCLE) {
+        return 2;
+    }
+    if (travelMode === TravelMode.SELF_DRIVING && vehicleType === VehicleType.SMALL_CAR) {
+        return 7;
+    }
+    return 10;
+}
+
+/**
+ * 车型人数上限校验：一律按 passengers.length 判断，不信任 personCount。
+ * 超限抛带稳定错误码的 PassengerBusinessException。
+ */
+export function validatePassengerLimit(
+    passengers: PassengerPricingInput[],
+    travelMode?: TravelMode | string | null,
+    vehicleType?: VehicleType | string | null,
+): void {
+    const limit = getPassengerLimit(travelMode, vehicleType);
+    const count = Array.isArray(passengers) ? passengers.length : 0;
+    if (count > limit) {
+        throw new PassengerBusinessException(
+            PassengerErrorCode.LIMIT_EXCEEDED,
+            `当前出行方式最多可预约 ${limit} 人`,
+        );
+    }
 }
 
 /**

@@ -256,6 +256,33 @@ describe('determineFreeEligibility / createBooking 集成', () => {
         ).rejects.toMatchObject({ code: PassengerErrorCode.TYPE_AGE_MISMATCH });
     });
 
+    it('后端强制车型人数上限：3 人摩托车 create 被拒绝（LIMIT_EXCEEDED）', async () => {
+        await expect(
+            service.createBooking({
+                passengers: [adult(), adult(), adult()] as any,
+                bookingDate: BOOKING_DATE,
+                travelMode: 'selfDriving',
+                vehicleType: 'wheelMotorcycle',
+                licensePlate: '豫A12345',
+                personCount: 3,
+                wechatOpenId: 'user-limit',
+            } as any),
+        ).rejects.toMatchObject({ code: PassengerErrorCode.LIMIT_EXCEEDED });
+    });
+
+    it('preview 同样拒绝超员数组（LIMIT_EXCEEDED）', async () => {
+        await expect(
+            service.determineFreeEligibility(
+                'user-limit2',
+                [adult(), adult(), adult()],
+                BOOKING_DATE,
+                TravelMode.SELF_DRIVING,
+                VehicleType.WHEEL_MOTORCYCLE,
+                '豫A12345',
+            ),
+        ).rejects.toMatchObject({ code: PassengerErrorCode.LIMIT_EXCEEDED });
+    });
+
     it('personCount !== passengers.length：create 返回稳定人数不一致错误', async () => {
         await expect(
             service.createBooking({

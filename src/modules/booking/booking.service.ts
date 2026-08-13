@@ -23,6 +23,7 @@ import {
     calculateAgePricing,
     PassengerPricingResult,
     validatePassengerBusinessRules,
+    validatePassengerLimit,
 } from './passenger-pricing';
 import { isAutoRecoverable, nextAnomalyRetryAt } from './anomaly-policy';
 import { BookingDashboardResponse } from '../admin/interfaces/booking-dashboard.interface';
@@ -232,6 +233,9 @@ export class BookingService {
             throw new PassengerBusinessException(PassengerErrorCode.COUNT_MISMATCH, '预约人数与人员列表不一致');
         }
 
+        // 车型人数上限（与 preview 共用同一校验，接口被直接调用时不可绕过）
+        validatePassengerLimit(createBookingDto.passengers, createBookingDto.travelMode, createBookingDto.vehicleType);
+
         // 检查预约人数是否超过限制
         const timeSlotLimit = await this.systemConfigService.getTimeSlotLimit();
         // 已废弃上下午概念，morningMaxPeople 即全天总限额
@@ -413,6 +417,8 @@ export class BookingService {
         //    create 事务内的纯函数异常会使事务干净回滚）
         validatePassengerBusinessRules(passengers, bookingDate);
         const agePricing = calculateAgePricing(passengers, bookingDate);
+        // 车型人数上限（按 passengers.length，不信任 personCount）
+        validatePassengerLimit(passengers, travelMode, vehicleType);
 
         // 1. 读取支付配置（含每日免费名额配置）
         const config = await configRepo.findOne({ where: { configId: 'system_config' } });

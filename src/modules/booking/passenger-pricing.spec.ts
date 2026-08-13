@@ -3,11 +3,13 @@ import {
     calculateAgePricing,
     calculateYearAge,
     extractBirthYear,
+    getPassengerLimit,
     normalizePassengerType,
     PassengerPricingInput,
     PassengerType,
     validateChineseIdCard,
     validatePassengerBusinessRules,
+    validatePassengerLimit,
 } from './passenger-pricing';
 
 /**
@@ -241,6 +243,43 @@ describe('validatePassengerBusinessRules', () => {
         expect(() => validatePassengerBusinessRules([], BOOKING_2026)).toThrowError(
             expect.objectContaining({ code: PassengerErrorCode.CONTACT_INVALID }),
         );
+    });
+});
+
+describe('getPassengerLimit / validatePassengerLimit', () => {
+    it('车型人数上限口径：摩托 2 / 小客车 7 / 非机动车与摆渡车等其他方式 10', () => {
+        expect(getPassengerLimit('selfDriving', 'wheelMotorcycle')).toBe(2);
+        expect(getPassengerLimit('selfDriving', 'smallCar')).toBe(7);
+        expect(getPassengerLimit('selfDriving', 'nonMotorized')).toBe(10);
+        expect(getPassengerLimit('scenicBus', 'smallCar')).toBe(10);
+        expect(getPassengerLimit('scenicBus', undefined)).toBe(10);
+        expect(getPassengerLimit('tourGroup', null)).toBe(10);
+        expect(getPassengerLimit(undefined, undefined)).toBe(10);
+    });
+
+    it('3 人摩托车超限：抛 LIMIT_EXCEEDED，message 包含上限', () => {
+        const three = [adult(), adult(), adult()];
+        expect(() => validatePassengerLimit(three, 'selfDriving', 'wheelMotorcycle')).toThrowError(
+            expect.objectContaining({
+                code: PassengerErrorCode.LIMIT_EXCEEDED,
+                message: expect.stringContaining('2'),
+            }),
+        );
+    });
+
+    it('8 人小型客车超限：抛 LIMIT_EXCEEDED，message 包含上限', () => {
+        const eight = Array.from({ length: 8 }, () => adult());
+        expect(() => validatePassengerLimit(eight, 'selfDriving', 'smallCar')).toThrowError(
+            expect.objectContaining({
+                code: PassengerErrorCode.LIMIT_EXCEEDED,
+                message: expect.stringContaining('7'),
+            }),
+        );
+    });
+
+    it('上限内不抛错：2 人摩托、10 人摆渡车', () => {
+        expect(() => validatePassengerLimit([adult(), adult()], 'selfDriving', 'wheelMotorcycle')).not.toThrow();
+        expect(() => validatePassengerLimit(Array.from({ length: 10 }, () => adult()), 'scenicBus', undefined)).not.toThrow();
     });
 });
 
