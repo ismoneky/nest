@@ -130,4 +130,31 @@ describe('PassengerDto 结构校验（preview 与 create 共用）', () => {
             expect.objectContaining({ code: PassengerErrorCode.TYPE_AGE_MISMATCH }),
         );
     });
+
+    it('前端伪造 ageFree/amount/finalCharged 等计费字段被白名单剥离，不能改变后端结果', () => {
+        const instance = plainToInstance(CreateBookingDto, {
+            ...BOOKING_BASE,
+            passengers: [
+                {
+                    name: '张三',
+                    phone: '13800000001',
+                    idCard: ADULT_CARD,
+                    // 前端伪造计费字段：DTO 白名单剥离，后端计费以自身计算为准
+                    ageFree: true,
+                    finalCharged: false,
+                    ageValue: 1,
+                    amount: 0,
+                },
+            ],
+        });
+        const errors = validateSync(instance, { whitelist: true, forbidNonWhitelisted: false });
+        expect(errors).toHaveLength(0);
+        const p = instance.passengers[0] as any;
+        expect(p.ageFree).toBeUndefined();
+        expect(p.finalCharged).toBeUndefined();
+        expect(p.ageValue).toBeUndefined();
+        expect(p.amount).toBeUndefined();
+        expect(p.passengerType).toBe(PassengerType.ADULT);
+        expect(p.idCardUnavailable).toBe(false);
+    });
 });
