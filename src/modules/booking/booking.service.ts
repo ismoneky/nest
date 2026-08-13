@@ -17,6 +17,13 @@ import { UserProfileRepository } from '../../repositories/user-profile.repositor
 import { FreeEligibilityResult } from './dto/free-eligibility.dto';
 import { normalizeIdCard } from '../../common/utils/id-card.util';
 import { PaymentException, PaymentErrorCode } from '../../common/payment-errors';
+import { PassengerBusinessException, PassengerErrorCode } from '../../common/passenger-business.exception';
+import {
+    AgePricingSummary,
+    calculateAgePricing,
+    PassengerPricingResult,
+    validatePassengerBusinessRules,
+} from './passenger-pricing';
 import { isAutoRecoverable, nextAnomalyRetryAt } from './anomaly-policy';
 import { BookingDashboardResponse } from '../admin/interfaces/booking-dashboard.interface';
 import { LoggingService } from '../logging/logging.service';
@@ -101,6 +108,57 @@ class ReconcileSemaphore {
 }
 
 /**
+ * 组合订单级定价：整单免费（会员/每日名额）优先于人员级年龄定价。
+ * 纯函数：入参为人员级年龄定价摘要，出参为最终金额、免费来源与每位人员的计费快照。
+ * 优惠顺序固定：月卡会员整单免费 → 每日免费名额整单免费 → 儿童/老人人员级年龄免费。
+ */
+export function composeOrderPricing(
+    ageSummary: AgePricingSummary,
+    personCount: number,
+    unitPrice: number,
+    orderFreeReason: 'member' | 'dailyQuota' | null,
+): {
+    amount: number;
+    isFree: boolean;
+    freeReason: 'member' | 'dailyQuota' | 'age' | null;
+    chargedPeople: number;
+    ageFreePeople: number;
+    passengerPricing: PassengerPricingResult[];
+} {
+    const ageFreePeople = ageSummary.ageFreePeople;
+
+    if (orderFreeReason) {
+        // 整单免费命中：所有人员 finalCharged=false、原因改为对应整单免费；
+        // 仍保留 ageFreePeople 作为年龄资格统计
+        return {
+            amount: 0,
+            isFree: true,
+            freeReason: orderFreeReason,
+            chargedPeople: 0,
+            ageFreePeople,
+            passengerPricing: ageSummary.passengerPricing.map((p) => ({
+                ...p,
+                finalCharged: false,
+                pricingReason: orderFreeReason === 'member' ? 'member_order_free' : 'daily_quota_order_free',
+            })),
+        };
+    }
+
+    // 人员级年龄免费：收费人数 = 总人数 - 年龄免费人数；金额 = 收费人数 * 单价
+    const chargedPeople = personCount - ageFreePeople;
+    const amount = chargedPeople * unitPrice;
+    const isFree = amount === 0;
+    return {
+        amount,
+        isFree,
+        freeReason: isFree ? 'age' : null,
+        chargedPeople,
+        ageFreePeople,
+        passengerPricing: ageSummary.passengerPricing,
+    };
+}
+
+/**
  * 预约订单业务逻辑层
  * 处理预约订单相关的业务逻辑
  */
@@ -169,6 +227,11 @@ export class BookingService {
             }
         }
 
+        // 人数唯一来源为 passengers.length，拒绝 personCount 与数组长度不一致的请求
+        if (createBookingDto.personCount !== createBookingDto.passengers.length) {
+            throw new PassengerBusinessException(PassengerErrorCode.COUNT_MISMATCH, '预约人数与人员列表不一致');
+        }
+
         // 检查预约人数是否超过限制
         const timeSlotLimit = await this.systemConfigService.getTimeSlotLimit();
         // 已废弃上下午概念，morningMaxPeople 即全天总限额
@@ -232,11 +295,22 @@ export class BookingService {
                 paymentExpiredAt.setMinutes(paymentExpiredAt.getMinutes() + 30);
             }
 
-            // 从 passengers[0] 同步联系人信息到兼容字段；身份证归一化（统一大写）写入
-            const normalizedPassengers = createBookingDto.passengers.map((p) => ({
-                ...p,
-                idCard: normalizeIdCard(p.idCard),
-            }));
+            // 从 passengers[0] 同步联系人信息到兼容字段；人员计费快照使用白名单字段构造，
+            // 计费字段由后端 eligibility 结果显式写入，不保留前端传入的同名字段
+            const normalizedPassengers = createBookingDto.passengers.map((p, index) => {
+                const pricing = eligibility.passengerPricing[index];
+                return {
+                    name: p.name,
+                    phone: p.phone,
+                    idCard: normalizeIdCard(p.idCard),
+                    passengerType: pricing.passengerType,
+                    idCardUnavailable: p.idCardUnavailable === true,
+                    ageValue: pricing.ageValue,
+                    ageFree: pricing.ageFree,
+                    finalCharged: pricing.finalCharged,
+                    pricingReason: pricing.pricingReason,
+                };
+            });
             const firstPassenger = normalizedPassengers[0];
             const passengersJson = JSON.stringify(normalizedPassengers);
 
@@ -255,6 +329,8 @@ export class BookingService {
                 bookingId,
                 bookingDate,
                 passengers: passengersJson,
+                // 人数唯一来源为 passengers.length，落库时不信任请求数值
+                personCount: createBookingDto.passengers.length,
                 name: firstPassenger.name,
                 phone: firstPassenger.phone,
                 idCard: firstPassenger.idCard,
@@ -333,6 +409,11 @@ export class BookingService {
         const configRepo = em.getRepository(SystemConfig);
         const bookingRepo = em.getRepository(Booking);
 
+        // 0. 统一人员业务校验与年龄定价（preview 与 create 共用，先于任何数据库查询；
+        //    create 事务内的纯函数异常会使事务干净回滚）
+        validatePassengerBusinessRules(passengers, bookingDate);
+        const agePricing = calculateAgePricing(passengers, bookingDate);
+
         // 1. 读取支付配置（含每日免费名额配置）
         const config = await configRepo.findOne({ where: { configId: 'system_config' } });
         const paymentConfig = config?.paymentConfig ?? { paymentAmount: 0 };
@@ -358,8 +439,10 @@ export class BookingService {
         let activeMember: Awaited<ReturnType<MemberService['getActiveMemberByIdCard']>> = null;
         let memberIdCardMatched = false;
         if (isMotorcycle) {
-            // 遍历乘客身份证，找到第一个命中的有效会员
+            // 遍历乘客身份证，找到第一个命中的有效会员；
+            // 无身份证（暂时无法提供）人员不参与会员匹配，避免把空值传给会员服务
             for (const p of passengers) {
+                if (!p.idCard) continue;
                 const m = await this.memberService.getActiveMemberByIdCard(p.idCard);
                 if (m) {
                     activeMember = m;
@@ -430,13 +513,17 @@ export class BookingService {
             const inputPlate = (licensePlate ?? '').toUpperCase().trim();
             const plateMatched = inputPlate.length > 0 && memberPlates.includes(inputPlate);
             if (plateMatched) {
+                const composed = composeOrderPricing(agePricing, personCount, unitPrice, 'member');
                 return {
-                    isFree: true,
-                    freeReason: 'member',
+                    isFree: composed.isFree,
+                    freeReason: composed.freeReason,
                     reason: null,
-                    amount: 0,
+                    amount: composed.amount,
                     unitPrice,
                     personCount,
+                    ageFreePeople: composed.ageFreePeople,
+                    chargedPeople: composed.chargedPeople,
+                    passengerPricing: composed.passengerPricing,
                     memberInfo,
                     freeQuotaInfo,
                     bookingRank,
@@ -446,13 +533,17 @@ export class BookingService {
 
         // 5. 每日免费名额命中（仅会员未命中时）
         if (freeEnabled && bookingIsToday && !userHasFreeBooking && quotaUsed < freeLimit) {
+            const composed = composeOrderPricing(agePricing, personCount, unitPrice, 'dailyQuota');
             return {
-                isFree: true,
-                freeReason: 'dailyQuota',
+                isFree: composed.isFree,
+                freeReason: composed.freeReason,
                 reason: null,
-                amount: 0,
+                amount: composed.amount,
                 unitPrice,
                 personCount,
+                ageFreePeople: composed.ageFreePeople,
+                chargedPeople: composed.chargedPeople,
+                passengerPricing: composed.passengerPricing,
                 memberInfo,
                 freeQuotaInfo,
                 bookingRank,
@@ -487,13 +578,17 @@ export class BookingService {
             reason = 'no_free_activity';
         }
 
+        const composed = composeOrderPricing(agePricing, personCount, unitPrice, null);
         return {
-            isFree: false,
-            freeReason: null,
+            isFree: composed.isFree,
+            freeReason: composed.freeReason,
             reason,
-            amount: personCount * unitPrice,
+            amount: composed.amount,
             unitPrice,
             personCount,
+            ageFreePeople: composed.ageFreePeople,
+            chargedPeople: composed.chargedPeople,
+            passengerPricing: composed.passengerPricing,
             memberInfo,
             freeQuotaInfo,
             bookingRank,
