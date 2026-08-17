@@ -39,16 +39,12 @@ import { APP_FILTER } from '@nestjs/core';
             synchronize: process.env.NODE_ENV !== 'production',
             logging: process.env.DATABASE_LOGGING === 'true',
             entities: [User, UserProfile, Admin, Booking, Announcement, SystemConfig, AdminApplication, Feedback, Member, BookingAnomaly],
-            // WAL 模式：读写不互斥，显著提升并发性能
-            // busy_timeout：写锁冲突时等待 5 秒而非立即报错
-            // synchronous=NORMAL：WAL 模式下安全且更快的同步级别
-            extra: {
-                pragma: [
-                    'journal_mode = WAL',
-                    'busy_timeout = 5000',
-                    'synchronous = NORMAL',
-                ],
-            },
+            // busyTimeout：写锁冲突时等待 5 秒而非立即报错。
+            // sqlite3 驱动只识别顶层 enableWAL/busyTimeout，extra.pragma 写法不生效
+            // （此前 busy_timeout 实际为 0，2026-08-16 12:31 事务报错后修正，
+            // 见 docs/implementation-todo.md「TYPEORM_PRAGMA_CONFIGURATION_IGNORED」）；
+            // WAL 与 synchronous 按支付可靠性设计暂不启用，另行验证后决策。
+            busyTimeout: 5000,
         }),
         // 日志库独立 DataSource（logs.db）：只注册 AppLog，synchronize 无条件关闭，
         // 建表走手工 SQL（docs/implementation-todo.md「生产 schema 变更 SQL」第 5 节）

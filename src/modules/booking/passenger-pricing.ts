@@ -62,8 +62,14 @@ export interface AgePricingSummary {
     passengerPricing: PassengerPricingResult[];
 }
 
-/** 儿童年龄免费边界：年龄值 <= 7 */
-export const CHILD_MAX_AGE = 7;
+/**
+ * 年龄免费总开关：false 时儿童/老人一律正常收费（自动分类仅用于打标），
+ * 会员/每日名额整单免费不受影响。想恢复年龄免费时改回 true 即可。
+ */
+export const AGE_FREE_ENABLED = false;
+
+/** 儿童年龄免费边界：年龄值 <= 13 */
+export const CHILD_MAX_AGE = 13;
 /** 老人年龄免费边界：年龄值 >= 70 */
 export const SENIOR_MIN_AGE = 70;
 
@@ -134,6 +140,23 @@ export function calculateYearAge(idCard: string, bookingDate: string): number | 
 }
 
 /**
+ * 解析实际用于计费的年龄类型。
+ * adult 是“未显式选择儿童/老人”的兼容值，此时按身份证年龄自动分类。
+ */
+export function resolveEffectivePassengerType(passenger: PassengerPricingInput, bookingDate: string): PassengerType {
+    const storedType = normalizePassengerType(passenger?.passengerType);
+    if (storedType === PassengerType.CHILD || storedType === PassengerType.SENIOR) {
+        return storedType;
+    }
+    const idCard = typeof passenger?.idCard === 'string' ? passenger.idCard.trim().toUpperCase() : '';
+    const age = calculateYearAge(idCard, bookingDate);
+    if (age === null || age < 0) return PassengerType.ADULT;
+    if (age <= CHILD_MAX_AGE) return PassengerType.CHILD;
+    if (age >= SENIOR_MIN_AGE) return PassengerType.SENIOR;
+    return PassengerType.ADULT;
+}
+
+/**
  * 车型人数上限口径：自驾摩托 2 人、自驾小型客车 7 人、非机动车/摆渡车及其他出行方式 10 人。
  * 与前端 fctl/utils/passenger-pricing.js 的 getPassengerLimit 保持完全一致；
  * 前端只用于交互提示，后端才是安全边界。
@@ -192,9 +215,9 @@ export function validatePassengerBusinessRules(passengers: PassengerPricingInput
         const hasIdCard = rawIdCard.length > 0;
         const idCard = rawIdCard.toUpperCase();
 
-        // 联系人固定为第一人：必须 adult、有身份证且未勾选暂时无法提供
-        if (i === 0 && (passengerType !== PassengerType.ADULT || idCardUnavailable || !hasIdCard)) {
-            throw new PassengerBusinessException(PassengerErrorCode.CONTACT_INVALID, '联系人必须为成年人并填写身份证号');
+        // 联系人固定为第一人：必须提供身份证，但不限制儿童/普通/老人年龄类型
+        if (i === 0 && (idCardUnavailable || !hasIdCard)) {
+            throw new PassengerBusinessException(PassengerErrorCode.CONTACT_INVALID, '联系人必须填写身份证号');
         }
 
         // 勾选暂时无法提供时不允许同时传身份证
@@ -231,7 +254,7 @@ export function validatePassengerBusinessRules(passengers: PassengerPricingInput
         if (hasIdCard && (passengerType === PassengerType.CHILD || passengerType === PassengerType.SENIOR)) {
             const age = calculateYearAge(idCard, bookingDate);
             const isChild = passengerType === PassengerType.CHILD;
-            const label = isChild ? '7岁及以下儿童' : '70岁及以上老人';
+            const label = isChild ? '13岁及以下儿童' : '70岁及以上老人';
             const ageOk = age !== null && age >= 0 && (isChild ? age <= CHILD_MAX_AGE : age >= SENIOR_MIN_AGE);
             if (!ageOk) {
                 throw new PassengerBusinessException(PassengerErrorCode.TYPE_AGE_MISMATCH, `身份证年龄不符合${label}条件`);
@@ -247,7 +270,7 @@ export function validatePassengerBusinessRules(passengers: PassengerPricingInput
  */
 export function calculateAgePricing(passengers: PassengerPricingInput[], bookingDate: string): AgePricingSummary {
     const passengerPricing: PassengerPricingResult[] = passengers.map((p, index) => {
-        const passengerType = normalizePassengerType(p?.passengerType);
+        const passengerType = resolveEffectivePassengerType(p, bookingDate);
         const idCardUnavailable = p?.idCardUnavailable === true;
         const rawIdCard = typeof p?.idCard === 'string' ? p.idCard.trim() : '';
         const idCard = rawIdCard.toUpperCase();
@@ -264,7 +287,12 @@ export function calculateAgePricing(passengers: PassengerPricingInput[], booking
             const age = calculateYearAge(idCard, bookingDate);
             ageValue = age;
             // 年龄值必须 >= 0：未来出生年份即使漏过前置校验也不得获得年龄免费
-            if (age !== null && age >= 0 && (passengerType === PassengerType.CHILD ? age <= CHILD_MAX_AGE : age >= SENIOR_MIN_AGE)) {
+            if (
+                AGE_FREE_ENABLED &&
+                age !== null &&
+                age >= 0 &&
+                (passengerType === PassengerType.CHILD ? age <= CHILD_MAX_AGE : age >= SENIOR_MIN_AGE)
+            ) {
                 ageFree = true;
                 pricingReason = passengerType === PassengerType.CHILD ? 'child_age_free' : 'senior_age_free';
             }

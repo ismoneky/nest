@@ -35,8 +35,8 @@ function makeIdCard(birth: string, seq = '001'): string {
 
 const ADULT_CARD = makeIdCard('19900101');
 const MEMBER_CARD = makeIdCard('19850101');
-const CHILD_7_CARD = makeIdCard('20190101'); // 2026 年预约时年龄 7
-const CHILD_8_CARD = makeIdCard('20180101'); // 2026 年预约时年龄 8
+const CHILD_13_CARD = makeIdCard('20130101'); // 2026 年预约时年龄 13
+const CHILD_14_CARD = makeIdCard('20120101'); // 2026 年预约时年龄 14
 const SENIOR_70_CARD = makeIdCard('19560101'); // 2026 年预约时年龄 70
 const UNIT_PRICE = 10000;
 const BOOKING_DATE = '2026-09-01'; // 非今天，避免干扰每日免费分支
@@ -60,8 +60,8 @@ describe('beijingDateStr（每日免费的“当天”口径）', () => {
 });
 
 describe('composeOrderPricing 纯函数（优惠顺序与金额公式）', () => {
-    it('所有人均年龄免费：金额 0、isFree=true、freeReason=age', () => {
-        // 两名 70 岁老人（纯函数不校验联系人约束，仅验证公式分支）
+    it('年龄免费关闭：两名 70 岁老人均收费，金额 2*unitPrice、isFree=false', () => {
+        // 两名 70 岁老人（AGE_FREE_ENABLED=false，仅自动打标 senior，不免费）
         const ageSummary = calculateAgePricing(
             [
                 { name: '老人甲', phone: '13800000001', idCard: SENIOR_70_CARD, passengerType: PassengerType.SENIOR },
@@ -69,33 +69,33 @@ describe('composeOrderPricing 纯函数（优惠顺序与金额公式）', () =>
             ],
             BOOKING_DATE,
         );
-        expect(ageSummary.ageFreePeople).toBe(2);
+        expect(ageSummary.ageFreePeople).toBe(0);
         const result = composeOrderPricing(ageSummary, 2, UNIT_PRICE, null);
-        expect(result.amount).toBe(0);
-        expect(result.isFree).toBe(true);
-        expect(result.freeReason).toBe('age');
-        expect(result.chargedPeople).toBe(0);
-        expect(result.ageFreePeople).toBe(2);
+        expect(result.amount).toBe(2 * UNIT_PRICE);
+        expect(result.isFree).toBe(false);
+        expect(result.freeReason).toBeNull();
+        expect(result.chargedPeople).toBe(2);
+        expect(result.ageFreePeople).toBe(0);
     });
 
-    it('一名 7 岁儿童 + 一名成人：收费人数 1、金额 unitPrice、isFree=false', () => {
+    it('一名 13 岁儿童 + 一名成人：年龄免费关闭，收费人数 2、金额 2*unitPrice', () => {
         const ageSummary = calculateAgePricing(
-            [adult(), { name: '儿童', phone: '13800000002', idCard: CHILD_7_CARD, passengerType: PassengerType.CHILD }],
+            [adult(), { name: '儿童', phone: '13800000002', idCard: CHILD_13_CARD, passengerType: PassengerType.CHILD }],
             BOOKING_DATE,
         );
         const result = composeOrderPricing(ageSummary, 2, UNIT_PRICE, null);
-        expect(result.amount).toBe(UNIT_PRICE);
+        expect(result.amount).toBe(2 * UNIT_PRICE);
         expect(result.isFree).toBe(false);
         expect(result.freeReason).toBeNull();
-        expect(result.chargedPeople).toBe(1);
-        expect(result.ageFreePeople).toBe(1);
-        expect(result.passengerPricing[1].pricingReason).toBe('child_age_free');
+        expect(result.chargedPeople).toBe(2);
+        expect(result.ageFreePeople).toBe(0);
+        expect(result.passengerPricing[1].pricingReason).toBe('regular');
         expect(result.passengerPricing[0].pricingReason).toBe('regular');
     });
 
-    it('会员整单免费：所有人员 finalCharged=false、pricingReason=member_order_free，保留 ageFreePeople', () => {
+    it('会员整单免费：所有人员 finalCharged=false、pricingReason=member_order_free', () => {
         const ageSummary = calculateAgePricing(
-            [adult(), { name: '儿童', phone: '13800000002', idCard: CHILD_7_CARD, passengerType: PassengerType.CHILD }],
+            [adult(), { name: '儿童', phone: '13800000002', idCard: CHILD_13_CARD, passengerType: PassengerType.CHILD }],
             BOOKING_DATE,
         );
         const result = composeOrderPricing(ageSummary, 2, UNIT_PRICE, 'member');
@@ -103,7 +103,7 @@ describe('composeOrderPricing 纯函数（优惠顺序与金额公式）', () =>
         expect(result.isFree).toBe(true);
         expect(result.freeReason).toBe('member');
         expect(result.chargedPeople).toBe(0);
-        expect(result.ageFreePeople).toBe(1);
+        expect(result.ageFreePeople).toBe(0);
         expect(result.passengerPricing.every((p) => p.finalCharged === false)).toBe(true);
         expect(result.passengerPricing.every((p) => p.pricingReason === 'member_order_free')).toBe(true);
     });
@@ -203,7 +203,7 @@ describe('determineFreeEligibility / createBooking 集成', () => {
             'user-1',
             [
                 adult({ idCard: MEMBER_CARD }),
-                { name: '儿童', phone: '13800000002', idCard: CHILD_7_CARD, passengerType: PassengerType.CHILD },
+                { name: '儿童', phone: '13800000002', idCard: CHILD_13_CARD, passengerType: PassengerType.CHILD },
             ],
             BOOKING_DATE,
             TravelMode.SELF_DRIVING,
@@ -214,10 +214,10 @@ describe('determineFreeEligibility / createBooking 集成', () => {
         expect(result.freeReason).toBe('member');
         expect(result.amount).toBe(0);
         expect(result.chargedPeople).toBe(0);
-        expect(result.ageFreePeople).toBe(1);
+        expect(result.ageFreePeople).toBe(0);
         expect(result.passengerPricing.every((p) => p.finalCharged === false)).toBe(true);
         expect(result.passengerPricing.every((p) => p.pricingReason === 'member_order_free')).toBe(true);
-        expect(result.passengerPricing[1].ageValue).toBe(7);
+        expect(result.passengerPricing[1].ageValue).toBe(13);
     });
 
     it('会员未命中但每日名额命中：金额 0、freeReason=dailyQuota', async () => {
@@ -228,18 +228,39 @@ describe('determineFreeEligibility / createBooking 集成', () => {
         expect(result.passengerPricing[0].pricingReason).toBe('daily_quota_order_free');
     });
 
-    it('前两项未命中，一名 7 岁儿童 + 一名成人：收费人数 1、金额 unitPrice', async () => {
+    it('前两项未命中，一名 13 岁儿童 + 一名成人：年龄免费关闭，收费人数 2、金额 2*unitPrice', async () => {
         const result = await service.determineFreeEligibility(
             'user-3',
-            [adult(), { name: '儿童', phone: '13800000002', idCard: CHILD_7_CARD, passengerType: PassengerType.CHILD }],
+            [adult(), { name: '儿童', phone: '13800000002', idCard: CHILD_13_CARD, passengerType: PassengerType.CHILD }],
             BOOKING_DATE,
             TravelMode.SCENIC_BUS,
         );
         expect(result.isFree).toBe(false);
         expect(result.freeReason).toBeNull();
+        expect(result.amount).toBe(2 * UNIT_PRICE);
+        expect(result.chargedPeople).toBe(2);
+        expect(result.ageFreePeople).toBe(0);
+    });
+
+    it('未显式选择类型的 13 岁联系人自动打标 child，但年龄免费关闭不免费', async () => {
+        const result = await service.determineFreeEligibility(
+            'user-auto-child-contact',
+            [adult({ idCard: CHILD_13_CARD, passengerType: PassengerType.ADULT })],
+            BOOKING_DATE,
+            TravelMode.SCENIC_BUS,
+        );
+
+        expect(result.isFree).toBe(false);
+        expect(result.freeReason).toBeNull();
         expect(result.amount).toBe(UNIT_PRICE);
-        expect(result.chargedPeople).toBe(1);
-        expect(result.ageFreePeople).toBe(1);
+        expect(result.ageFreePeople).toBe(0);
+        expect(result.passengerPricing[0]).toMatchObject({
+            passengerType: PassengerType.CHILD,
+            ageValue: 13,
+            ageFree: false,
+            finalCharged: true,
+            pricingReason: 'regular',
+        });
     });
 
     it('无身份证儿童：ageFree=false、finalCharged=true、pricingReason=id_card_unavailable', async () => {
@@ -264,7 +285,7 @@ describe('determineFreeEligibility / createBooking 集成', () => {
         await expect(
             service.determineFreeEligibility(
                 'user-5',
-                [adult(), { name: '儿童', phone: '13800000002', idCard: CHILD_8_CARD, passengerType: PassengerType.CHILD }],
+                [adult(), { name: '儿童', phone: '13800000002', idCard: CHILD_14_CARD, passengerType: PassengerType.CHILD }],
                 BOOKING_DATE,
                 TravelMode.SCENIC_BUS,
             ),
@@ -340,7 +361,7 @@ describe('determineFreeEligibility / createBooking 集成', () => {
             service.createBooking({
                 passengers: [
                     adult(),
-                    { name: '儿童', phone: '13800000002', idCard: CHILD_7_CARD, passengerType: PassengerType.CHILD },
+                    { name: '儿童', phone: '13800000002', idCard: CHILD_13_CARD, passengerType: PassengerType.CHILD },
                 ] as any,
                 bookingDate: BOOKING_DATE,
                 travelMode: 'scenicBus',
@@ -350,11 +371,11 @@ describe('determineFreeEligibility / createBooking 集成', () => {
         ).rejects.toMatchObject({ code: PassengerErrorCode.COUNT_MISMATCH });
     });
 
-    it('部分年龄免费订单保持 PENDING/UNPAID，支付金额为 chargedPeople * unitPrice', async () => {
+    it('含 13 岁儿童的订单（年龄免费关闭）保持 PENDING/UNPAID，金额为 2 * unitPrice', async () => {
         const booking = await service.createBooking({
             passengers: [
                 adult(),
-                { name: '儿童', phone: '13800000002', idCard: CHILD_7_CARD, passengerType: PassengerType.CHILD },
+                { name: '儿童', phone: '13800000002', idCard: CHILD_13_CARD, passengerType: PassengerType.CHILD },
             ] as any,
             bookingDate: BOOKING_DATE,
             travelMode: 'scenicBus',
@@ -366,7 +387,7 @@ describe('determineFreeEligibility / createBooking 集成', () => {
         expect(booking.paymentStatus).toBe('unpaid');
         expect(booking.isFree).toBe(false);
         expect(booking.freeReason).toBeNull();
-        expect(booking.amount).toBe(UNIT_PRICE);
+        expect(booking.amount).toBe(2 * UNIT_PRICE);
         expect(booking.personCount).toBe(2);
 
         const stored = JSON.parse(booking.passengers);
@@ -381,18 +402,41 @@ describe('determineFreeEligibility / createBooking 集成', () => {
         expect(stored[1]).toMatchObject({
             passengerType: 'child',
             idCardUnavailable: false,
-            ageValue: 7,
-            ageFree: true,
-            finalCharged: false,
-            pricingReason: 'child_age_free',
+            ageValue: 13,
+            ageFree: false,
+            finalCharged: true,
+            pricingReason: 'regular',
         });
     });
 
-    it('摩托车 + 会员联系人 + 7 岁儿童：整单免费直接 confirmed，快照为 member_order_free', async () => {
+    it('普通同行人的 70 岁身份证自动打标 senior，年龄免费关闭仍收费', async () => {
+        const booking = await service.createBooking({
+            passengers: [
+                adult(),
+                adult({ name: '老人', phone: '13800000002', idCard: SENIOR_70_CARD, passengerType: PassengerType.ADULT }),
+            ] as any,
+            bookingDate: BOOKING_DATE,
+            travelMode: 'scenicBus',
+            personCount: 2,
+            wechatOpenId: 'user-auto-senior-companion',
+        } as any);
+
+        expect(booking.amount).toBe(2 * UNIT_PRICE);
+        const stored = JSON.parse(booking.passengers);
+        expect(stored[1]).toMatchObject({
+            passengerType: 'senior',
+            ageValue: 70,
+            ageFree: false,
+            finalCharged: true,
+            pricingReason: 'regular',
+        });
+    });
+
+    it('摩托车 + 会员联系人 + 13 岁儿童：整单免费直接 confirmed，快照为 member_order_free', async () => {
         const booking = await service.createBooking({
             passengers: [
                 adult({ idCard: MEMBER_CARD }),
-                { name: '儿童', phone: '13800000002', idCard: CHILD_7_CARD, passengerType: PassengerType.CHILD },
+                { name: '儿童', phone: '13800000002', idCard: CHILD_13_CARD, passengerType: PassengerType.CHILD },
             ] as any,
             bookingDate: BOOKING_DATE,
             travelMode: 'selfDriving',
@@ -411,7 +455,7 @@ describe('determineFreeEligibility / createBooking 集成', () => {
         const stored = JSON.parse(booking.passengers);
         expect(stored.every((p: any) => p.finalCharged === false)).toBe(true);
         expect(stored.every((p: any) => p.pricingReason === 'member_order_free')).toBe(true);
-        expect(stored[1].ageValue).toBe(7);
+        expect(stored[1].ageValue).toBe(13);
     });
 
     it('无身份证儿童订单保存 idCardUnavailable 与空身份证快照', async () => {

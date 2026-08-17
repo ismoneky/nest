@@ -119,7 +119,7 @@ describe('PassengerDto 结构校验（preview 与 create 共用）', () => {
             ...BOOKING_BASE,
             passengers: [
                 { name: '张三', phone: '13800000001', idCard: ADULT_CARD },
-                { name: '儿童', phone: '13800000002', idCard: makeIdCard('20180101'), passengerType: 'child' },
+                { name: '儿童', phone: '13800000002', idCard: makeIdCard('20120101'), passengerType: 'child' },
             ],
         });
         expect(validateSync(instance)).toHaveLength(0);

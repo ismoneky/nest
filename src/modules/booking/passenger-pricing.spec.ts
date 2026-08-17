@@ -1,10 +1,12 @@
 import { PassengerErrorCode } from '../../common/passenger-business.exception';
 import {
+    AGE_FREE_ENABLED,
     calculateAgePricing,
     calculateYearAge,
     extractBirthYear,
     getPassengerLimit,
     normalizePassengerType,
+    resolveEffectivePassengerType,
     PassengerPricingInput,
     PassengerType,
     validateChineseIdCard,
@@ -32,7 +34,7 @@ function adult(overrides: Partial<PassengerPricingInput> = {}): PassengerPricing
     return { name: '张三', phone: '13800000001', idCard: makeIdCard('19900101'), ...overrides };
 }
 
-/** 预约 2026 年时 7 岁儿童（2019 年出生） */
+/** 边界测试统一使用 2026 年预约日期 */
 const BOOKING_2026 = '2026-08-13';
 
 describe('normalizePassengerType', () => {
@@ -133,15 +135,18 @@ describe('extractBirthYear / calculateYearAge', () => {
 });
 
 describe('validatePassengerBusinessRules', () => {
-    it('预约 2026 年、2019 年出生 → 年龄 7 → 儿童有效', () => {
-        const passengers = [adult(), { name: '儿童', phone: '13800000002', idCard: makeIdCard('20190101'), passengerType: PassengerType.CHILD }];
+    it('预约 2026 年、2013 年出生 → 年龄 13 → 儿童有效', () => {
+        const passengers = [adult(), { name: '儿童', phone: '13800000002', idCard: makeIdCard('20130101'), passengerType: PassengerType.CHILD }];
         expect(() => validatePassengerBusinessRules(passengers, BOOKING_2026)).not.toThrow();
     });
 
-    it('2018 年出生 → 年龄 8 → 儿童类型不符，抛 TYPE_AGE_MISMATCH', () => {
-        const passengers = [adult(), { name: '儿童', phone: '13800000002', idCard: makeIdCard('20180101'), passengerType: PassengerType.CHILD }];
+    it('2012 年出生 → 年龄 14 → 儿童类型不符，抛 TYPE_AGE_MISMATCH', () => {
+        const passengers = [adult(), { name: '儿童', phone: '13800000002', idCard: makeIdCard('20120101'), passengerType: PassengerType.CHILD }];
         expect(() => validatePassengerBusinessRules(passengers, BOOKING_2026)).toThrowError(
-            expect.objectContaining({ code: PassengerErrorCode.TYPE_AGE_MISMATCH }),
+            expect.objectContaining({
+                code: PassengerErrorCode.TYPE_AGE_MISMATCH,
+                message: '身份证年龄不符合13岁及以下儿童条件',
+            }),
         );
     });
 
@@ -168,7 +173,7 @@ describe('validatePassengerBusinessRules', () => {
     });
 
     it('类型与年龄不符不静默收费，错误响应不含身份证原值', () => {
-        const forgedCard = makeIdCard('20180101');
+        const forgedCard = makeIdCard('20120101');
         const passengers = [adult(), { name: '儿童', phone: '13800000002', idCard: forgedCard, passengerType: PassengerType.CHILD }];
         let thrown: unknown;
         try {
@@ -185,16 +190,12 @@ describe('validatePassengerBusinessRules', () => {
         expect(() => validatePassengerBusinessRules(legacy, BOOKING_2026)).not.toThrow();
     });
 
-    it('联系人是儿童/老人时抛 CONTACT_INVALID', () => {
-        const childFirst = [{ name: '儿童', phone: '13800000001', idCard: makeIdCard('20190101'), passengerType: PassengerType.CHILD }, adult()];
-        expect(() => validatePassengerBusinessRules(childFirst, BOOKING_2026)).toThrowError(
-            expect.objectContaining({ code: PassengerErrorCode.CONTACT_INVALID }),
-        );
+    it('联系人不限制年龄类型：有效儿童/老人身份证均通过', () => {
+        const automaticChild = [adult({ idCard: makeIdCard('20130101'), passengerType: PassengerType.ADULT }), adult()];
+        expect(() => validatePassengerBusinessRules(automaticChild, BOOKING_2026)).not.toThrow();
 
-        const seniorFirst = [{ name: '老人', phone: '13800000001', idCard: makeIdCard('19560101'), passengerType: PassengerType.SENIOR }, adult()];
-        expect(() => validatePassengerBusinessRules(seniorFirst, BOOKING_2026)).toThrowError(
-            expect.objectContaining({ code: PassengerErrorCode.CONTACT_INVALID }),
-        );
+        const explicitSenior = [{ name: '老人', phone: '13800000001', idCard: makeIdCard('19560101'), passengerType: PassengerType.SENIOR }, adult()];
+        expect(() => validatePassengerBusinessRules(explicitSenior, BOOKING_2026)).not.toThrow();
     });
 
     it('成人身份证必填：缺失或空抛 ID_CARD_REQUIRED', () => {
@@ -302,24 +303,59 @@ describe('getPassengerLimit / validatePassengerLimit', () => {
 });
 
 describe('calculateAgePricing', () => {
-    it('2019 年出生儿童：年龄 7、年龄免费', () => {
-        const passengers = [adult(), { name: '儿童', phone: '13800000002', idCard: makeIdCard('20190101'), passengerType: PassengerType.CHILD }];
-        const summary = calculateAgePricing(passengers, BOOKING_2026);
-        expect(summary.ageFreePeople).toBe(1);
-        expect(summary.chargedPeople).toBe(1);
-        const child = summary.passengerPricing[1];
-        expect(child.ageValue).toBe(7);
-        expect(child.ageFree).toBe(true);
-        expect(child.finalCharged).toBe(false);
-        expect(child.pricingReason).toBe('child_age_free');
+    it('普通联系人/同行人按身份证年龄解析有效类型，14 岁保持普通收费', () => {
+        const childContact = adult({ idCard: makeIdCard('20130101'), passengerType: PassengerType.ADULT });
+        const seniorCompanion = adult({ name: '老人', phone: '13800000002', idCard: makeIdCard('19560101'), passengerType: PassengerType.ADULT });
+        const regularCompanion = adult({ name: '普通', phone: '13800000003', idCard: makeIdCard('20120101'), passengerType: PassengerType.ADULT });
+
+        expect(resolveEffectivePassengerType(childContact, BOOKING_2026)).toBe(PassengerType.CHILD);
+        expect(resolveEffectivePassengerType(seniorCompanion, BOOKING_2026)).toBe(PassengerType.SENIOR);
+        expect(resolveEffectivePassengerType(regularCompanion, BOOKING_2026)).toBe(PassengerType.ADULT);
+
+        const summary = calculateAgePricing([childContact, seniorCompanion, regularCompanion], BOOKING_2026);
+        expect(AGE_FREE_ENABLED).toBe(false);
+        expect(summary.ageFreePeople).toBe(0);
+        expect(summary.chargedPeople).toBe(3);
+        expect(summary.passengerPricing[0]).toMatchObject({
+            passengerType: PassengerType.CHILD,
+            ageValue: 13,
+            ageFree: false,
+            finalCharged: true,
+            pricingReason: 'regular',
+        });
+        expect(summary.passengerPricing[1]).toMatchObject({
+            passengerType: PassengerType.SENIOR,
+            ageValue: 70,
+            ageFree: false,
+            finalCharged: true,
+            pricingReason: 'regular',
+        });
+        expect(summary.passengerPricing[2]).toMatchObject({
+            passengerType: PassengerType.ADULT,
+            ageValue: null,
+            ageFree: false,
+            pricingReason: 'regular',
+        });
     });
 
-    it('1956 年出生老人：年龄 70、年龄免费', () => {
+    it('2013 年出生儿童：年龄 13，年龄免费关闭时正常收费', () => {
+        const passengers = [adult(), { name: '儿童', phone: '13800000002', idCard: makeIdCard('20130101'), passengerType: PassengerType.CHILD }];
+        const summary = calculateAgePricing(passengers, BOOKING_2026);
+        expect(summary.ageFreePeople).toBe(0);
+        expect(summary.chargedPeople).toBe(2);
+        const child = summary.passengerPricing[1];
+        expect(child.ageValue).toBe(13);
+        expect(child.ageFree).toBe(false);
+        expect(child.finalCharged).toBe(true);
+        expect(child.pricingReason).toBe('regular');
+    });
+
+    it('1956 年出生老人：年龄 70，年龄免费关闭时正常收费', () => {
         const passengers = [adult(), { name: '老人', phone: '13800000002', idCard: makeIdCard('19560101'), passengerType: PassengerType.SENIOR }];
         const summary = calculateAgePricing(passengers, BOOKING_2026);
-        expect(summary.ageFreePeople).toBe(1);
-        expect(summary.chargedPeople).toBe(1);
-        expect(summary.passengerPricing[1].pricingReason).toBe('senior_age_free');
+        expect(summary.ageFreePeople).toBe(0);
+        expect(summary.chargedPeople).toBe(2);
+        expect(summary.passengerPricing[1]).toMatchObject({ ageFree: false, finalCharged: true, pricingReason: 'regular' });
     });
 
     it('无身份证人员结果固定为 id_card_unavailable，与 regular 区分', () => {
