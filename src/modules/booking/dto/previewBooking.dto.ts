@@ -37,6 +37,6 @@ export class PreviewBookingDto {
     /** 车牌号（自驾时必填，命中会员登记车牌其一） */
     @IsString()
     @IsOptional()
-    @Matches(LICENSE_PLATE_PATTERN, { message: 'Invalid license plate format' })
+    @Matches(LICENSE_PLATE_PATTERN, { message: '请检查车牌号' })
     licensePlate?: string;
 }

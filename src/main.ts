@@ -4,7 +4,7 @@ process.env.UV_THREADPOOL_SIZE = process.env.UV_THREADPOOL_SIZE || '16';
 import * as dotenv from 'dotenv';
 dotenv.config();
 
-import { ValidationPipe } from '@nestjs/common';
+import { BadRequestException, ValidationPipe } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { json } from 'express';
 import * as crypto from 'crypto';
@@ -32,6 +32,8 @@ async function bootstrap() {
   }));
 
   // 启用全局验证管道,防止无效数据导致内存问题
+  // exceptionFactory：Nest 默认把校验错误的 message 组成数组返回，前端无法直接展示，
+  // 这里拍平为「多字段错误用分号拼接」的字符串，保持统一错误响应结构 { message: string }
   app.useGlobalPipes(
     new ValidationPipe({
       transform: true,
@@ -39,6 +41,20 @@ async function bootstrap() {
       forbidNonWhitelisted: false,
       transformOptions: {
         enableImplicitConversion: true,
+      },
+      exceptionFactory: (errors) => {
+        // 递归收集约束信息（嵌套 DTO 如 passengers[i].phone 的错误在 children 里）
+        const collect = (list: any[]): string[] =>
+          list.flatMap((e) => {
+            const own: string[] = e.constraints ? Object.values<string>(e.constraints) : [];
+            const child: string[] = e.children ? collect(e.children) : [];
+            return [...own, ...child];
+          });
+        const messages = collect(errors);
+        return new BadRequestException({
+          error: 'Bad Request',
+          message: messages.length > 0 ? messages.join('; ') : '参数校验失败',
+        });
       },
     }),
   );

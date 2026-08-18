@@ -63,28 +63,28 @@ export class CreateBookingDto {
     /** 车牌号 (自驾+机动车时必填，非机动车不需要) */
     @ValidateIf((o) => o.travelMode === TravelMode.SELF_DRIVING && o.vehicleType !== VehicleType.NON_MOTORIZED)
     @IsString()
-    @IsNotEmpty({ message: 'License plate is required for self-driving mode' })
+    @IsNotEmpty({ message: '自驾预约请填写车牌号' })
     @Matches(/^[京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤青藏川宁琼使领][A-Z][A-HJ-NP-Z0-9]{4,5}[A-HJ-NP-Z0-9挂学警港澳]$/, {
-        message: 'Invalid license plate format',
+        message: '车牌号格式不正确，请检查后重试',
     })
     licensePlate?: string;
 
     /** 车辆类型 (自驾时必填) */
     @ValidateIf((o) => o.travelMode === TravelMode.SELF_DRIVING)
     @IsEnum(VehicleType)
-    @IsNotEmpty({ message: 'Vehicle type is required for self-driving mode' })
+    @IsNotEmpty({ message: '自驾预约请选择车辆类型' })
     vehicleType?: VehicleType;
 
     /** 旅游团名称 (旅游团时必填) */
     @ValidateIf((o) => o.travelMode === TravelMode.TOUR_GROUP)
     @IsString()
-    @IsNotEmpty({ message: 'Tour group name is required for tour group mode' })
+    @IsNotEmpty({ message: '旅游团预约请填写旅游团名称' })
     tourGroupName?: string;
 
     /** 旅游团订单编号 (旅游团时必填) */
     @ValidateIf((o) => o.travelMode === TravelMode.TOUR_GROUP)
     @IsString()
-    @IsNotEmpty({ message: 'Tour order number is required for tour group mode' })
+    @IsNotEmpty({ message: '旅游团预约请填写旅游团订单编号' })
     tourOrderNumber?: string;
 
     /** 预约人数 (≥1) */
