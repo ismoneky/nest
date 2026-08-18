@@ -36,4 +36,25 @@ export class SystemConfigService {
     async getTimeSlotLimit() {
         return await this.configRepository.getTimeSlotLimit();
     }
+
+    /**
+     * 获取支付配置
+     */
+    async getPaymentConfig() {
+        return await this.configRepository.getPaymentConfig();
+    }
+
+    /**
+     * 获取禁止预约时的展示文案
+     */
+    async getBookingDisabledMessage() {
+        return await this.configRepository.getBookingDisabledMessage();
+    }
+
+    /**
+     * 获取温馨提示配置
+     */
+    async getNoticeConfig() {
+        return await this.configRepository.getNoticeConfig();
+    }
 }

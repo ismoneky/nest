@@ -1,27 +1,40 @@
-import { Prop, Schema, SchemaFactory } from '@nestjs/mongoose';
-import { HydratedDocument } from 'mongoose';
+import { Entity, Column, PrimaryGeneratedColumn, Index, BeforeInsert, BeforeUpdate } from 'typeorm';
+import { timestampTransformer } from './timestamp.transformer';
 
-export type UserDocument = HydratedDocument<User>;
-
-@Schema({ timestamps: true })
+@Entity('users')
 export class User {
-    @Prop({ required: true, unique: true })
+    @PrimaryGeneratedColumn()
+    id: number;
+
+    @Column({ unique: true })
+    @Index()
     userId: string;
 
-    @Prop({ required: true, unique: true })
+    @Column({ unique: true })
+    @Index()
     wechatOpenId: string;
 
-    @Prop({ required: true })
-    wechatNickname: string;
+    @Column({ nullable: true })
+    wechatNickname?: string;
 
-    @Prop()
+    @Column({ nullable: true })
     wechatAvatarUrl?: string;
 
-    @Prop({ default: Date.now })
+    @Column({ type: 'integer', transformer: timestampTransformer, default: () => `${Date.now()}` })
     createdAt: Date;
 
-    @Prop()
-    updatedAt?: Date;
-}
+    @Column({ type: 'integer', transformer: timestampTransformer, default: () => `${Date.now()}` })
+    updatedAt: Date;
 
-export const UserSchema = SchemaFactory.createForClass(User);
+    @BeforeInsert()
+    setCreatedAt() {
+        const now = new Date();
+        if (!this.createdAt) this.createdAt = now;
+        this.updatedAt = now;
+    }
+
+    @BeforeUpdate()
+    setUpdatedAt() {
+        this.updatedAt = new Date();
+    }
+}

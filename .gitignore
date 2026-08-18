@@ -1,2 +1,40 @@
+# Dependencies
 node_modules
+
+# 微信支付证书和密钥（严禁入库）
+certs/
+
+# 环境变量（含敏感信息）
+.env
+.env.development
+.env.production
+
+# Build output
 dist
+
+# Database
+data/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Test coverage
+coverage
+.nyc_output
+
+.sh

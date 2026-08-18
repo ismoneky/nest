@@ -62,4 +62,56 @@ export class SystemConfigController {
             data: limit,
         });
     }
+
+    /**
+     * 获取支付配置
+     * GET /system-config/payment-config
+     */
+    @Get('payment-config')
+    async getPaymentConfig(@Res() res: Response) {
+        const paymentConfig = await this.configService.getPaymentConfig();
+        return res.status(HttpStatus.OK).send({
+            success: true,
+            data: paymentConfig,
+        });
+    }
+
+    /**
+     * 获取禁止预约时的展示文案
+     * GET /system-config/booking-disabled-message
+     */
+    @Get('booking-disabled-message')
+    async getBookingDisabledMessage(@Res() res: Response) {
+        const message = await this.configService.getBookingDisabledMessage();
+        return res.status(HttpStatus.OK).send({
+            success: true,
+            data: { bookingDisabledMessage: message },
+        });
+    }
+
+    /**
+     * 获取温馨提示配置（进入预约页弹窗，小程序使用）
+     * GET /system-config/notice
+     */
+    @Get('notice')
+    async getNoticeConfig(@Res() res: Response) {
+        const noticeConfig = await this.configService.getNoticeConfig();
+        return res.status(HttpStatus.OK).send({
+            success: true,
+            data: noticeConfig,
+        });
+    }
+
+    /**
+     * 获取轮播图列表（小程序首页使用）
+     * GET /system-config/banners
+     */
+    @Get('banners')
+    async getBanners(@Res() res: Response) {
+        const config = await this.configService.getConfig();
+        return res.status(HttpStatus.OK).send({
+            success: true,
+            data: config.banners,
+        });
+    }
 }

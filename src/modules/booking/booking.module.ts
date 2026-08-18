@@ -1,16 +1,29 @@
 import { Module } from '@nestjs/common';
-import { MongooseModule } from '@nestjs/mongoose';
-import { Booking, BookingSchema } from '../../entities/booking.entity';
-import { BookingRepository } from '../../repositories/booking.repository';
+import { TypeOrmModule } from '@nestjs/typeorm';
+import { Booking } from '../../entities/booking.entity';
+import { AdminApplication } from '../../entities/admin-application.entity';
+import { BookingAnomaly } from '../../entities/booking-anomaly.entity';
 import { BookingController } from './booking.controller';
 import { BookingService } from './booking.service';
+import { BookingRepository } from '../../repositories/booking.repository';
+import { AdminApplicationRepository } from '../../repositories/admin-application.repository';
+import { WechatPayModule } from '../wechat-pay/wechat-pay.module';
+import { SystemConfigModule } from '../system-config/system-config.module';
+import { UserModule } from '../user/user.module';
+import { MemberModule } from '../member/member.module';
+import { LoggingModule } from '../logging/logging.module';
 
 @Module({
-    imports: [
-        MongooseModule.forFeature([{ name: Booking.name, schema: BookingSchema }]),
-    ],
-    controllers: [BookingController],
-    providers: [BookingService, BookingRepository],
-    exports: [BookingService, BookingRepository],
+  imports: [
+    TypeOrmModule.forFeature([Booking, AdminApplication, BookingAnomaly]),
+    WechatPayModule,
+    SystemConfigModule,
+    UserModule,
+    MemberModule,
+    LoggingModule,
+  ],
+  controllers: [BookingController],
+  providers: [BookingService, BookingRepository, AdminApplicationRepository],
+  exports: [BookingService],
 })
 export class BookingModule {}

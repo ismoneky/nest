@@ -1,7 +1,7 @@
-import { Injectable, InternalServerErrorException, NotFoundException } from '@nestjs/common';
-import { InjectModel } from '@nestjs/mongoose';
-import { Model } from 'mongoose';
-import { Admin, AdminDocument } from '../entities/admin.entity';
+import { Injectable, InternalServerErrorException } from '@nestjs/common';
+import { InjectRepository } from '@nestjs/typeorm';
+import { Repository } from 'typeorm';
+import { Admin } from '../entities/admin.entity';
 import * as bcrypt from 'bcrypt';
 
 /**
@@ -9,16 +9,19 @@ import * as bcrypt from 'bcrypt';
  */
 @Injectable()
 export class AdminRepository {
-    constructor(@InjectModel(Admin.name) private readonly adminModel: Model<AdminDocument>) {}
+    constructor(
+        @InjectRepository(Admin)
+        private readonly adminRepository: Repository<Admin>,
+    ) {}
 
     /**
      * 根据用户名查找管理员
      * @param username 用户名
-     * @returns 管理员文档
+     * @returns 管理员实体
      */
-    async findByUsername(username: string) {
+    async findByUsername(username: string): Promise<Admin | null> {
         try {
-            return await this.adminModel.findOne({ username }).lean().exec();
+            return await this.adminRepository.findOne({ where: { username } });
         } catch (error) {
             throw new InternalServerErrorException(error instanceof Error ? error.message : 'Failed to find admin');
         }
@@ -42,9 +45,9 @@ export class AdminRepository {
      * 更新最后登录时间
      * @param username 用户名
      */
-    async updateLastLogin(username: string) {
+    async updateLastLogin(username: string): Promise<void> {
         try {
-            await this.adminModel.updateOne({ username }, { lastLoginAt: new Date() }).exec();
+            await this.adminRepository.update({ username }, { lastLoginAt: new Date() });
         } catch (error) {
             throw new InternalServerErrorException(error instanceof Error ? error.message : 'Failed to update last login');
         }
@@ -56,16 +59,15 @@ export class AdminRepository {
      * @param password 密码
      * @param name 姓名
      */
-    async createAdmin(username: string, password: string, name: string) {
+    async createAdmin(username: string, password: string, name: string): Promise<Admin> {
         try {
             const hashedPassword = await bcrypt.hash(password, 10);
-            const admin = new this.adminModel({
+            const admin = this.adminRepository.create({
                 username,
                 password: hashedPassword,
                 name,
             });
-            const savedAdmin = await admin.save();
-            return savedAdmin.toObject();
+            return await this.adminRepository.save(admin);
         } catch (error) {
             throw new InternalServerErrorException(error instanceof Error ? error.message : 'Failed to create admin');
         }

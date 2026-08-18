@@ -6,18 +6,8 @@ import { IsArray, IsBoolean, IsInt, IsObject, IsOptional, IsString, IsUrl, Min, 
  */
 export class BannerItemDto {
     @IsString()
-    title: string;
-
-    @IsUrl()
+    @IsUrl({}, { message: '请输入有效的图片链接' })
     imageUrl: string;
-
-    @IsOptional()
-    @IsUrl()
-    linkUrl?: string;
-
-    @IsInt()
-    @Min(0)
-    sortOrder: number;
 }
 
 /**
@@ -29,8 +19,41 @@ export class TimeSlotLimitDto {
     morningMaxPeople: number;
 
     @IsInt()
-    @Min(1)
+    @Min(0)
     afternoonMaxPeople: number;
+}
+
+/**
+ * 支付配置 DTO
+ */
+export class PaymentConfigDto {
+    @IsInt()
+    @Min(0)
+    paymentAmount: number;
+
+    /** 每日前N名用户免费：是否开启 */
+    @IsOptional()
+    @IsBoolean()
+    freeQuotaEnabled?: boolean;
+
+    /** 每日前N名用户免费：免费名额上限（去重用户数，按日重置） */
+    @IsOptional()
+    @IsInt()
+    @Min(1)
+    freeQuotaLimit?: number;
+}
+
+/**
+ * 温馨提示配置 DTO
+ */
+export class NoticeConfigDto {
+    /** 是否开启温馨提示弹窗 */
+    @IsBoolean()
+    enabled: boolean;
+
+    /** 提示内容 */
+    @IsString()
+    content: string;
 }
 
 /**
@@ -41,6 +64,11 @@ export class UpdateSystemConfigDto {
     @IsOptional()
     @IsBoolean()
     bookingEnabled?: boolean;
+
+    /** 禁止预约时的展示文案 */
+    @IsOptional()
+    @IsString()
+    bookingDisabledMessage?: string;
 
     /** 轮播图配置 */
     @IsOptional()
@@ -55,4 +83,18 @@ export class UpdateSystemConfigDto {
     @ValidateNested()
     @Type(() => TimeSlotLimitDto)
     timeSlotLimit?: TimeSlotLimitDto;
+
+    /** 支付配置 */
+    @IsOptional()
+    @IsObject()
+    @ValidateNested()
+    @Type(() => PaymentConfigDto)
+    paymentConfig?: PaymentConfigDto;
+
+    /** 温馨提示配置 */
+    @IsOptional()
+    @IsObject()
+    @ValidateNested()
+    @Type(() => NoticeConfigDto)
+    noticeConfig?: NoticeConfigDto;
 }
