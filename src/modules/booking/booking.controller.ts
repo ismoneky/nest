@@ -109,6 +109,33 @@ export class BookingController {
     }
 
     /**
+     * 今日名额概览（提交订单页展示「今日名额 + 剩余免费名额」，前端 90 秒轮询）
+     * GET /bookings/today-quota
+     *
+     * 匿名可访问，无 @UseGuards（与 stats/by-date 同族的产品决策）。
+     *
+     * 【安全约束，改前必读】本接口的存在意义是不泄漏每日营收，因此：
+     *  1. 签名里刻意【不声明 @Query()】—— 不接受任何日期参数，服务端固定用
+     *     beijingDateStr() 取「今天」。这样全局 ValidationPipe 的 whitelist 根本不参与，
+     *     请求带 ?bookingDate=2020-01-01 会被直接忽略，约束由类型系统而非纪律保证。
+     *     目的是防止被批量回捞历史序列、反推每日总量。
+     *  2. 只返回剩余，【绝不返回】total / maxPeople / currentPeople / bookingCount ——
+     *     单价公开，故 已约人数 × 单价 ≈ 每日营收；而「已约人数 = 总限额 − 剩余」，
+     *     返回总限额等于把已约人数直接送出去。
+     *  3. 本路由是单段静态路径，必须声明在 @Get(':bookingId') 之前，否则会被参数路由吃掉。
+     *
+     * 字段级约束详见 dto/today-quota.dto.ts 顶部说明。
+     */
+    @Get('today-quota')
+    async getTodayQuota(@Res() res: Response) {
+        const data = await this.bookingService.getTodayQuotaOverview();
+        return res.status(HttpStatus.OK).send({
+            success: true,
+            data,
+        });
+    }
+
+    /**
      * 查询当前用户指定状态下的订单数量
      * GET /bookings/count?status=pending
      * @param query 查询条件，status 可选

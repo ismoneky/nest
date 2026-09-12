@@ -458,6 +458,41 @@ describe('determineFreeEligibility / createBooking 集成', () => {
         expect(stored[1].ageValue).toBe(13);
     });
 
+    it('摩托车 + 非会员：reason=not_member，不返回会员信息（回归：曾误报身份证与会员记录不一致）', async () => {
+        // activeMember 与 memberIdCardMatched 同生共死，非会员场景下不存在可比对的会员记录，
+        // 因此不能报 member_idcard_not_matched，否则会把「从未注册会员」误报成「身份证不一致」
+        const result = await service.determineFreeEligibility(
+            'user-nonmember',
+            [adult()],
+            BOOKING_DATE,
+            TravelMode.SELF_DRIVING,
+            VehicleType.WHEEL_MOTORCYCLE,
+            '豫A12345',
+        );
+
+        expect(result.isFree).toBe(false);
+        expect(result.reason).toBe('not_member');
+        expect(result.memberInfo).toBeNull();
+        expect(result.amount).toBe(UNIT_PRICE);
+    });
+
+    it('摩托车 + 身份证命中会员但车牌未登记：reason=member_plate_not_matched，返回会员信息', async () => {
+        // 与上一例对照：确有会员记录时车牌不符才提示会员相关文案，前端据此展示提示
+        const result = await service.determineFreeEligibility(
+            'user-member-plate',
+            [adult({ idCard: MEMBER_CARD })],
+            BOOKING_DATE,
+            TravelMode.SELF_DRIVING,
+            VehicleType.WHEEL_MOTORCYCLE,
+            '豫C99999',
+        );
+
+        expect(result.isFree).toBe(false);
+        expect(result.reason).toBe('member_plate_not_matched');
+        expect(result.memberInfo).not.toBeNull();
+        expect(result.amount).toBe(UNIT_PRICE);
+    });
+
     it('无身份证儿童订单保存 idCardUnavailable 与空身份证快照', async () => {
         const booking = await service.createBooking({
             passengers: [

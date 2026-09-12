@@ -9,12 +9,13 @@ import { GetBookingsDto } from './dto/getBookings.dto';
 import { UpdateBookingDto } from './dto/updateBooking.dto';
 import { TimeSlot, TravelMode, VehicleType, BookingStatus, PaymentStatus, RefundStatus, Booking } from '../../entities/booking.entity';
 import { AnomalyType, BookingAnomaly, AnomalyStatus } from '../../entities/booking-anomaly.entity';
-import { SystemConfig } from '../../entities/system-config.entity';
+import { SystemConfig, PaymentConfig } from '../../entities/system-config.entity';
 import { WechatPayService, PaymentRequestError, WechatApiError, OrderQueryResult, CloseOrderResult, PaymentParams } from '../wechat-pay/wechat-pay.service';
 import { SystemConfigService } from '../system-config/system-config.service';
 import { MemberService } from '../member/member.service';
 import { UserProfileRepository } from '../../repositories/user-profile.repository';
-import { FreeEligibilityResult } from './dto/free-eligibility.dto';
+import { DailyFreeQuotaInfo, FreeEligibilityResult } from './dto/free-eligibility.dto';
+import { TodayQuotaOverview } from './dto/today-quota.dto';
 import { normalizeIdCard } from '../../common/utils/id-card.util';
 import { PaymentException, PaymentErrorCode } from '../../common/payment-errors';
 import { PassengerBusinessException, PassengerErrorCode } from '../../common/passenger-business.exception';
@@ -34,6 +35,24 @@ import { AppLogLevel, AppLogSource, AppLogCategory } from '../../entities/app-lo
  * 支付准备整体预算（22 秒）。前端 25 秒超时为响应留出余量。
  */
 const PAYMENT_PREPARATION_DEADLINE_MS = 22 * 1000;
+
+/**
+ * 今日名额「紧张」阈值：剩余 <= 总限额 × 本比例 时，接口才下发精确剩余数字。
+ *
+ * 【为什么需要这个阈值】单价是公开的，故 已约人数 × 单价 ≈ 每日营收。而
+ * 「剩余 = 总量 − 已约」，若一直下发精确剩余，任何人从当天 00:00 开始轮询、
+ * 取首尾差值就等于当天的已约人数 —— 根本不需要知道总量。
+ * 只在剩余偏低时才给数字，观察者拿不到当日基线，减法失效。
+ *
+ * 日后如需调整口径，可提升为后台配置项。
+ */
+const QUOTA_TIGHT_RATIO = 0.3;
+
+/**
+ * 今日名额概览的进程内缓存时长（5 秒）。
+ * 远小于前端 90 秒轮询间隔，对用户完全无感；给匿名接口一个最低限度的抓取成本。
+ */
+const TODAY_QUOTA_CACHE_MS = 5 * 1000;
 
 /**
  * 支付准备成功结果缓存时长（30 秒）
@@ -182,6 +201,12 @@ export class BookingService {
     // ── 支付 single-flight 与短期结果缓存（进程内，不写库，Nest 重启后自然清空）──
     private readonly paymentFlights = new Map<string, Promise<PaymentParams>>();
     private readonly recentPaymentResults = new Map<string, RecentPaymentResult>();
+
+    // ── 今日名额概览的进程内短缓存（不写库）──
+    // 该接口匿名且无限流（仓库既无 ThrottlerModule 也无 CacheModule），被脚本高频
+    // 抓取会挤压 SQLite 单 writer 的写预算。5 秒 << 前端 90 秒轮询间隔，对用户完全
+    // 无感，最坏情况下每 5 秒才真查一次。
+    private todayQuotaCache: { key: string; value: TodayQuotaOverview; expireAt: number } | null = null;
 
     // ── 定时任务独立运行标记（防止自身重入）──
     private readonly taskRunning = {
@@ -399,6 +424,94 @@ export class BookingService {
     }
 
     /**
+     * 每日免费名额快照（唯一口径来源）。
+     *
+     * preview / createBooking / 今日名额接口三处必须都走本方法，禁止再内联一份统计：
+     * 口径一旦分叉就会出现「页面显示还能免费、下单却收费」这类对用户的承诺违约。
+     *
+     * 口径（逐字沿用既有行为）：
+     *  - isFree=true 且 freeReason='dailyQuota'（显式排除 'member' 与 'age'）
+     *  - 按 wechatOpenId 去重：同一用户多单只占 1 个名额
+     *  - 不按 status 过滤：取消 / 退款不退还名额
+     *  - 「今天」由本方法内部 beijingDateStr() 决定；targetDateStr 只用于回答
+     *    「用户选的日期是不是今天」，绝不参与范围查询 —— 调用方无法让统计落到别的一天
+     *
+     * @param em 事务 EM 或 DataSource。createBooking 必须传事务 EM，保证判定查询与
+     *           createBooking 里抢 SQLite 写锁的那条 UPDATE 处于同一事务上下文（免费名额不超卖）
+     * @param paymentConfig 已读出的支付配置（避免事务内重复读配置表）
+     * @param targetDateStr 用户选择的预约日期 (YYYY-MM-DD)
+     * @param options.wechatOpenId 传入时额外返回该用户今日是否已享过每日免费
+     */
+    private async buildDailyFreeQuotaInfo(
+        em: EntityManager | DataSource,
+        paymentConfig: PaymentConfig,
+        targetDateStr: string,
+        options?: { wechatOpenId?: string },
+    ): Promise<DailyFreeQuotaInfo> {
+        const freeEnabled = paymentConfig.freeQuotaEnabled === true;
+        const freeLimit = paymentConfig.freeQuotaLimit ?? 100;
+
+        // 用纯日期字符串比较，避免 new Date() 产生的 ISO 字符串与 SQLite date 列不一致；
+        // “今天”按北京时间（UTC+8）取，避免 UTC 日期在北京时间凌晨跨天误判
+        const target = targetDateStr.length >= 10 ? targetDateStr.substring(0, 10) : targetDateStr;
+        const today = beijingDateStr(); // YYYY-MM-DD，北京时间口径
+        const bookingIsToday = target === today;
+
+        // 活动未开启、或预约日期非今天：不参与每日免费。
+        // 沿用既有语义：used 恒为 0、remaining 恒等于 limit（前端据此隐藏整项）
+        if (!freeEnabled || !bookingIsToday) {
+            return {
+                enabled: freeEnabled,
+                limit: freeLimit,
+                used: 0,
+                remaining: Math.max(0, freeLimit),
+                bookingIsToday,
+                userHasFreeBooking: false,
+            };
+        }
+
+        const bookingRepo = em.getRepository(Booking);
+        // SQLite date 列只存日期，用纯日期字符串做范围查询（>= today AND <= today 即当天）
+        const dayStart = today;
+        const nextDay = today;
+
+        // 当日已用免费名额（去重用户数，仅算 dailyQuota，不含 member / age）。
+        // 注意：刻意不按 status 过滤 —— 取消 / 退款不退还名额，与下单时的判定严格一致
+        const freeCountResult = await bookingRepo
+            .createQueryBuilder('booking')
+            .select('COUNT(DISTINCT booking.wechatOpenId)', 'count')
+            .where('booking.isFree = :isFree', { isFree: true })
+            .andWhere('booking.freeReason = :reason', { reason: 'dailyQuota' })
+            .andWhere('booking.bookingDate >= :dayStart', { dayStart })
+            .andWhere('booking.bookingDate <= :nextDay', { nextDay })
+            .getRawOne();
+        const used = parseInt(freeCountResult?.count || '0', 10);
+
+        // 当前用户今日是否已享过每日免费（同样仅算 dailyQuota）
+        let userHasFreeBooking = false;
+        if (options?.wechatOpenId) {
+            const userFreeCount = await bookingRepo
+                .createQueryBuilder('booking')
+                .where('booking.wechatOpenId = :openid', { openid: options.wechatOpenId })
+                .andWhere('booking.isFree = :isFree', { isFree: true })
+                .andWhere('booking.freeReason = :reason', { reason: 'dailyQuota' })
+                .andWhere('booking.bookingDate >= :dayStart', { dayStart })
+                .andWhere('booking.bookingDate <= :nextDay', { nextDay })
+                .getCount();
+            userHasFreeBooking = userFreeCount > 0;
+        }
+
+        return {
+            enabled: true,
+            limit: freeLimit,
+            used,
+            remaining: Math.max(0, freeLimit - used),
+            bookingIsToday,
+            userHasFreeBooking,
+        };
+    }
+
+    /**
      * 统一免费资格判定（preview 与 createBooking 共用，保证预览结果与最终创建结果一致）
      * @param wechatOpenId 微信 OpenID（历史入参，会员判定不再依赖；保留以不破坏调用方）
      * @param passengers 出行人员列表
@@ -423,7 +536,6 @@ export class BookingService {
     ): Promise<FreeEligibilityResult> {
         const em = options?.entityManager ?? this.dataSource;
         const configRepo = em.getRepository(SystemConfig);
-        const bookingRepo = em.getRepository(Booking);
 
         // 0. 统一人员业务校验与年龄定价（preview 与 create 共用，先于任何数据库查询；
         //    create 事务内的纯函数异常会使事务干净回滚）
@@ -439,19 +551,9 @@ export class BookingService {
         const freeEnabled = paymentConfig.freeQuotaEnabled === true;
         const freeLimit = paymentConfig.freeQuotaLimit ?? 100;
 
-        // 2. 是否今天（仅预约日期为今天时才参与每日免费）
-        // 用纯日期字符串比较，避免 new Date() 产生的 ISO 字符串与 SQLite date 列不一致；
-        // “今天”按北京时间（UTC+8）取，避免 UTC 日期在北京时间凌晨跨天误判
-        const targetDateStr = bookingDate.length >= 10 ? bookingDate.substring(0, 10) : bookingDate;
-        const todayDateStr = beijingDateStr(); // YYYY-MM-DD，北京时间口径
-        const bookingIsToday = targetDateStr === todayDateStr;
-        // SQLite date 列只存日期，用纯日期字符串做范围查询
-        const todayStart = todayDateStr;
-        const nextDay = todayDateStr; // >= :todayStart AND <= :nextDay 即当天
-
         const personCount = passengers.length;
 
-        // 3. 会员判定：仅「自驾 + 摩托车」才查会员，按身份证+车牌双匹配
+        // 2. 会员判定：仅「自驾 + 摩托车」才查会员，按身份证+车牌双匹配
         //    身份证：任一乘客身份证命中会员登记身份证
         //    车牌：下单车牌命中会员登记车牌（多个，分号分隔）其一
         const isMotorcycle = travelMode === TravelMode.SELF_DRIVING && vehicleType === VehicleType.WHEEL_MOTORCYCLE;
@@ -478,51 +580,13 @@ export class BookingService {
               }
             : null;
 
-        // 每日免费名额统计（修复 bug：仅统计 freeReason='dailyQuota'，排除会员订单）
-        let quotaUsed = 0;
-        let userHasFreeBooking = false;
-        if (freeEnabled && bookingIsToday) {
-            // 当日已用免费名额（去重用户数，仅算 dailyQuota，不含 member）
-            const freeCountResult = await bookingRepo
-                .createQueryBuilder('booking')
-                .select('COUNT(DISTINCT booking.wechatOpenId)', 'count')
-                .where('booking.isFree = :isFree', { isFree: true })
-                .andWhere('booking.freeReason = :reason', { reason: 'dailyQuota' })
-                .andWhere('booking.bookingDate >= :dayStart', { dayStart: todayStart })
-                .andWhere('booking.bookingDate <= :nextDay', { nextDay })
-                .getRawOne();
-            quotaUsed = parseInt(freeCountResult?.count || '0', 10);
-
-            // 当前用户今日是否已享过每日免费（同样仅算 dailyQuota）
-            const userFreeCount = await bookingRepo
-                .createQueryBuilder('booking')
-                .where('booking.wechatOpenId = :openid', { openid: wechatOpenId })
-                .andWhere('booking.isFree = :isFree', { isFree: true })
-                .andWhere('booking.freeReason = :reason', { reason: 'dailyQuota' })
-                .andWhere('booking.bookingDate >= :dayStart', { dayStart: todayStart })
-                .andWhere('booking.bookingDate <= :nextDay', { nextDay })
-                .getCount();
-            userHasFreeBooking = userFreeCount > 0;
-        }
-
-        const freeQuotaInfo = {
-            enabled: freeEnabled,
-            limit: freeLimit,
-            used: quotaUsed,
-            remaining: Math.max(0, freeLimit - quotaUsed),
-            bookingIsToday,
-            userHasFreeBooking,
-        };
-
-        // 查询当天已预约总人数（pending + confirmed），用于前端展示"您是第 N 位预约"
-        const targetDateStrForQuery = bookingDate.length >= 10 ? bookingDate.substring(0, 10) : bookingDate;
-        const rankResult = await bookingRepo
-            .createQueryBuilder('booking')
-            .select('COALESCE(SUM(booking.personCount), 0)', 'totalPeople')
-            .where('booking.bookingDate = :date', { date: targetDateStrForQuery })
-            .andWhere('booking.status IN (:...activeStatuses)', { activeStatuses: ['pending', 'confirmed'] })
-            .getRawOne();
-        const bookingRank = parseInt(rankResult?.totalPeople || '0', 10);
+        // 3. 每日免费名额与「是否今天」（口径唯一来源，见 buildDailyFreeQuotaInfo 注释）。
+        //    同时产出 bookingIsToday，避免「是否今天」这个判断在本文件里出现两次而悄悄分叉
+        const freeQuotaInfo = await this.buildDailyFreeQuotaInfo(em, paymentConfig, bookingDate, {
+            wechatOpenId,
+        });
+        const { bookingIsToday, userHasFreeBooking } = freeQuotaInfo;
+        const quotaUsed = freeQuotaInfo.used;
 
         // 4. 会员免费命中：摩托车 + 身份证命中 + 车牌命中
         if (isMotorcycle && activeMember && memberIdCardMatched) {
@@ -545,7 +609,6 @@ export class BookingService {
                     passengerPricing: composed.passengerPricing,
                     memberInfo,
                     freeQuotaInfo,
-                    bookingRank,
                 };
             }
         }
@@ -565,22 +628,24 @@ export class BookingService {
                 passengerPricing: composed.passengerPricing,
                 memberInfo,
                 freeQuotaInfo,
-                bookingRank,
             };
         }
 
         // 6. 收费分支：按优先级定 reason
-        //    摩托车且身份证命中会员但车牌未命中 → member_plate_not_matched
-        //    摩托车但身份证未命中任何会员 → member_idcard_not_matched
+        //    摩托车且身份证命中会员但车牌未命中 → member_plate_not_matched（确为会员，仅车牌未登记）
+        //    摩托车但未找到任何会员记录（非会员）→ not_member（会员免费不适用，前端不展示原因文案）
         //    每日免费活动开启但名额用完/已享过/非今日 → daily_quota_* / not_today
         //    每日免费活动未开启（关闭）→ no_free_activity（活动隐藏，不向用户暴露免费相关文案）
         let reason: FreeEligibilityResult['reason'];
         if (isMotorcycle && activeMember && memberIdCardMatched) {
             // 身份证命中会员但车牌未命中（走到这里说明车牌比对失败）
             reason = 'member_plate_not_matched';
-        } else if (isMotorcycle && !memberIdCardMatched) {
-            // 摩托车但身份证未命中任何有效会员
-            reason = 'member_idcard_not_matched';
+        } else if (isMotorcycle && !activeMember) {
+            // 摩托车但未找到任何有效会员记录：会员免费不适用，按正常收费且不展示原因。
+            // 不可报 member_idcard_not_matched —— activeMember 与 memberIdCardMatched 同生共死，
+            // 真正“身份证与会员记录不一致”的场景在上面的循环里不可达，
+            // 那样写只会把「从来没注册过会员」误报成「身份证与会员记录不一致」。
+            reason = 'not_member';
         } else if (freeEnabled && bookingIsToday) {
             if (userHasFreeBooking) {
                 reason = 'daily_quota_used';
@@ -610,7 +675,6 @@ export class BookingService {
             passengerPricing: composed.passengerPricing,
             memberInfo,
             freeQuotaInfo,
-            bookingRank,
         };
     }
 
@@ -670,6 +734,61 @@ export class BookingService {
      */
     async getBookingStatsByDate(bookingDate: string) {
         return await this.bookingRepository.getBookingStatsByDate(bookingDate);
+    }
+
+    /**
+     * 今日名额概览（GET /bookings/today-quota 的唯一数据来源）
+     *
+     * 【安全边界】响应字段的约束见 dto/today-quota.dto.ts 顶部说明。要点：
+     * 「今天」由服务端 beijingDateStr() 决定，本方法签名里没有任何日期入参，
+     * 因此不存在被拼参数回捞历史序列、反推每日总量的可能。
+     */
+    async getTodayQuotaOverview(): Promise<TodayQuotaOverview> {
+        const today = beijingDateStr(); // 固定今天，不接受外部日期
+
+        // 进程内短缓存：本接口匿名且无限流，防止被高频抓取挤压 SQLite 写预算
+        const cached = this.todayQuotaCache;
+        if (cached && cached.key === today && cached.expireAt > Date.now()) {
+            return cached.value;
+        }
+
+        // 容量：与 createBooking 的容量校验完全同一口径。
+        // morningMaxPeople 即全天总限额（上下午概念已废弃），但历史数据里 afternoon 桶仍有
+        // 记录，必须两桶相加，否则会低估已约人数、高估剩余名额
+        const timeSlotLimit = await this.systemConfigService.getTimeSlotLimit();
+        const maxPeople = timeSlotLimit.morningMaxPeople;
+        const stats = await this.bookingRepository.getBookingStatsByDate(today);
+        const currentPeople = stats.morning.totalPeople + stats.afternoon.totalPeople;
+        const remaining = Math.max(0, maxPeople - currentPeople);
+
+        // 免费名额：与 preview / 下单共用同一私有方法（不传 openid，省掉一次用户维度查询）
+        const paymentConfig = await this.systemConfigService.getPaymentConfig();
+        const freeQuota = await this.buildDailyFreeQuotaInfo(this.dataSource, paymentConfig, today);
+
+        const overview: TodayQuotaOverview = {
+            date: today,
+            // 【禁止新增字段】total / maxPeople / currentPeople / bookedPeople / bookingCount：
+            // 「已约人数 = 总限额 − 剩余」，返回总限额等于把已约人数直接送出去。
+            // level='plenty' 时刻意不带 remaining —— 若一直下发精确剩余，任何人从当天 00:00
+            // 开始轮询、取首尾差值就等于当天的已约人数（见 QUOTA_TIGHT_RATIO 注释）
+            capacity: remaining <= 0
+                ? { level: 'full' }
+                : remaining <= maxPeople * QUOTA_TIGHT_RATIO
+                    ? { level: 'limited', remaining }
+                    : { level: 'plenty' },
+            freeQuota: {
+                enabled: freeQuota.enabled,
+                limit: freeQuota.limit,
+                remaining: freeQuota.remaining,
+            },
+        };
+
+        this.todayQuotaCache = {
+            key: today,
+            value: overview,
+            expireAt: Date.now() + TODAY_QUOTA_CACHE_MS,
+        };
+        return overview;
     }
 
     /**
