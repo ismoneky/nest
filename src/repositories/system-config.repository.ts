@@ -2,6 +2,7 @@ import { Injectable, InternalServerErrorException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { SystemConfig } from '../entities/system-config.entity';
+import { serialSave } from '../common/transaction-runner';
 
 /**
  * 系统配置数据访问层
@@ -35,7 +36,7 @@ export class SystemConfigRepository {
                     noticeConfigJson:
                         '{"enabled":true,"content":"风车天路目前半开放，仅开放鲍庄出入口通行；每日限行100辆，请合理安排出行时间，敬请知悉。"}',
                 });
-                await this.configRepository.save(config);
+                await serialSave(this.configRepository, config);
             }
 
             return config;
@@ -64,7 +65,7 @@ export class SystemConfigRepository {
                 Object.assign(config, updateData);
             }
 
-            return await this.configRepository.save(config);
+            return await serialSave(this.configRepository, config);
         } catch (error) {
             throw new InternalServerErrorException(error instanceof Error ? error.message : 'Failed to update system config');
         }

@@ -9,6 +9,7 @@ import { UpdateBookingDto } from '../modules/booking/dto/updateBooking.dto';
 import { DataSource, EntityManager } from 'typeorm';
 import { randomUUID } from 'crypto';
 import { BookingDashboardResponse } from '../modules/admin/interfaces/booking-dashboard.interface';
+import { serialSave, serialTransaction } from '../common/transaction-runner';
 
 /**
  * 对账任务类型
@@ -47,7 +48,7 @@ export class BookingRepository {
                 bookingDate: new Date(createBookingDto.bookingDate),
             });
 
-            const savedBooking = await this.bookingRepository.save(booking);
+            const savedBooking = await serialSave(this.bookingRepository, booking);
             return Array.isArray(savedBooking) ? savedBooking[0] : savedBooking;
         } catch (error) {
             throw new InternalServerErrorException(error instanceof Error ? error.message : 'Failed to create booking');
@@ -70,7 +71,7 @@ export class BookingRepository {
             }
 
             Object.assign(booking, updateBookingDto);
-            return await this.bookingRepository.save(booking);
+            return await serialSave(this.bookingRepository, booking);
         } catch (error) {
             if (error instanceof NotFoundException) {
                 throw error;
@@ -780,7 +781,9 @@ export class BookingRepository {
         nextRetryAt: number | null,
     ): Promise<void> {
         const now = Date.now();
-        await this.dataSource.transaction(async (em) => {
+        // 经事务串行器排队：sqlite 全进程一条连接，两处并发事务会打坏 BEGIN/COMMIT 记账
+        // （本方法由对账 cron 循环调用，与用户下单的事务同源冲突），见 common/transaction-runner.ts
+        await serialTransaction(this.dataSource, async (em) => {
             await this.upsertAnomaly(bookingId, type, errorCode, summary, nextRetryAt, now, em);
             await em
                 .createQueryBuilder()
@@ -799,7 +802,7 @@ export class BookingRepository {
         // SQLite 不支持 DELETE ... LIMIT，用子查询限定每批条数，保证短事务。
         // sqlite3 驱动的 .query() 对 DELETE 返回空数组（无 affected/changes），必须用事务
         // 固定同一连接，DELETE 后立即 SELECT changes() 取删除行数。
-        return this.dataSource.transaction(async (em) => {
+        return serialTransaction(this.dataSource, async (em) => {
             await em.query(
                 `DELETE FROM booking_anomalies WHERE id IN (
                     SELECT id FROM booking_anomalies

@@ -5,6 +5,7 @@ import { Announcement } from '../entities/announcement.entity';
 import { CreateAnnouncementDto } from '../modules/announcement/dto/create-announcement.dto';
 import { UpdateAnnouncementDto } from '../modules/announcement/dto/update-announcement.dto';
 import { randomUUID } from 'crypto';
+import { serialRemove, serialSave } from '../common/transaction-runner';
 
 /**
  * 公告数据访问层
@@ -25,7 +26,7 @@ export class AnnouncementRepository {
                 announcementId: randomUUID(),
                 ...dto,
             });
-            return await this.announcementRepository.save(announcement);
+            return await serialSave(this.announcementRepository, announcement);
         } catch (error) {
             throw new InternalServerErrorException(error instanceof Error ? error.message : 'Failed to create announcement');
         }
@@ -91,7 +92,7 @@ export class AnnouncementRepository {
         try {
             const announcement = await this.findById(announcementId);
             Object.assign(announcement, dto);
-            return await this.announcementRepository.save(announcement);
+            return await serialSave(this.announcementRepository, announcement);
         } catch (error) {
             if (error instanceof NotFoundException) {
                 throw error;
@@ -106,7 +107,7 @@ export class AnnouncementRepository {
     async delete(announcementId: string): Promise<Announcement> {
         try {
             const announcement = await this.findById(announcementId);
-            return await this.announcementRepository.remove(announcement);
+            return await serialRemove(this.announcementRepository, announcement);
         } catch (error) {
             if (error instanceof NotFoundException) {
                 throw error;

@@ -3,6 +3,7 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { User } from '../entities/user.entity';
 import { randomUUID } from 'crypto';
+import { serialSave } from '../common/transaction-runner';
 
 @Injectable()
 export class UserRepository {
@@ -22,7 +23,7 @@ export class UserRepository {
                     userId: randomUUID(),
                     wechatOpenId: params.wechatOpenId,
                 });
-                await this.userRepository.save(user);
+                await serialSave(this.userRepository, user);
             }
 
             return user;

@@ -44,6 +44,10 @@ import { APP_FILTER } from '@nestjs/core';
             // （此前 busy_timeout 实际为 0，2026-08-16 12:31 事务报错后修正，
             // 见 docs/implementation-todo.md「TYPEORM_PRAGMA_CONFIGURATION_IGNORED」）；
             // WAL 与 synchronous 按支付可靠性设计暂不启用，另行验证后决策。
+            //
+            // 注意 busyTimeout 只对「其它连接持锁」有效：sqlite 驱动全进程共用一条连接，
+            // 进程内并发的事务之间根本不会走到这个等待。进程内并发由
+            // src/common/transaction-runner.ts 串行化（2026-09-13 线上事故的修复）。
             busyTimeout: 5000,
         }),
         // 日志库独立 DataSource（logs.db）：只注册 AppLog，synchronize 无条件关闭，
@@ -55,6 +59,10 @@ import { APP_FILTER } from '@nestjs/core';
             synchronize: false,
             logging: process.env.DATABASE_LOGGING === 'true',
             entities: [AppLog],
+            // 与主库同款：写锁冲突时等 5 秒而不是立即报错（此前这条漏了，日志清理事务
+            // 与应用侧写日志撞锁时会直接失败）。logs.db 只有 runLogCleanup 一处事务，
+            // 不存在主库那种进程内并发事务问题，故无需走 transaction-runner。
+            busyTimeout: 5000,
         }),
         ScheduleModule.forRoot(),
         LoggingModule,

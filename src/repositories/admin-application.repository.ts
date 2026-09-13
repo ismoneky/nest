@@ -3,6 +3,7 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { randomUUID } from 'crypto';
 import { AdminApplication, AdminApplicationStatus } from '../entities/admin-application.entity';
+import { serialSave } from '../common/transaction-runner';
 
 @Injectable()
 export class AdminApplicationRepository {
@@ -19,7 +20,7 @@ export class AdminApplicationRepository {
             name,
             status: AdminApplicationStatus.PENDING,
         });
-        return this.repo.save(application);
+        return serialSave(this.repo, application);
     }
 
     async findPendingByOpenid(openid: string): Promise<AdminApplication | null> {

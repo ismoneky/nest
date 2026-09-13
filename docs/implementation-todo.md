@@ -239,6 +239,48 @@ sqlite3 data/prod.db "DROP TABLE booking_anomalies; DROP INDEX idx_bookings_stat
 
 - `logId` 唯一索引保证不产生重复记录。**已实现**：`persistClientBatch` 使用 INSERT OR IGNORE，重复 logId 视为已接受并计入 `acceptedLogIds`，客户端可安全删除。
 
+## 事故记录：SQLite 单连接并发事务（2026-09-13，已修复）
+
+**现象**：线上出现一次事务阻塞后，写入全部停留在 Node 内存未落盘，任何访问数据库的请求都返回 `database is locked`。
+
+**根因**（`typeorm` 0.3.28 + `type: 'sqlite'`）：
+
+1. **全进程只有一条 sqlite 连接** —— `SqliteDriver.createQueryRunner()` 永远返回同一个 runner，进程内不存在真正的并发事务。
+2. **驱动不拦嵌套事务** —— `AbstractSqliteDriver.transactionSupport = 'nested'`，而 `startTransaction()` 顶部的 `TransactionAlreadyStartedError` 守卫只对 `'simple'` 生效，于是两个并发调用会各发一条 `BEGIN TRANSACTION`。
+3. **记账错位** —— 第二个 `BEGIN` 报 `cannot start a transaction within a transaction`，其失败清理发出的**裸 `ROLLBACK` 回滚掉的是另一个请求的事务**；`transactionDepth > 1` 时 commit/rollback 走 `RELEASE` / `ROLLBACK TO SAVEPOINT`，而后者既不结束事务也不复位 `isTransactionActive`。
+4. **结果** —— 留下**没有任何代码会去提交的开放事务**：写入只在内存、外部访问报锁、重启即丢。事务本身不阻塞时不会暴露，所以此前一直潜伏。
+5. **放大器**：`EntityPersistExecutor` 在 `!queryRunner.isTransactionActive` 时会自行 BEGIN/COMMIT，因此**每一处 `repo.save()` / `repo.remove()` 都是一次事务发起**（本仓库共 19 处），未排队就会把「并发事务」装回来，写入还可能被卷进别人的事务随之回滚（典型：支付回调更新订单状态时被一个失败的下单事务带走 → 用户付了钱、订单仍是未支付）。`createBooking` 事务体内的 `setImmediate` 会在同一连接上另起一次 BEGIN/COMMIT，与父事务的 COMMIT 交错，是本次的触发点之一。
+
+**修复**（`src/common/transaction-runner.ts`，模块级单例，非 Nest provider）：
+
+- 按 DataSource 建 **FIFO 串行队列**（`WeakMap`，主库与 logs 库互不阻塞）：`serialTransaction`（显式事务）、`serialSave` / `serialRemove`（包装自开事务的 save/remove）、`serialWrite`（其它非事务写）。
+- `AsyncLocalStorage` 标记事务上下文：**禁止嵌套事务**（事务内再调 `serialTransaction` 直接抛错，要求显式透传 EntityManager）；`serialWrite` 在事务内调用则并入外层事务，不排队、不碰 BEGIN/COMMIT。
+- 看门狗与超时：等锁 >5s 告警、事务体 >30s 告警、等锁 >30s 拒绝并给出「唯一恢复手段是重启进程」的提示（超时的等待者持「放弃」标志，绝不在事后偷偷执行）。
+- 同步改动：`createBooking` 事务体内的 `setImmediate` 移到事务提交之后并经 `serialWrite` 排队；`booking.repository` 两处显式事务改走 `serialTransaction`；`app.module.ts` 给 logs DataSource 补 `busyTimeout: 5000`。
+
+**为什么不在 SQL 层排队（为什么必须把等待搬到事件循环）**：
+
+修复前的 `createBooking` 事务里那条「无副作用 UPDATE 抢 RESERVED 锁 + `busyTimeout: 5000`」就是**在 SQL 层排队**的尝试 —— 让后到的写事务在数据库里等锁。这条路线在 sqlite 上有独立的高危副作用：`node-sqlite3` 是原生异步驱动，SQL 跑在 **libuv 线程池**（默认 4 线程）上，而「等锁」会**占住线程池线程不动**。4 个这样的等待即可占满线程池，此后所有需要线程池的工作全部饿死 —— 首当其冲是 `dns.lookup`（HTTP 建连前的域名解析）与 socket 建立，于是微信支付请求发不出去、页面一直转圈。这正是 `scripts/diagnose-sqlite-payment-contention.js` 里 `SQLITE_LIBUV_COUPLING`（severity: high，"SQLite lock waits can starve DNS/socket setup in the default libuv threadpool"）所指，该脚本另有一条 `KEEPALIVE_BYPASSES_LOOKUP` 发现被采纳在 `wechat-pay.service.ts:111/120`（HTTPS Agent 已开 `keepAlive`）。
+
+**结论：在等锁这条路上，"等"本身就是危险动作。** 串行器把等待从线程池搬回了事件循环：排队期间不占用任何线程池线程、也不向 sqlite 下发任何语句，因此「线程池被等锁占满」这个成因在新路径上不存在。本机临时库实测（60 并发）：
+
+| 场景 | 结果 |
+| --- | --- |
+| 修复前写法（并发 `dataSource.transaction`） | 60/60 请求报错（`cannot start a transaction within a transaction`），61 行只落 2 行 → 59 笔写入丢失 |
+| `serialTransaction` | 0 错误，61/61 行落盘，总耗时 245ms |
+| `serialSave`（仓库写入路径） | 0 错误，61/61 行落盘，255ms |
+| 写突发期间的读（模拟支付状态轮询） | 突发期间 31 次读，延迟 p50=0ms / p95=3ms / max=3ms —— **读不走队列** |
+| `dns.lookup` 探针（线程池是否被占） | 加载期间 p95=1ms / max=5ms；事件循环延迟 max 8ms |
+
+**部署约束（重要）**：串行器是**进程内**的。必须保持**单进程单写者**（当前 pm2 单实例 + 进程内 cron 符合）。若将来开多实例、或另起进程/脚本连同一个 db 文件，跨进程的锁等待会重新出现（`busyTimeout` 只把等待压到 5s，等待期间仍占线程池）。
+
+**已知残留（后续项，非本次范围）**：
+
+1. **未启用 WAL** —— 开启会永久改变生产库的 journal_mode（若库位于 NFS / Windows bind mount 上有损坏风险），且 WAL 治不了上述记账错位，只是让外部读不再撞锁。`busyTimeout` 只对「其它连接持锁」有效，进程内并发走不到它。
+2. **`wechat-pay.controller` 的异步处理段未整体包锁** —— webhook 先应答 200 再 `setImmediate` 异步处理（内部含网络调用，不适合放进串行队列），其中的 repository 条件更新已由串行器覆盖。
+3. **`createBooking` 事务未瘦身** —— 免费名额判定必须与写在同一事务内才有防超卖意义，串行化后已无碰撞风险，搬出去反而引入超卖。
+4. **logs 库唯一事务点**（`logging.service.ts` 日志清理）保持原样：独立 DB、单点发起，不存在本节的并发形态。
+
 ## 实现说明（非问题，供后续维护）
 
 1. 定时任务分钟表（Asia/Shanghai）：支付兜底 `00,05,...,55`；超时关单 `02,07,...,57`；退款对账 `04,19,34,49`；异常重试 `08,38`；历史订单 `13`；日志清理 `03:21`（每日）；异常表清理周日 `03:16`。均为 Cron 秒字段 `0`。

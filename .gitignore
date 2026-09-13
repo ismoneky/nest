@@ -15,6 +15,12 @@ dist
 # Database
 data/
 
+# 事故恢复导出与备份（含乘客姓名/手机号/身份证号，严禁入库或外发）
+recovery-export-*/
+import-report-*.json
+*.pre-import-*
+*.rawcopy-*
+
 # OS
 .DS_Store
 Thumbs.db

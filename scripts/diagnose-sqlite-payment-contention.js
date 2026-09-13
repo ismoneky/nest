@@ -84,9 +84,21 @@ function requestMockPayment({ port, agent }) {
         path: '/v3/pay/transactions/jsapi',
         method: 'POST',
         agent,
-        lookup: (hostname, _options, callback) => {
-          dns.lookup(hostname, { family: 4 }, (error, address, family) => {
+        // 自定义 lookup 必须**透传调用方给的 options**。net.js 传进来的是
+        // { hints: 0, all: true }（Node 18.13+ autoSelectFamily 的默认行为），
+        // 这种情况下它期望回调收到 [{ address, family }] 数组；若无视 options 硬回单一地址，
+        // 下游解构 addresses[0].address 会得到 undefined，报
+        // ERR_INVALID_IP_ADDRESS: Invalid IP address: undefined，整个场景直接崩。
+        lookup: (hostname, options, callback) => {
+          dns.lookup(hostname, { ...options, family: 4 }, (error, address, family) => {
             if (error) return callback(error);
+            if (Array.isArray(address)) {
+              const bad = address.find((entry) => !entry.address.startsWith('127.'));
+              if (bad) {
+                return callback(new Error(`Refusing non-loopback localhost address: ${bad.address}`));
+              }
+              return callback(null, address);
+            }
             if (!address.startsWith('127.')) {
               return callback(new Error(`Refusing non-loopback localhost address: ${address}`));
             }

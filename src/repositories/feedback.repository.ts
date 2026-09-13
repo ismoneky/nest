@@ -3,6 +3,7 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { randomUUID } from 'crypto';
 import { Feedback } from '../entities/feedback.entity';
+import { serialSave } from '../common/transaction-runner';
 
 @Injectable()
 export class FeedbackRepository {
@@ -18,7 +19,7 @@ export class FeedbackRepository {
             phone,
             content,
         });
-        return this.repo.save(feedback);
+        return serialSave(this.repo, feedback);
     }
 
     async findAll(): Promise<Feedback[]> {

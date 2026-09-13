@@ -3,6 +3,7 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { randomUUID } from 'crypto';
 import { Member, MemberStatus } from '../entities/member.entity';
+import { serialRemove, serialSave } from '../common/transaction-runner';
 
 /**
  * 月卡会员数据访问层
@@ -33,7 +34,7 @@ export class MemberRepository {
                 ...data,
                 status: MemberStatus.ACTIVE,
             });
-            return await this.memberRepository.save(member);
+            return await serialSave(this.memberRepository, member);
         } catch (error) {
             throw new InternalServerErrorException(error instanceof Error ? error.message : 'Failed to create member');
         }
@@ -164,7 +165,7 @@ export class MemberRepository {
                 throw new NotFoundException(`会员 ${memberId} 不存在`);
             }
             Object.assign(member, data);
-            return await this.memberRepository.save(member);
+            return await serialSave(this.memberRepository, member);
         } catch (error) {
             if (error instanceof NotFoundException) {
                 throw error;
@@ -182,7 +183,7 @@ export class MemberRepository {
             if (!member) {
                 throw new NotFoundException(`会员 ${memberId} 不存在`);
             }
-            await this.memberRepository.remove(member);
+            await serialRemove(this.memberRepository, member);
         } catch (error) {
             if (error instanceof NotFoundException) {
                 throw error;

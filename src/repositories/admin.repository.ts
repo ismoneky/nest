@@ -3,6 +3,7 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { Admin } from '../entities/admin.entity';
 import * as bcrypt from 'bcrypt';
+import { serialSave } from '../common/transaction-runner';
 
 /**
  * 管理员数据访问层
@@ -67,7 +68,7 @@ export class AdminRepository {
                 password: hashedPassword,
                 name,
             });
-            return await this.adminRepository.save(admin);
+            return await serialSave(this.adminRepository, admin);
         } catch (error) {
             throw new InternalServerErrorException(error instanceof Error ? error.message : 'Failed to create admin');
         }

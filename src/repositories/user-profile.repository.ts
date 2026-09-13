@@ -3,6 +3,7 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { randomUUID } from 'crypto';
 import { UserProfile } from '../entities/user-profile.entity';
+import { serialRemove, serialSave } from '../common/transaction-runner';
 
 @Injectable()
 export class UserProfileRepository {
@@ -21,20 +22,20 @@ export class UserProfileRepository {
             wechatOpenId,
             ...data,
         });
-        return this.repo.save(profile);
+        return serialSave(this.repo, profile);
     }
 
     async update(profileId: string, wechatOpenId: string, data: Partial<{ name: string; phone: string; idCard: string }>): Promise<UserProfile> {
         const profile = await this.repo.findOne({ where: { profileId, wechatOpenId } });
         if (!profile) throw new NotFoundException('常用人员不存在');
         Object.assign(profile, data);
-        return this.repo.save(profile);
+        return serialSave(this.repo, profile);
     }
 
     async delete(profileId: string, wechatOpenId: string): Promise<void> {
         const profile = await this.repo.findOne({ where: { profileId, wechatOpenId } });
         if (!profile) throw new NotFoundException('常用人员不存在');
-        await this.repo.remove(profile);
+        await serialRemove(this.repo, profile);
     }
 
     /**
@@ -77,6 +78,6 @@ export class UserProfileRepository {
             }),
         );
 
-        await this.repo.save(entities);
+        await serialSave(this.repo, entities);
     }
 }

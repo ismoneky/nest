@@ -19,6 +19,7 @@ import { TodayQuotaOverview } from './dto/today-quota.dto';
 import { normalizeIdCard } from '../../common/utils/id-card.util';
 import { PaymentException, PaymentErrorCode } from '../../common/payment-errors';
 import { PassengerBusinessException, PassengerErrorCode } from '../../common/passenger-business.exception';
+import { serialTransaction, serialWrite } from '../../common/transaction-runner';
 import {
     AgePricingSummary,
     calculateAgePricing,
@@ -299,104 +300,107 @@ export class BookingService {
         // 事务内：原子地判断免费资格并创建订单，避免并发下免费名额超卖
         let createdBooking: Booking;
         try {
-            createdBooking = await this.dataSource.transaction(async (entityManager) => {
-            const bookingRepo = entityManager.getRepository(Booking);
-            const configRepo = entityManager.getRepository(SystemConfig);
-
-            // SQLite 使用 DEFERRED 事务，读操作不会加锁，导致并发事务可能同时读到相同的免费名额计数后超卖。
-            // 解决方案：在事务内最先执行一条写操作（对 system_configs 的无副作用 UPDATE），
-            // 立即获取 SQLite RESERVED 锁，使后续并发的写事务阻塞等待，保证读-写串行化。
-            await configRepo.createQueryBuilder().update(SystemConfig).set({ updatedAt: new Date() }).where('configId = :configId', { configId: 'system_config' }).execute();
-
-            // 统一免费资格判定（与 preview 共用同一套逻辑），传入事务 EM 保证判定查询与抢锁在同一事务上下文
-            const eligibility = await this.determineFreeEligibility(
-                createBookingDto.wechatOpenId,
-                createBookingDto.passengers,
-                createBookingDto.bookingDate,
-                createBookingDto.travelMode,
-                createBookingDto.vehicleType,
-                createBookingDto.licensePlate,
-                { entityManager },
-            );
-            const { isFree, freeReason, amount } = eligibility;
-
-            let status: BookingStatus;
-            let paymentStatus: PaymentStatus;
-            let paymentExpiredAt: Date | null;
-            if (isFree) {
-                // 免费订单：直接确认生效，跳过微信支付流程
-                status = BookingStatus.CONFIRMED;
-                paymentStatus = PaymentStatus.PAID;
-                paymentExpiredAt = null;
-            } else {
-                // 收费订单：初始状态为待确认 + 未支付
-                status = BookingStatus.PENDING;
-                paymentStatus = PaymentStatus.UNPAID;
-                paymentExpiredAt = new Date();
-                paymentExpiredAt.setMinutes(paymentExpiredAt.getMinutes() + 30);
-            }
-
-            // 从 passengers[0] 同步联系人信息到兼容字段；人员计费快照使用白名单字段构造，
-            // 计费字段由后端 eligibility 结果显式写入，不保留前端传入的同名字段
-            const normalizedPassengers = createBookingDto.passengers.map((p, index) => {
-                const pricing = eligibility.passengerPricing[index];
-                return {
-                    name: p.name,
-                    phone: p.phone,
-                    idCard: normalizeIdCard(p.idCard),
-                    passengerType: pricing.passengerType,
-                    idCardUnavailable: p.idCardUnavailable === true,
-                    ageValue: pricing.ageValue,
-                    ageFree: pricing.ageFree,
-                    finalCharged: pricing.finalCharged,
-                    pricingReason: pricing.pricingReason,
-                };
-            });
-            const firstPassenger = normalizedPassengers[0];
-            const passengersJson = JSON.stringify(normalizedPassengers);
-
-            // timeSlot 已不再区分上下午，统一存 morning（兼容历史数据与 NOT NULL 约束）
-            if (!createBookingDto.timeSlot) {
-                createBookingDto.timeSlot = TimeSlot.MORNING;
-            }
-
-            const bookingDate = new Date(createBookingDto.bookingDate);
-            // 生成以 TL 开头的 11 位随机字符订单号
-            const bookingId = `TL${randomUUID().replace(/-/g, '').substring(0, 11).toUpperCase()}`;
-
-            // 创建订单
-            const booking = bookingRepo.create({
-                ...createBookingDto,
-                bookingId,
-                bookingDate,
-                passengers: passengersJson,
-                // 人数唯一来源为 passengers.length，落库时不信任请求数值
-                personCount: createBookingDto.passengers.length,
-                name: firstPassenger.name,
-                phone: firstPassenger.phone,
-                idCard: firstPassenger.idCard,
-                isFree,
-                freeReason,
-                amount,
-                status,
-                paymentStatus,
-                refundStatus: RefundStatus.NONE,
-                paymentExpiredAt,
-            });
-
-            const savedBooking = await bookingRepo.save(booking);
-
-            // 订单创建成功后，异步将乘客信息保存为常用联系人（按身份证号去重）
-            // 不影响订单创建流程，即使保存失败也不阻断
-            setImmediate(async () => {
-                try {
-                    await this.userProfileRepository.upsertProfiles(createBookingDto.wechatOpenId, normalizedPassengers);
-                } catch (err) {
-                    this.logger.warn(`自动保存常用联系人失败: ${err.message}`, err);
+            // 走 serialTransaction 排队执行：sqlite 驱动全进程共用一条连接且不允许并发事务，
+            // 两个事务重叠会打坏 BEGIN/COMMIT 记账（2026-09-13 线上事故），详见 transaction-runner.ts
+            const created = await serialTransaction(this.dataSource, async (entityManager) => {
+                const bookingRepo = entityManager.getRepository(Booking);
+                const configRepo = entityManager.getRepository(SystemConfig);
+    
+                // SQLite 使用 DEFERRED 事务，读操作不会加锁，导致并发事务可能同时读到相同的免费名额计数后超卖。
+                // 解决方案：在事务内最先执行一条写操作（对 system_configs 的无副作用 UPDATE），
+                // 立即获取 SQLite RESERVED 锁，使后续并发的写事务阻塞等待，保证读-写串行化。
+                await configRepo.createQueryBuilder().update(SystemConfig).set({ updatedAt: new Date() }).where('configId = :configId', { configId: 'system_config' }).execute();
+    
+                // 统一免费资格判定（与 preview 共用同一套逻辑），传入事务 EM 保证判定查询与抢锁在同一事务上下文
+                const eligibility = await this.determineFreeEligibility(
+                    createBookingDto.wechatOpenId,
+                    createBookingDto.passengers,
+                    createBookingDto.bookingDate,
+                    createBookingDto.travelMode,
+                    createBookingDto.vehicleType,
+                    createBookingDto.licensePlate,
+                    { entityManager },
+                );
+                const { isFree, freeReason, amount } = eligibility;
+    
+                let status: BookingStatus;
+                let paymentStatus: PaymentStatus;
+                let paymentExpiredAt: Date | null;
+                if (isFree) {
+                    // 免费订单：直接确认生效，跳过微信支付流程
+                    status = BookingStatus.CONFIRMED;
+                    paymentStatus = PaymentStatus.PAID;
+                    paymentExpiredAt = null;
+                } else {
+                    // 收费订单：初始状态为待确认 + 未支付
+                    status = BookingStatus.PENDING;
+                    paymentStatus = PaymentStatus.UNPAID;
+                    paymentExpiredAt = new Date();
+                    paymentExpiredAt.setMinutes(paymentExpiredAt.getMinutes() + 30);
                 }
+    
+                // 从 passengers[0] 同步联系人信息到兼容字段；人员计费快照使用白名单字段构造，
+                // 计费字段由后端 eligibility 结果显式写入，不保留前端传入的同名字段
+                const normalizedPassengers = createBookingDto.passengers.map((p, index) => {
+                    const pricing = eligibility.passengerPricing[index];
+                    return {
+                        name: p.name,
+                        phone: p.phone,
+                        idCard: normalizeIdCard(p.idCard),
+                        passengerType: pricing.passengerType,
+                        idCardUnavailable: p.idCardUnavailable === true,
+                        ageValue: pricing.ageValue,
+                        ageFree: pricing.ageFree,
+                        finalCharged: pricing.finalCharged,
+                        pricingReason: pricing.pricingReason,
+                    };
+                });
+                const firstPassenger = normalizedPassengers[0];
+                const passengersJson = JSON.stringify(normalizedPassengers);
+    
+                // timeSlot 已不再区分上下午，统一存 morning（兼容历史数据与 NOT NULL 约束）
+                if (!createBookingDto.timeSlot) {
+                    createBookingDto.timeSlot = TimeSlot.MORNING;
+                }
+    
+                const bookingDate = new Date(createBookingDto.bookingDate);
+                // 生成以 TL 开头的 11 位随机字符订单号
+                const bookingId = `TL${randomUUID().replace(/-/g, '').substring(0, 11).toUpperCase()}`;
+    
+                // 创建订单
+                const booking = bookingRepo.create({
+                    ...createBookingDto,
+                    bookingId,
+                    bookingDate,
+                    passengers: passengersJson,
+                    // 人数唯一来源为 passengers.length，落库时不信任请求数值
+                    personCount: createBookingDto.passengers.length,
+                    name: firstPassenger.name,
+                    phone: firstPassenger.phone,
+                    idCard: firstPassenger.idCard,
+                    isFree,
+                    freeReason,
+                    amount,
+                    status,
+                    paymentStatus,
+                    refundStatus: RefundStatus.NONE,
+                    paymentExpiredAt,
+                });
+    
+                const savedBooking = await bookingRepo.save(booking);
+    
+                return { savedBooking, normalizedPassengers };
             });
+            createdBooking = created.savedBooking;
 
-            return savedBooking;
+            // 订单创建成功后，异步将乘客信息保存为常用联系人（按身份证号去重）。
+            // 放在事务**提交之后**、且经 serialWrite 排同一把锁：原先在事务内用 setImmediate 触发，
+            // 它会在同一条 sqlite 连接上再开一次 BEGIN/COMMIT 与父事务的 COMMIT 交错 ——
+            // 线上事故的触发点之一。仍然不影响订单创建流程，保存失败也不阻断
+            void serialWrite(this.dataSource, () =>
+                this.userProfileRepository.upsertProfiles(createBookingDto.wechatOpenId, created.normalizedPassengers),
+            ).catch((err) => {
+                this.logger.warn(`自动保存常用联系人失败: ${err.message}`, err);
             });
         } catch (error) {
             // 记录点：预约创建异常（日志失败不影响业务结果）
