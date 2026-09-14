@@ -14,7 +14,7 @@ import { Message, MessageType, OaSendStatus } from '../../entities/message.entit
 import { BookingRepository } from '../../repositories/booking.repository';
 import { MessageRepository } from '../../repositories/message.repository';
 import { MessageService } from '../message/message.service';
-import { MESSAGE_SCAN_BATCH_LIMIT } from '../message/message-policy';
+import { MESSAGE_QUIET_WINDOW_MS, MESSAGE_SCAN_BATCH_LIMIT } from '../message/message-policy';
 import { BookingService } from './booking.service';
 import { beijingDateStr } from '../../common/date-utils';
 
@@ -279,7 +279,7 @@ describe('阶段 4 扫描类通知（T1 ② / T2）', () => {
             const older = await seedBooking({ status: BookingStatus.EXPIRED, expiredAt: ago(3 * DAY) });
             const newer = await seedBooking({ status: BookingStatus.EXPIRED, expiredAt: ago(1 * DAY) });
 
-            const rows = await bookingRepository.findExpiredNotNotified(10, Date.now());
+            const rows = await bookingRepository.findExpiredNotNotified(10, Date.now(), MESSAGE_QUIET_WINDOW_MS);
 
             expect(rows.map((r) => r.bookingId)).toEqual([older.bookingId, newer.bookingId]);
         });
@@ -289,7 +289,7 @@ describe('阶段 4 扫描类通知（T1 ② / T2）', () => {
                 await seedBooking({ status: BookingStatus.EXPIRED, expiredAt: ago((i + 1) * DAY) });
             }
 
-            const rows = await bookingRepository.findExpiredNotNotified(2, Date.now());
+            const rows = await bookingRepository.findExpiredNotNotified(2, Date.now(), MESSAGE_QUIET_WINDOW_MS);
 
             expect(rows).toHaveLength(2);
             expect(MESSAGE_SCAN_BATCH_LIMIT).toBeGreaterThan(2); // 批量上限是独立的常量
@@ -299,7 +299,7 @@ describe('阶段 4 扫描类通知（T1 ② / T2）', () => {
             const booking = await seedBooking({ status: BookingStatus.EXPIRED, expiredAt: ago(1 * DAY) });
             await bookingRepository.markExpireNotified(booking.bookingId, Date.now());
 
-            expect(await bookingRepository.findExpiredNotNotified(10, Date.now())).toHaveLength(0);
+            expect(await bookingRepository.findExpiredNotNotified(10, Date.now(), MESSAGE_QUIET_WINDOW_MS)).toHaveLength(0);
         });
 
         it('markExpireNotified 带 IS NULL 条件：重复调用只有第一次 affected=1', async () => {
@@ -422,6 +422,87 @@ describe('阶段 4 扫描类通知（T1 ② / T2）', () => {
 
             const types = (await messagesOf()).map((m) => m.msgType).sort();
             expect(types).toEqual([MessageType.ORDER_EXPIRED, MessageType.ORDER_EXPIRE_REMINDER]);
+        });
+    });
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 手动触发的静默期覆盖（POST /admin/tasks/* 的 quietWindowMinutes）
+    //
+    // 这组用例锁的是「能覆盖，但只覆盖这一次，且 cron 路径不受影响」。
+    // 覆盖是给测试用的：不覆盖的话，「下单 → 过期 → 收通知」这条链路要干等 2 小时，
+    // 一遍都验不完。
+    // ─────────────────────────────────────────────────────────────────────────
+
+    describe('静默期覆盖（只有手动触发能传）', () => {
+        it('不传 = A 规则 2 小时：半小时前下单的过期单不会被扫到', async () => {
+            const booking = await seedBooking({
+                status: BookingStatus.EXPIRED,
+                expiredAt: ago(30 * 60 * 1000),
+                createdAt: ago(30 * 60 * 1000),
+            });
+
+            const result = await service.runExpireScan();
+
+            expect(await messagesOf()).toHaveLength(0);
+            expect(await notifiedAtOf(booking.bookingId)).toBeNull();
+            expect(result.quietWindowMinutes).toBe(120);
+        });
+
+        it('传 0 = 不设静默期：同一张单立刻被扫到并发出通知', async () => {
+            const booking = await seedBooking({
+                status: BookingStatus.EXPIRED,
+                expiredAt: ago(30 * 60 * 1000),
+                createdAt: ago(30 * 60 * 1000),
+            });
+
+            const result = await service.runExpireScan({ quietWindowMs: 0 });
+
+            expect(await messagesOf()).toHaveLength(1);
+            expect(await notifiedAtOf(booking.bookingId)).not.toBeNull();
+            expect(result.quietWindowMinutes).toBe(0);
+        });
+
+        it('覆盖只作用于本次：下一次不传时仍按 2 小时走', async () => {
+            await seedBooking({
+                status: BookingStatus.EXPIRED,
+                expiredAt: ago(30 * 60 * 1000),
+                createdAt: ago(30 * 60 * 1000),
+            });
+            expect((await service.runExpireScan({ quietWindowMs: 0 })).quietWindowMinutes).toBe(0);
+
+            // 再建一单同样「不足 2 小时」的，用默认值扫 —— 必须仍被挡住，
+            // 否则「覆盖」就变成了把 A 规则改松，而不是只影响那一次
+            const another = await seedBooking({
+                status: BookingStatus.EXPIRED,
+                expiredAt: ago(30 * 60 * 1000),
+                createdAt: ago(30 * 60 * 1000),
+            });
+            const normal = await service.runExpireScan();
+
+            expect(normal.quietWindowMinutes).toBe(120);
+            expect(await notifiedAtOf(another.bookingId)).toBeNull();
+        });
+
+        it('越界值在 service 层被钳制：负数归 0，超过 24 小时按 24 小时算', async () => {
+            // DTO 已经拦过一道（400）；这条锁的是「绕过 HTTP 直接调 service」的第二道钳制
+            expect((await service.runExpireScan({ quietWindowMs: -1 })).quietWindowMinutes).toBe(0);
+            expect((await service.runExpireScan({ quietWindowMs: 30 * DAY })).quietWindowMinutes).toBe(24 * 60);
+        });
+
+        it('T2 ① 同样受覆盖影响', async () => {
+            await seedBooking({
+                status: BookingStatus.CONFIRMED,
+                bookingDate: new Date(`${beijingDateStr()}T00:00:00`) as any,
+                createdAt: ago(30 * 60 * 1000),
+            });
+
+            const normal = await service.runDailyReminderScan();
+            expect(normal.remindedCount).toBe(0);
+            expect(normal.quietWindowMinutes).toBe(120);
+
+            const forced = await service.runDailyReminderScan({ quietWindowMs: 0 });
+            expect(forced.remindedCount).toBe(1);
+            expect(forced.quietWindowMinutes).toBe(0);
         });
     });
 });

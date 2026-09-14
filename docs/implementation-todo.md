@@ -473,9 +473,33 @@ sqlite3 data/prod.db "DROP TABLE IF EXISTS messages;"
 **已知残留（后续项，非本次范围）**：
 
 1. **未启用 WAL** —— 开启会永久改变生产库的 journal_mode（若库位于 NFS / Windows bind mount 上有损坏风险），且 WAL 治不了上述记账错位，只是让外部读不再撞锁。`busyTimeout` 只对「其它连接持锁」有效，进程内并发走不到它。
-2. **`wechat-pay.controller` 的异步处理段未整体包锁** —— webhook 先应答 200 再 `setImmediate` 异步处理（内部含网络调用，不适合放进串行队列），其中的 repository 条件更新已由串行器覆盖。
+2. **`wechat-pay.controller` 的异步处理段未整体包锁** —— webhook 先应答 200 再 `setImmediate` 异步处理（内部含网络调用，不适合放进串行队列）。其中的 repository 写入**已在 2026-09-14 补上排队**，见下方订正。
 3. **`createBooking` 事务未瘦身** —— 免费名额判定必须与写在同一事务内才有防超卖意义，串行化后已无碰撞风险，搬出去反而引入超卖。
 4. **logs 库唯一事务点**（`logging.service.ts` 日志清理）保持原样：独立 DB、单点发起，不存在本节的并发形态。
+
+### 订正与补修：`update().execute()` 这条路当时漏了（2026-09-14）
+
+上文第 2 条原写「其中的 repository 条件更新**已由串行器覆盖**」——**这句话当时不成立，已订正并补修。**
+
+**为什么漏**：2026-09-13 的排查口径是「`EntityPersistExecutor` 在 `!queryRunner.isTransactionActive` 时会自行 BEGIN/COMMIT，因此每一处 `repo.save()` / `repo.remove()` 都是一次事务发起（共 19 处）」。`save()`/`remove()` 那条线据此被系统性换成 `serialSave`/`serialRemove`。
+
+但 TypeORM 的 `createQueryBuilder().update().execute()`（以及 `repo.update()` / `repo.delete()` 这两个快捷方法）**不走 EntityPersistExecutor**，不自开事务、不撞坏 BEGIN/COMMIT 记账——所以它既不在「那 19 处」里，也不表现为「并发事务」。**它不制造事故，但会被事故吃掉**：事务持锁期间下发的语句会被卷进那个未提交事务，随它的回滚一起消失，而它返回的 `affected` 仍是正常值（调用方以为写成功了）。
+
+**实测**（`src/common/write-isolation.spec.ts`，该文件已成为回归网）：
+
+```
+事务自己的写            存活=false   ← 回滚确实发生，实验有效
+裸 update().execute()   存活=false   ← 被卷进事务，随回滚消失，affected=1
+serialWrite(...)        存活=true
+```
+
+**影响面**：支付回调链 `wechat-pay.controller → setImmediate → handlePaymentSuccess → markPaymentSucceeded` 全程无排队——正是本节开头举的那个例子「用户付了钱、订单仍是未支付」。
+
+**修复**：全仓约 30 处裸写补 `serialWrite`——`booking.repository.ts`（支付族 9、退款族 2、`markVerified`/`markExpired`/`markExpireNotified`、`resolveAnomaly`）、`refund-apply.repository.ts`（审核三态）、`message.repository.ts`（标记已读 / 治理）、`admin-application.repository.ts`（审批）。
+
+**为什么补排队不会再引出「开放事务」那个故障**：那个状态由并发 `BEGIN`/`COMMIT` 造成，只有 `serialTransaction` 那条路能产生；`serialWrite` 不发 BEGIN 也不发 COMMIT，结构上造不出来。且 `serialWrite` 在事务体内调用会**内联**（并入外层事务），不会自己等自己——这条契约由同文件的第二个用例锁定。
+
+**约定（新增写操作时必须遵守）**：`createQueryBuilder()` 的 `.execute()`、以及 `repo.update()` / `repo.delete()`，**都要包在 `serialWrite` 里**。`repo.save()` / `repo.remove()` 用 `serialSave` / `serialRemove`。
 
 ## 实现说明（非问题，供后续维护）
 

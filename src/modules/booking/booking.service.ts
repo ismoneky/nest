@@ -34,7 +34,11 @@ import { LoggingService } from '../logging/logging.service';
 import { AppLogLevel, AppLogSource, AppLogCategory } from '../../entities/app-log.entity';
 import { beijingDateStr } from '../../common/date-utils';
 import { MessageService } from '../message/message.service';
-import { MESSAGE_SCAN_BATCH_LIMIT } from '../message/message-policy';
+import {
+    MESSAGE_QUIET_WINDOW_MAX_MS,
+    MESSAGE_QUIET_WINDOW_MS,
+    MESSAGE_SCAN_BATCH_LIMIT,
+} from '../message/message-policy';
 import { resolveApplyDeadlineStr } from '../refund/refund-deadline';
 import { MessageType } from '../../entities/message.entity';
 
@@ -193,6 +197,69 @@ export function composeOrderPricing(
         ageFreePeople,
         passengerPricing: ageSummary.passengerPricing,
     };
+}
+
+/**
+ * T1 过期扫描的执行结果
+ *
+ * cron 与手动触发接口共用同一个实现，所以结果要从方法里带出来：
+ * 定时触发时没人看，手动触发时这是唯一的反馈来源。
+ */
+export interface ExpireScanResult {
+    /** 命中重入锁：上一轮还没跑完，本轮什么都没做 */
+    skipped: boolean;
+    /** 被置为 expired 的订单数 */
+    expiredCount: number;
+    /** 发出（或早已存在）的「订单已过期」站内信数 */
+    notifiedCount: number;
+    /** 本次实际生效的静默期（分钟）。cron 恒为 120；手动触发可覆盖，便于回看出当时用了什么 */
+    quietWindowMinutes: number;
+    /**
+     * 失败原因；null = 正常完成。
+     *
+     * **不在方法里向外抛**：`@Cron` 抛出去会变成 unhandled rejection，
+     * 定时任务失败不该有拖垮进程的可能。手动触发接口读这个字段决定返回 200 还是 500。
+     */
+    error: string | null;
+}
+
+/** T2 每日提醒的执行结果（一次扫描覆盖两件事，见 runDailyReminderScan） */
+export interface DailyReminderResult {
+    /** 命中重入锁 */
+    skipped: boolean;
+    /** 当天未核销、被扫到的订单数 */
+    todayPendingCount: number;
+    /** 实际发出的「即将过期」提醒数 */
+    remindedCount: number;
+    /** 近 N 天已过期未通知、被扫到的订单数 */
+    expiredPendingCount: number;
+    /** 实际发出的「已过期可退款」提醒数 */
+    recalledCount: number;
+    /**
+     * 本次实际生效的静默期（分钟），只作用于 ①。
+     *
+     * ②（已过期可退款）用的是**退款申请时限窗口**（`expiredAt >= now - N 天`），
+     * 不是静默期——它挑的是「还能退但还没人提醒」的单，与下单时间无关。
+     */
+    quietWindowMinutes: number;
+    /** 同 ExpireScanResult.error */
+    error: string | null;
+}
+
+/**
+ * 手动触发扫描任务时的可选覆盖项
+ *
+ * ⚠️ 只有 `POST /admin/tasks/*` 会传它。**cron 路径不传**，永远走 A 规则的默认值——
+ * 这个类型的全部意义就是「让测试能跳过 2 小时干等」，不是给定时任务调参用的。
+ */
+export interface TaskTriggerOptions {
+    /**
+     * 覆盖本次扫描的静默期（毫秒）。
+     *
+     * `0` 是合法值 = 不设静默期：刚下单的订单也会被扫到，测「下单 → 过期 → 收通知」
+     * 这条链路时必须用它，否则要干等 2 小时。生产环境慎用（用户刚下完单就会收到提醒）。
+     */
+    quietWindowMs?: number;
 }
 
 /**
@@ -1622,29 +1689,55 @@ export class BookingService {
      *   ① 只改状态，失败了下轮重跑（`WHERE status='confirmed'` 已不匹配的不会重复处理）；
      *   ② 只发通知，靠 `expireNotifiedAt IS NULL` 标记位补发。
      * 任一步骤失败都不会造成永久漏发——这是 v1「用扫描窗口挑待通知订单」的替代方案。
+     *
+     * @param options 只由手动触发接口传入。cron 不传，静默期永远是 A 规则的 2 小时
      */
     @Cron('0 13 * * * *', { timeZone: 'Asia/Shanghai' })
-    async runExpireScan() {
-        if (this.taskRunning.expire) return;
+    async runExpireScan(options: TaskTriggerOptions = {}): Promise<ExpireScanResult> {
+        const quietWindowMs = this.resolveQuietWindow(options.quietWindowMs);
+        const quietWindowMinutes = Math.round(quietWindowMs / 60000);
+        if (this.taskRunning.expire) {
+            return { skipped: true, expiredCount: 0, notifiedCount: 0, quietWindowMinutes, error: null };
+        }
         this.taskRunning.expire = true;
         try {
             const now = Date.now();
             // 步骤①：状态流转
             const affected = await this.bookingRepository.markExpired(beijingDateStr(), now);
             // 步骤②：发通知（按标记位捞，跑几次都安全）
-            const notified = await this.notifyExpiredBookings(now);
+            const notified = await this.notifyExpiredBookings(now, quietWindowMs);
 
             this.logTask('expire', AppLogLevel.INFO, '完成', {
                 task: 'expire',
                 expiredCount: affected,
                 notifiedCount: notified,
+                quietWindowMinutes,
             });
+            return { skipped: false, expiredCount: affected, notifiedCount: notified, quietWindowMinutes, error: null };
         } catch (error) {
             this.logger.error('过期扫描任务失败', error);
-            this.logTask('expire', AppLogLevel.ERROR, '失败', { task: 'expire', error: (error as Error).message });
+            const message = (error as Error).message;
+            this.logTask('expire', AppLogLevel.ERROR, '失败', { task: 'expire', error: message });
+            return { skipped: false, expiredCount: 0, notifiedCount: 0, quietWindowMinutes, error: message };
         } finally {
             this.taskRunning.expire = false;
         }
+    }
+
+    /**
+     * 解析本次扫描的静默期
+     *
+     * 不传 → A 规则的默认值（`MESSAGE_QUIET_WINDOW_MS`）。只有手动触发接口会传。
+     *
+     * 越界值在这里钳制而不是抛错：DTO 已经拦过一道（400），这里是防「绕过 HTTP 直接调
+     * service」的第二道。下界 0 是**合法值**（不设静默期，测试刚下的单要用），
+     * 上界 24 小时——再大等于把通知整体静默掉，那是关功能不是调参。
+     */
+    private resolveQuietWindow(overrideMs?: number): number {
+        if (overrideMs === undefined || overrideMs === null) return MESSAGE_QUIET_WINDOW_MS;
+        const n = Number(overrideMs);
+        if (!Number.isFinite(n)) return MESSAGE_QUIET_WINDOW_MS;
+        return Math.min(Math.max(0, Math.floor(n)), MESSAGE_QUIET_WINDOW_MAX_MS);
     }
 
     /**
@@ -1667,10 +1760,24 @@ export class BookingService {
      * ⚠️ 与 T1 用的是**同一个 dedupeKey**（`ORDER_EXPIRED:{bookingId}`），
      * 这是刻意的：两条路径谁先到谁生效，另一条被去重拦下、照样写标记位，
      * 用户不会收到两条「已过期」。若两处 key 不一致，就会轰炸。
+     *
+     * @param options 只由手动触发接口传入，覆盖的静默期**只作用于 ①**（② 用的是退款时限窗口）
      */
     @Cron('0 0 22 * * *', { timeZone: 'Asia/Shanghai' })
-    async runDailyReminderScan() {
-        if (this.taskRunning.dailyReminder) return;
+    async runDailyReminderScan(options: TaskTriggerOptions = {}): Promise<DailyReminderResult> {
+        const quietWindowMs = this.resolveQuietWindow(options.quietWindowMs);
+        const quietWindowMinutes = Math.round(quietWindowMs / 60000);
+        if (this.taskRunning.dailyReminder) {
+            return {
+                skipped: true,
+                todayPendingCount: 0,
+                remindedCount: 0,
+                expiredPendingCount: 0,
+                recalledCount: 0,
+                quietWindowMinutes,
+                error: null,
+            };
+        }
         this.taskRunning.dailyReminder = true;
         try {
             const now = Date.now();
@@ -1680,11 +1787,13 @@ export class BookingService {
                 beijingDateStr(),
                 MESSAGE_SCAN_BATCH_LIMIT,
                 now,
+                quietWindowMs,
             );
             let reminded = 0;
             for (const booking of todayPending) {
-                await this.notifyQuietly(MessageType.ORDER_EXPIRE_REMINDER, booking, now);
-                reminded++;
+                // 只计真正发出去的：被每日配额挡下的也在这批里，
+                // 算进去会让日志和手动触发看到的数字变成「尝试数」而不是「发出数」
+                if (await this.notifyQuietly(MessageType.ORDER_EXPIRE_REMINDER, booking, now)) reminded++;
             }
 
             // ② 近 N 天已过期未通知 → 提醒可退款（兜底 + 唤回）
@@ -1705,13 +1814,33 @@ export class BookingService {
                 remindedCount: reminded,
                 expiredPendingCount: expiredPending.length,
                 recalledCount: recalled,
+                quietWindowMinutes,
             });
+            return {
+                skipped: false,
+                todayPendingCount: todayPending.length,
+                remindedCount: reminded,
+                expiredPendingCount: expiredPending.length,
+                recalledCount: recalled,
+                quietWindowMinutes,
+                error: null,
+            };
         } catch (error) {
             this.logger.error('每日提醒任务失败', error);
+            const message = (error as Error).message;
             this.logTask('daily-reminder', AppLogLevel.ERROR, '失败', {
                 task: 'daily-reminder',
-                error: (error as Error).message,
+                error: message,
             });
+            return {
+                skipped: false,
+                todayPendingCount: 0,
+                remindedCount: 0,
+                expiredPendingCount: 0,
+                recalledCount: 0,
+                quietWindowMinutes,
+                error: message,
+            };
         } finally {
             this.taskRunning.dailyReminder = false;
         }
@@ -1722,10 +1851,11 @@ export class BookingService {
      *
      * @returns 已发出（或早已存在）的条数
      */
-    private async notifyExpiredBookings(now: number): Promise<number> {
+    private async notifyExpiredBookings(now: number, quietWindowMs: number): Promise<number> {
         const pending = await this.bookingRepository.findExpiredNotNotified(
             MESSAGE_SCAN_BATCH_LIMIT,
             now,
+            quietWindowMs,
         );
         let notified = 0;
         for (const booking of pending) {
@@ -1779,18 +1909,22 @@ export class BookingService {
      * 被挡下就挡下了，次日该订单若仍未核销会转成 T1/T2 ② 的「已过期可退款」，
      * 不存在永久漏发。
      */
-    private async notifyQuietly(msgType: MessageType, booking: Booking, now: number): Promise<void> {
+    private async notifyQuietly(msgType: MessageType, booking: Booking, now: number): Promise<boolean> {
         try {
-            await this.messageService.send(
+            const result = await this.messageService.send(
                 msgType,
                 { userId: booking.wechatOpenId, bookingId: booking.bookingId },
                 new Date(now),
             );
+            // sent=false 只有一种情况：撞上该用户的每日系统消息上限（§4.4 防打扰）。
+            // 如实返回，调用方的计数才是「发出数」而不是「尝试数」
+            return result.sent;
         } catch (error) {
             this.logger.error(
                 `每日提醒发送失败: msgType=${msgType}, bookingId=${booking.bookingId}`,
                 error instanceof Error ? error.stack : String(error),
             );
+            return false;
         }
     }
 

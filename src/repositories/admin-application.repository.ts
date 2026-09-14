@@ -3,7 +3,7 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { randomUUID } from 'crypto';
 import { AdminApplication, AdminApplicationStatus } from '../entities/admin-application.entity';
-import { serialSave } from '../common/transaction-runner';
+import { serialSave, serialWrite } from '../common/transaction-runner';
 
 @Injectable()
 export class AdminApplicationRepository {
@@ -47,14 +47,19 @@ export class AdminApplicationRepository {
     }
 
     async approve(applicationId: string): Promise<AdminApplication> {
-        await this.repo.update({ applicationId }, { status: AdminApplicationStatus.APPROVED });
+        // repo.update() 是 QueryBuilder 的快捷写法，同样不自开事务 —— 不排队就会被并发事务的回滚带走
+        await serialWrite(this.repo.manager.connection, () =>
+            this.repo.update({ applicationId }, { status: AdminApplicationStatus.APPROVED }),
+        );
         return this.repo.findOne({ where: { applicationId } });
     }
 
     async reject(applicationId: string, rejectionReason?: string): Promise<AdminApplication> {
-        await this.repo.update(
-            { applicationId },
-            { status: AdminApplicationStatus.REJECTED, rejectionReason: rejectionReason || null },
+        await serialWrite(this.repo.manager.connection, () =>
+            this.repo.update(
+                { applicationId },
+                { status: AdminApplicationStatus.REJECTED, rejectionReason: rejectionReason || null },
+            ),
         );
         return this.repo.findOne({ where: { applicationId } });
     }

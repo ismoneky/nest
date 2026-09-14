@@ -8,7 +8,7 @@ import { GetBookingsDto } from '../modules/booking/dto/getBookings.dto';
 import { DataSource, EntityManager } from 'typeorm';
 import { randomUUID } from 'crypto';
 import { BookingDashboardResponse } from '../modules/admin/interfaces/booking-dashboard.interface';
-import { serialSave, serialTransaction } from '../common/transaction-runner';
+import { serialSave, serialTransaction, serialWrite } from '../common/transaction-runner';
 import { MESSAGE_QUIET_WINDOW_MS } from '../modules/message/message-policy';
 
 /**
@@ -372,7 +372,7 @@ export class BookingRepository {
      * @returns affected rows
      */
     async markExpired(todayStr: string, now: number): Promise<number> {
-        return (await this.bookingRepository
+        return serialWrite(this.dataSource, async () => (await this.bookingRepository
             .createQueryBuilder()
             .update(Booking)
             .set({ status: BookingStatus.EXPIRED, expiredAt: new Date(now) })
@@ -381,7 +381,7 @@ export class BookingRepository {
             .andWhere('refundStatus NOT IN (:...refundStatuses)', {
                 refundStatuses: [RefundStatus.REFUNDING, RefundStatus.REFUNDED],
             })
-            .execute()).affected ?? 0;
+            .execute()).affected ?? 0);
     }
 
     /**
@@ -393,21 +393,23 @@ export class BookingRepository {
      * 下一轮它们的 `expiredAt` 早于窗口下限——**永远不再被取到**。
      * `dedupeKey` 只防重复，不防漏发；标记位（`expireNotifiedAt IS NULL`）才能防漏发。
      *
-     * `createdAt <= now - 2h` 是 A 规则（见 `message-policy.ts`）。**不满足的订单
+     * `createdAt <= now - quietWindowMs` 是 A 规则（见 `message-policy.ts`）。**不满足的订单
      * 不写标记位**，下轮继续被取到，到期后自然补发——不会永久漏发。
      *
      * 排序 `expiredAt ASC` + LIMIT：积压时按「过期最久」优先补发，
      * 每轮消化一批而不是一次性倾泻（理由见 `MESSAGE_SCAN_BATCH_LIMIT`）。
      *
      * @param now 当前时刻（epoch ms）
+     * @param quietWindowMs 静默期。cron 路径传 `MESSAGE_QUIET_WINDOW_MS`（2h）；
+     *                      手动触发可覆盖，0 = 不设静默期（测试用）
      */
-    async findExpiredNotNotified(limit: number, now: number): Promise<Booking[]> {
+    async findExpiredNotNotified(limit: number, now: number, quietWindowMs: number): Promise<Booking[]> {
         return await this.bookingRepository
             .createQueryBuilder('booking')
             .where('booking.status = :status', { status: BookingStatus.EXPIRED })
             .andWhere('booking.expireNotifiedAt IS NULL')
             .andWhere('booking.createdAt <= :notifyCutoff', {
-                notifyCutoff: now - MESSAGE_QUIET_WINDOW_MS,
+                notifyCutoff: now - quietWindowMs,
             })
             .orderBy('booking.expiredAt', 'ASC')
             .limit(limit)
@@ -423,16 +425,18 @@ export class BookingRepository {
      * 「相等」永远不成立（长串 ≠ 短串）。详见 `markExpired` 的注释与
      * `implementation-todo.md` 说明 23。
      *
-     * 只取 `createdAt <= now - 2h`（A 规则）：当天很晚下单的用户当晚不推，
+     * 只取 `createdAt <= now - quietWindowMs`（A 规则）：当天很晚下单的用户当晚不推，
      * 次日 22:00 时若订单已过期，由 ② 补推。
+     *
+     * @param quietWindowMs 静默期，语义同 `findExpiredNotNotified`
      */
-    async findTodayUnverified(todayStr: string, limit: number, now: number): Promise<Booking[]> {
+    async findTodayUnverified(todayStr: string, limit: number, now: number, quietWindowMs: number): Promise<Booking[]> {
         return await this.bookingRepository
             .createQueryBuilder('booking')
             .where('booking.status = :status', { status: BookingStatus.CONFIRMED })
             .andWhere('booking.bookingDate = :todayStr', { todayStr })
             .andWhere('booking.createdAt <= :notifyCutoff', {
-                notifyCutoff: now - MESSAGE_QUIET_WINDOW_MS,
+                notifyCutoff: now - quietWindowMs,
             })
             .orderBy('booking.createdAt', 'ASC')
             .limit(limit)
@@ -475,13 +479,13 @@ export class BookingRepository {
      * 被每日配额挡住时**不能**写：写了就等于放弃补发。
      */
     async markExpireNotified(bookingId: string, now: number): Promise<number> {
-        return (await this.bookingRepository
+        return serialWrite(this.dataSource, async () => (await this.bookingRepository
             .createQueryBuilder()
             .update(Booking)
             .set({ expireNotifiedAt: new Date(now) })
             .where('bookingId = :bookingId', { bookingId })
             .andWhere('expireNotifiedAt IS NULL')
-            .execute()).affected ?? 0;
+            .execute()).affected ?? 0);
     }
 
     /**
@@ -501,7 +505,7 @@ export class BookingRepository {
      * @returns affected rows（0 = 状态已不是 confirmed，如已被 T1 翻成 expired）
      */
     async markVerified(bookingId: string, verifierOpenid: string, now: number): Promise<number> {
-        return (await this.bookingRepository
+        return serialWrite(this.dataSource, async () => (await this.bookingRepository
             .createQueryBuilder()
             .update(Booking)
             .set({
@@ -511,7 +515,7 @@ export class BookingRepository {
             })
             .where('bookingId = :bookingId', { bookingId })
             .andWhere('status = :status', { status: BookingStatus.CONFIRMED })
-            .execute()).affected ?? 0;
+            .execute()).affected ?? 0);
     }
 
     /**
@@ -617,7 +621,8 @@ export class BookingRepository {
             qb.andWhere('outTradeNo IS NULL');
         }
 
-        return (await qb.execute()).affected ?? 0;
+        // 构造 qb 不碰数据库，只有 execute() 才下发语句 —— 排队只需罩住它
+        return serialWrite(this.dataSource, async () => (await qb.execute()).affected ?? 0);
     }
 
     /**
@@ -625,7 +630,7 @@ export class BookingRepository {
      * 清空 payment 调度字段，保留稳定错误码
      */
     async markPaymentStartRejected(bookingId: string, outTradeNo: string, errorCode: string): Promise<number> {
-        return (await this.bookingRepository
+        return serialWrite(this.dataSource, async () => (await this.bookingRepository
             .createQueryBuilder()
             .update(Booking)
             .set({
@@ -638,7 +643,7 @@ export class BookingRepository {
             .where('bookingId = :bookingId', { bookingId })
             .andWhere('paymentStatus = :ps', { ps: PaymentStatus.PAYING })
             .andWhere('outTradeNo = :outTradeNo', { outTradeNo })
-            .execute()).affected ?? 0;
+            .execute()).affected ?? 0);
     }
 
     /**
@@ -646,7 +651,7 @@ export class BookingRepository {
      * reconcileKind=payment、reconcileNextAt=now、attempts 加一，记录稳定错误码
      */
     async markPaymentResultUnknown(bookingId: string, outTradeNo: string, errorCode: string, now: number): Promise<number> {
-        return (await this.bookingRepository
+        return serialWrite(this.dataSource, async () => (await this.bookingRepository
             .createQueryBuilder()
             .update(Booking)
             .set({
@@ -659,14 +664,14 @@ export class BookingRepository {
             .where('bookingId = :bookingId', { bookingId })
             .andWhere('paymentStatus = :ps', { ps: PaymentStatus.PAYING })
             .andWhere('outTradeNo = :outTradeNo', { outTradeNo })
-            .execute()).affected ?? 0;
+            .execute()).affected ?? 0);
     }
 
     /**
      * reschedulePaymentCheck：支付对账仍未支付 → 保持业务状态，设置下一次执行时间，清空本次临时错误
      */
     async reschedulePaymentCheck(bookingId: string, outTradeNo: string, nextAt: number, now: number): Promise<number> {
-        return (await this.bookingRepository
+        return serialWrite(this.dataSource, async () => (await this.bookingRepository
             .createQueryBuilder()
             .update(Booking)
             .set({
@@ -678,7 +683,7 @@ export class BookingRepository {
             .where('bookingId = :bookingId', { bookingId })
             .andWhere('paymentStatus = :ps', { ps: PaymentStatus.PAYING })
             .andWhere('outTradeNo = :outTradeNo', { outTradeNo })
-            .execute()).affected ?? 0;
+            .execute()).affected ?? 0);
     }
 
     /**
@@ -686,7 +691,7 @@ export class BookingRepository {
      * 非支付终态且 outTradeNo 相同 → CONFIRMED + PAID，写 transactionId/paidAt，清空全部调度字段
      */
     async markPaymentSucceeded(outTradeNo: string, transactionId: string | null, paidAt: Date): Promise<number> {
-        return (await this.bookingRepository
+        return serialWrite(this.dataSource, async () => (await this.bookingRepository
             .createQueryBuilder()
             .update(Booking)
             .set({
@@ -704,14 +709,14 @@ export class BookingRepository {
             .andWhere('paymentStatus NOT IN (:...excluded)', {
                 excluded: [PaymentStatus.PAID, PaymentStatus.REFUNDING, PaymentStatus.REFUNDED],
             })
-            .execute()).affected ?? 0;
+            .execute()).affected ?? 0);
     }
 
     /**
      * markPaymentFailed：支付对账明确终态失败 → 按微信终态设为 FAILED/CANCELLED，清空调度字段
      */
     async markPaymentFailed(bookingId: string, outTradeNo: string, paymentStatus: PaymentStatus, bookingStatus: BookingStatus): Promise<number> {
-        return (await this.bookingRepository
+        return serialWrite(this.dataSource, async () => (await this.bookingRepository
             .createQueryBuilder()
             .update(Booking)
             .set({
@@ -725,7 +730,7 @@ export class BookingRepository {
             .where('bookingId = :bookingId', { bookingId })
             .andWhere('paymentStatus = :ps', { ps: PaymentStatus.PAYING })
             .andWhere('outTradeNo = :outTradeNo', { outTradeNo })
-            .execute()).affected ?? 0;
+            .execute()).affected ?? 0);
     }
 
     /**
@@ -733,7 +738,7 @@ export class BookingRepository {
      * 发现步骤：扫描所有已过期的 UNPAID/PAYING 订单（含从未发起支付、无调度字段的订单）。
      */
     async markCloseDue(now: number): Promise<number> {
-        return (await this.bookingRepository
+        return serialWrite(this.dataSource, async () => (await this.bookingRepository
             .createQueryBuilder()
             .update(Booking)
             .set({
@@ -744,7 +749,7 @@ export class BookingRepository {
             .andWhere('paymentStatus IN (:...statuses)', {
                 statuses: [PaymentStatus.UNPAID, PaymentStatus.PAYING],
             })
-            .execute()).affected ?? 0;
+            .execute()).affected ?? 0);
     }
 
     /**
@@ -753,7 +758,7 @@ export class BookingRepository {
      */
     async markPaymentClosed(bookingIds: string[], now: number): Promise<number> {
         if (bookingIds.length === 0) return 0;
-        return (await this.bookingRepository
+        return serialWrite(this.dataSource, async () => (await this.bookingRepository
             .createQueryBuilder()
             .update(Booking)
             .set({
@@ -767,7 +772,7 @@ export class BookingRepository {
                 statuses: [PaymentStatus.UNPAID, PaymentStatus.PAYING],
             })
             .andWhere('paymentExpiredAt < :now', { now })
-            .execute()).affected ?? 0;
+            .execute()).affected ?? 0);
     }
 
     /**
@@ -791,7 +796,7 @@ export class BookingRepository {
      * @returns affected rows（0 表示订单已被其他流程推进，调用方应报「状态已变化」）
      */
     async markCancelledByUser(bookingId: string): Promise<number> {
-        return (await this.bookingRepository
+        return serialWrite(this.dataSource, async () => (await this.bookingRepository
             .createQueryBuilder()
             .update(Booking)
             .set({
@@ -803,7 +808,7 @@ export class BookingRepository {
             .where('bookingId = :bookingId', { bookingId })
             .andWhere('status = :status', { status: BookingStatus.PENDING })
             .andWhere('paymentStatus = :paymentStatus', { paymentStatus: PaymentStatus.UNPAID })
-            .execute()).affected ?? 0;
+            .execute()).affected ?? 0);
     }
 
     /**
@@ -812,7 +817,7 @@ export class BookingRepository {
      * 与 markPaymentResultUnknown 对称的关单临时失败计数（设计表格未列，见 implementation-todo.md）。
      */
     async markCloseResultUnknown(bookingId: string, errorCode: string, nextAt: number, now: number): Promise<number> {
-        return (await this.bookingRepository
+        return serialWrite(this.dataSource, async () => (await this.bookingRepository
             .createQueryBuilder()
             .update(Booking)
             .set({
@@ -826,7 +831,7 @@ export class BookingRepository {
             .andWhere('paymentStatus IN (:...statuses)', {
                 statuses: [PaymentStatus.UNPAID, PaymentStatus.PAYING],
             })
-            .execute()).affected ?? 0;
+            .execute()).affected ?? 0);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -858,7 +863,7 @@ export class BookingRepository {
      * 因此 `expired → refunded` 天然成立，退款终态不需要任何改动。
      */
     async markRefundStarting(bookingId: string, outRefundNo: string, nextAt: number): Promise<number> {
-        return (await this.bookingRepository
+        return serialWrite(this.dataSource, async () => (await this.bookingRepository
             .createQueryBuilder()
             .update(Booking)
             .set({
@@ -877,14 +882,14 @@ export class BookingRepository {
             .andWhere('refundStatus IN (:...refundStatuses)', {
                 refundStatuses: [RefundStatus.NONE, RefundStatus.FAILED],
             })
-            .execute()).affected ?? 0;
+            .execute()).affected ?? 0);
     }
 
     /**
      * markRefundSucceeded：退款回调或对账成功 → 退款成功终态，写 refundedAt，清空调度字段
      */
     async markRefundSucceeded(bookingId: string, outRefundNo: string, refundedAt: Date): Promise<number> {
-        return (await this.bookingRepository
+        return serialWrite(this.dataSource, async () => (await this.bookingRepository
             .createQueryBuilder()
             .update(Booking)
             .set({
@@ -900,7 +905,7 @@ export class BookingRepository {
             .where('bookingId = :bookingId', { bookingId })
             .andWhere('refundStatus = :rs', { rs: RefundStatus.REFUNDING })
             .andWhere('outRefundNo = :outRefundNo', { outRefundNo })
-            .execute()).affected ?? 0;
+            .execute()).affected ?? 0);
     }
 
     /**
@@ -1083,7 +1088,7 @@ export class BookingRepository {
      * 对账成功后自动标记 RESOLVED（只处理 OPEN，不覆盖人工 IGNORED）
      */
     async resolveAnomaly(bookingId: string, type: AnomalyType, resolution: string, now: number): Promise<number> {
-        return (await this.anomalyRepository
+        return serialWrite(this.dataSource, async () => (await this.anomalyRepository
             .createQueryBuilder()
             .update(BookingAnomaly)
             .set({
@@ -1094,7 +1099,7 @@ export class BookingRepository {
             .where('bookingId = :bookingId', { bookingId })
             .andWhere('type = :type', { type })
             .andWhere('status = :status', { status: AnomalyStatus.OPEN })
-            .execute()).affected ?? 0;
+            .execute()).affected ?? 0);
     }
 
     /**

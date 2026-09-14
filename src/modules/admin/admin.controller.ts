@@ -1,4 +1,16 @@
-import { Body, Controller, Get, HttpStatus, Param, Post, Query, Req, Res, UseGuards } from '@nestjs/common';
+import {
+    Body,
+    Controller,
+    Get,
+    HttpStatus,
+    InternalServerErrorException,
+    Param,
+    Post,
+    Query,
+    Req,
+    Res,
+    UseGuards,
+} from '@nestjs/common';
 import { Request, Response } from 'express';
 import { AdminService, AdminOperator } from './admin.service';
 import { BookingService } from '../booking/booking.service';
@@ -12,6 +24,7 @@ import {
     RejectRefundApplyDto,
 } from '../refund/dto/audit-refund-apply.dto';
 import { SendMessageDto } from './dto/send-message.dto';
+import { TriggerTaskDto } from './dto/trigger-task.dto';
 
 @Controller('admin')
 export class AdminController {
@@ -194,6 +207,75 @@ export class AdminController {
             data,
         });
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 定时任务手动触发（测试 / 运维）
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * 手动执行 T1 过期扫描
+     * POST /admin/tasks/expire-scan
+     *
+     * ── 为什么有这个接口 ───────────────────────────────────────────────────
+     * 扫描任务原本只能靠 cron 等到点（T1 每小时 :13、T2 每天 22:00），
+     * 测试环境里没法「立刻跑一次，看它到底扫到了什么」。这里只是把同一个方法调一次，
+     * 不改动任何扫描逻辑，也不绕过静默期与去重。
+     *
+     * ⚠️ **有真实副作用**：把 `bookingDate < 今天` 且未核销的订单置为 expired，
+     * 并给这些订单的用户发站内信。单轮上限 `MESSAGE_SCAN_BATCH_LIMIT`（200）条，
+     * 积压多时要连续调用几轮才能消化完。
+     *
+     * 可传 `quietWindowMinutes` 覆盖本次的静默期（默认 2 小时，0 = 不设），见 `TriggerTaskDto`。
+     */
+    @Post('tasks/expire-scan')
+    @UseGuards(AdminAuthGuard)
+    async triggerExpireScan(@Body() dto: TriggerTaskDto, @Res() res: Response) {
+        const data = await this.bookingService.runExpireScan({
+            quietWindowMs: toQuietWindowMs(dto),
+        });
+        if (data.error) throw new InternalServerErrorException(data.error);
+        return res.status(HttpStatus.OK).send({
+            success: true,
+            message: data.skipped
+                ? '上一轮尚未结束，本次未执行'
+                : `扫描完成：转入过期 ${data.expiredCount} 单，发出通知 ${data.notifiedCount} 条（静默期 ${data.quietWindowMinutes} 分钟）`,
+            data,
+        });
+    }
+
+    /**
+     * 手动执行 T2 每日提醒
+     * POST /admin/tasks/daily-reminder
+     *
+     * ⚠️ 这个任务**设计上跑在每天 22:00**：① 号分支发给「今天已预约但还没核销」的用户，
+     * 文案是「今天快结束了，请尽快核销」。白天或凌晨手动触发，同样会给这批人发出去——
+     * 内容不算错，但换到这个时点就是打扰。测试可以，别当成日常运维手段。
+     */
+    @Post('tasks/daily-reminder')
+    @UseGuards(AdminAuthGuard)
+    async triggerDailyReminder(@Body() dto: TriggerTaskDto, @Res() res: Response) {
+        const data = await this.bookingService.runDailyReminderScan({
+            quietWindowMs: toQuietWindowMs(dto),
+        });
+        if (data.error) throw new InternalServerErrorException(data.error);
+        return res.status(HttpStatus.OK).send({
+            success: true,
+            message: data.skipped
+                ? '上一轮尚未结束，本次未执行'
+                : `提醒完成：核销提醒 ${data.remindedCount} 条，过期可退款提醒 ${data.recalledCount} 条（静默期 ${data.quietWindowMinutes} 分钟）`,
+            data,
+        });
+    }
+}
+
+/**
+ * 分钟 → 毫秒；未传返回 `undefined`，由 service 落到 A 规则的默认 2 小时
+ *
+ * 转换放在这一层而不是 service：service 只认毫秒（它与 cron 共用），
+ * 「分钟」是给 HTTP 调用方看的单位。
+ */
+function toQuietWindowMs(dto: TriggerTaskDto): number | undefined {
+    return dto.quietWindowMinutes === undefined ? undefined : dto.quietWindowMinutes * 60 * 1000;
 }
 
 /**

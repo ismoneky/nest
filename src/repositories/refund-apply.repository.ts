@@ -7,7 +7,7 @@ import {
     RefundApplyStatus,
     REFUND_APPLY_CONSUMED_STATUSES,
 } from '../entities/refund-apply.entity';
-import { serialSave } from '../common/transaction-runner';
+import { serialSave, serialWrite } from '../common/transaction-runner';
 
 /**
  * 审核列表的可选筛选条件
@@ -257,7 +257,7 @@ export class RefundApplyRepository {
         applyNo: string,
         audit: { outRefundNo: string; adminId: number | null; adminName: string | null; remark: string | null; at: number },
     ): Promise<number> {
-        return (await this.refundApplyRepository
+        return serialWrite(this.refundApplyRepository.manager.connection, async () => (await this.refundApplyRepository
             .createQueryBuilder()
             .update(RefundApply)
             .set({
@@ -273,7 +273,7 @@ export class RefundApplyRepository {
             })
             .where('applyNo = :applyNo', { applyNo })
             .andWhere('status = :status', { status: RefundApplyStatus.PENDING })
-            .execute()).affected ?? 0;
+            .execute()).affected ?? 0);
     }
 
     /**
@@ -283,7 +283,7 @@ export class RefundApplyRepository {
         applyNo: string,
         audit: { rejectReason: string; adminId: number | null; adminName: string | null; remark: string | null; at: number },
     ): Promise<number> {
-        return (await this.refundApplyRepository
+        return serialWrite(this.refundApplyRepository.manager.connection, async () => (await this.refundApplyRepository
             .createQueryBuilder()
             .update(RefundApply)
             .set({
@@ -297,7 +297,7 @@ export class RefundApplyRepository {
             })
             .where('applyNo = :applyNo', { applyNo })
             .andWhere('status = :status', { status: RefundApplyStatus.PENDING })
-            .execute()).affected ?? 0;
+            .execute()).affected ?? 0);
     }
 
     /**
@@ -311,7 +311,7 @@ export class RefundApplyRepository {
      * rejected 的单子更不该——那说明这条退款单不属于本申请（outRefundNo 反查已限定）。
      */
     async markSettled(applyNo: string, success: boolean): Promise<number> {
-        return (await this.refundApplyRepository
+        return serialWrite(this.refundApplyRepository.manager.connection, async () => (await this.refundApplyRepository
             .createQueryBuilder()
             .update(RefundApply)
             .set({
@@ -320,7 +320,7 @@ export class RefundApplyRepository {
             })
             .where('applyNo = :applyNo', { applyNo })
             .andWhere('status = :status', { status: RefundApplyStatus.APPROVED })
-            .execute()).affected ?? 0;
+            .execute()).affected ?? 0);
     }
 
     /**

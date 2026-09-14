@@ -214,26 +214,26 @@ export class MessageRepository {
      */
     async markRead(userId: string, ids: number[], now: Date = new Date()): Promise<number> {
         if (ids.length === 0) return 0;
-        const result = await this.messageRepository
+        const result = await serialWrite(this.messageRepository.manager.connection, () => this.messageRepository
             .createQueryBuilder()
             .update(Message)
             .set({ isRead: 1, readAt: now, updatedAt: now })
             .where('userId = :userId', { userId })
             .andWhere('id IN (:...ids)', { ids })
             .andWhere('isRead = 0')
-            .execute();
+            .execute());
         return result.affected ?? 0;
     }
 
     /** 全部标为已读（同一把 userId 条件） */
     async markAllRead(userId: string, now: Date = new Date()): Promise<number> {
-        const result = await this.messageRepository
+        const result = await serialWrite(this.messageRepository.manager.connection, () => this.messageRepository
             .createQueryBuilder()
             .update(Message)
             .set({ isRead: 1, readAt: now, updatedAt: now })
             .where('userId = :userId', { userId })
             .andWhere('isRead = 0')
-            .execute();
+            .execute());
         return result.affected ?? 0;
     }
 
@@ -252,24 +252,24 @@ export class MessageRepository {
      * 这份数据不能被伪造的时间戳污染。
      */
     async markStaleUnreadAsRead(cutoff: Date, now: Date = new Date()): Promise<number> {
-        const result = await this.messageRepository
+        const result = await serialWrite(this.messageRepository.manager.connection, () => this.messageRepository
             .createQueryBuilder()
             .update(Message)
             .set({ isRead: 1, readAt: now, updatedAt: now })
             .where('isRead = 0')
             .andWhere('createdAt <= :cutoff', { cutoff: cutoff.getTime() })
-            .execute();
+            .execute());
         return result.affected ?? 0;
     }
 
     /** 删除 90 天前的消息（含已读与未读，硬删除） */
     async deleteOlderThan(cutoff: Date): Promise<number> {
-        const result = await this.messageRepository
+        const result = await serialWrite(this.messageRepository.manager.connection, () => this.messageRepository
             .createQueryBuilder()
             .delete()
             .from(Message)
             .where('createdAt <= :cutoff', { cutoff: cutoff.getTime() })
-            .execute();
+            .execute());
         return result.affected ?? 0;
     }
 }
