@@ -25,6 +25,7 @@ export class HttpExceptionFilter implements ExceptionFilter {
         let message = 'Internal server error';
         let error = 'Internal Server Error';
         let code: unknown;
+        let taskId: unknown;
         let isUnhandled = false;
 
         // 处理 HTTP 异常
@@ -39,6 +40,8 @@ export class HttpExceptionFilter implements ExceptionFilter {
                 message = responseObj.message || message;
                 error = responseObj.error || error;
                 code = responseObj.code;
+                // 409 批量退款冲突等场景：透传业务定位字段（如当前 RUNNING 任务 taskId）
+                taskId = responseObj.taskId;
             }
             // 仅 5xx 视为需要记录的未处理异常；4xx 属于正常业务分支，不记录
             isUnhandled = status >= 500;
@@ -82,6 +85,8 @@ export class HttpExceptionFilter implements ExceptionFilter {
             // 仅当异常响应自带稳定业务错误码时透传（如乘客业务错误码），
             // 不改变已有非乘客异常的响应字段
             ...(code !== undefined ? { code } : {}),
+            // 仅当异常响应自带 taskId 时透传（批量退款 409 冲突定位当前任务）
+            ...(taskId !== undefined ? { taskId } : {}),
         });
     }
 }

@@ -61,6 +61,25 @@ export enum RefundStatus {
 }
 
 /**
+ * 退款来源
+ */
+export enum RefundSource {
+    USER = 'user', // 用户自助退款
+    BATCH = 'batch', // 管理端批量退款
+}
+
+/**
+ * 批量退款提交状态（仅批量任务目标订单使用；
+ * 用户自助退款不写该字段，保持 null）
+ */
+export enum RefundSubmitStatus {
+    PENDING = 'pending', // 已冻结，待 worker 提交
+    SUBMITTED = 'submitted', // 微信已受理
+    UNKNOWN = 'unknown', // 提交结果未知，待对账收敛
+    FAILED = 'failed', // 微信明确拒绝
+}
+
+/**
  * 预约订单实体
  */
 @Entity('bookings')
@@ -174,6 +193,23 @@ export class Booking {
     /** 商户退款单号 (微信支付) */
     @Column({ nullable: true })
     outRefundNo: string;
+
+    /** 退款来源（user=用户自助，batch=管理端批量） */
+    @Column({ type: 'varchar', nullable: true })
+    refundSource?: RefundSource;
+
+    /** 批量退款任务 ID（目标快照，任务进度按此聚合） */
+    @Column({ type: 'varchar', nullable: true })
+    @Index()
+    refundBatchTaskId?: string;
+
+    /** 批量退款提交状态（pending/submitted/unknown/failed，仅批量目标使用） */
+    @Column({ type: 'varchar', nullable: true })
+    refundSubmitStatus?: RefundSubmitStatus;
+
+    /** 批量退款提交失败的稳定错误码 */
+    @Column({ type: 'varchar', nullable: true })
+    refundSubmitErrorCode?: string;
 
     /** 支付时间 */
     @Column({ type: 'integer', nullable: true, transformer: timestampTransformer })

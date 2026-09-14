@@ -12,6 +12,7 @@ import { BookingModule } from './modules/booking/booking.module';
 import { SystemConfigModule } from './modules/system-config/system-config.module';
 import { UserModule } from './modules/user/user.module';
 import { WechatPayModule } from './modules/wechat-pay/wechat-pay.module';
+import { BatchRefundModule } from './modules/batch-refund/batch-refund.module';
 
 // 导入所有实体
 import { User } from './entities/user.entity';
@@ -24,6 +25,7 @@ import { AdminApplication } from './entities/admin-application.entity';
 import { Feedback } from './entities/feedback.entity';
 import { Member } from './entities/member.entity';
 import { BookingAnomaly } from './entities/booking-anomaly.entity';
+import { BatchRefundTask } from './entities/batch-refund-task.entity';
 import { AppLog } from './entities/app-log.entity';
 import { LoggingModule } from './modules/logging/logging.module';
 import { HttpExceptionFilter } from './filters/http-exception.filter';
@@ -38,7 +40,7 @@ import { APP_FILTER } from '@nestjs/core';
             // SQL 见 docs/implementation-todo.md「生产 schema 变更 SQL（手工执行）」
             synchronize: process.env.NODE_ENV !== 'production',
             logging: process.env.DATABASE_LOGGING === 'true',
-            entities: [User, UserProfile, Admin, Booking, Announcement, SystemConfig, AdminApplication, Feedback, Member, BookingAnomaly],
+            entities: [User, UserProfile, Admin, Booking, Announcement, SystemConfig, AdminApplication, Feedback, Member, BookingAnomaly, BatchRefundTask],
             // busyTimeout：写锁冲突时等待 5 秒而非立即报错。
             // sqlite3 驱动只识别顶层 enableWAL/busyTimeout，extra.pragma 写法不生效
             // （此前 busy_timeout 实际为 0，2026-08-16 12:31 事务报错后修正，
@@ -67,6 +69,7 @@ import { APP_FILTER } from '@nestjs/core';
         WechatPayModule,
         FeedbackModule,
         MemberModule,
+        BatchRefundModule,
     ],
     controllers: [AppController],
     providers: [

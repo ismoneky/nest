@@ -88,6 +88,28 @@ export interface RefundQueryResult {
 }
 
 /**
+ * 退款提交结构化结果（批量退款设计 2.5）
+ * 用户自助退款与批量退款共用同一分类，调用方只决定 Agent、原因和结果展示方式
+ */
+export type RefundSubmitResult =
+    | { state: 'accepted'; refundStatus?: string }
+    | { state: 'rejected'; code: string; message: string }
+    | { state: 'unknown'; code: string; message: string };
+
+/**
+ * 微信退款「明确业务拒绝且可确认未创建退款单」的错误码枚举。
+ * 与支付下单 PAYMENT_START_REJECTED_CODES 同理：只有这些码可以当作 rejected，
+ * 其余业务错误（含超限、余额不足等资金侧错误）无法确认微信侧是否已建退款单，一律归为 unknown，
+ * 由退款对账按固定 outRefundNo 查询收敛（查询得到 NOT_EXIST 才确认未建单）。
+ */
+const REFUND_SUBMIT_REJECTED_CODES = new Set([
+    'PARAM_ERROR', // 参数错误，请求未受理
+    'INVALID_REQUEST', // 请求体不符合规范，未受理
+    'NOT_ENOUGH', // 商户账户余额不足：微信明确拒绝，未创建退款单（补充资金后可人工重试）
+    'FREQUENCY_LIMITED', // 频率限制：未受理，降速后可重试
+]);
+
+/**
  * 微信支付服务
  * 直接调用微信支付 APIv3，使用 WECHATPAY2-SHA256-RSA2048 签名认证
  * 不依赖第三方 npm 包
@@ -105,6 +127,12 @@ export class WechatPayService {
     private apiV3Key: string;       // APIv3 密钥（用于 AES-GCM 解密回调数据）
     private initialized = false;
 
+    /**
+     * 批量退款任务状态重算回调（由 BatchRefundModule 注入，避免模块循环依赖）。
+     * 退款回调更新订单后顺带重算关联任务状态（设计 2.6），失败不影响订单状态。
+     */
+    batchRefundRecalc: ((taskId: string) => Promise<unknown>) | null = null;
+
     // 用户交互 Agent：用户发起支付、用户重试时关闭旧单、申请退款使用。
     // 保留 keep-alive，maxSockets=5，与后台对账 Agent 隔离，避免被后台任务占满 socket。
     readonly interactiveAgent = new https.Agent({
@@ -119,6 +147,16 @@ export class WechatPayService {
     readonly reconciliationAgent = new https.Agent({
         keepAlive: true,
         maxSockets: 2,
+        maxFreeSockets: 1,
+        timeout: 10000,
+    });
+
+    // 批量退款 Agent：批量退款 worker 专用。
+    // 并发 1 + 相邻请求启动间隔至少 300ms（批量退款设计 2.12），
+    // 与交互、对账通道隔离，批量提交不挤占用户请求。
+    readonly batchRefundAgent = new https.Agent({
+        keepAlive: true,
+        maxSockets: 1,
         maxFreeSockets: 1,
         timeout: 10000,
     });
@@ -500,19 +538,28 @@ export class WechatPayService {
     }
 
     /**
-     * 申请退款（用户主动发起，使用交互 Agent）
+     * 申请退款（结构化结果，不抛异常，由调用方按 state 决策）
      * 官方文档：POST /v3/refund/domestic/refunds
+     * 用户自助退款使用 interactiveAgent，批量退款 worker 传 batchRefundAgent；
+     * 错误语义（accepted / rejected / unknown）见 RefundSubmitResult。
      */
-    async refund(outTradeNo: string, outRefundNo: string, totalAmount: number, refundAmount: number) {
+    async refund(
+        outTradeNo: string,
+        outRefundNo: string,
+        totalAmount: number,
+        refundAmount: number,
+        opts?: { reason?: string; agent?: https.Agent },
+    ): Promise<RefundSubmitResult> {
         this.assertInitialized();
 
         try {
-            return await this.request(
+            const data = await this.request<any>(
                 'POST',
                 '/v3/refund/domestic/refunds',
                 {
                     out_trade_no: outTradeNo,
                     out_refund_no: outRefundNo,
+                    reason: opts?.reason,
                     notify_url: `${this.getApiBaseUrl()}/wechat-pay/refund-notify`,
                     amount: {
                         refund: refundAmount,
@@ -520,11 +567,25 @@ export class WechatPayService {
                         currency: 'CNY',
                     },
                 },
-                { agent: this.interactiveAgent },
+                { agent: opts?.agent ?? this.interactiveAgent },
             );
+            return { state: 'accepted', refundStatus: data?.refund_status };
         } catch (error) {
-            this.logger.error('申请退款失败', error);
-            throw new BadRequestException('申请退款失败');
+            if (error instanceof WechatApiError) {
+                const code = error.body?.code ?? `HTTP_${error.statusCode}`;
+                const message = error.body?.message ?? `微信退款请求失败 [${error.statusCode}]`;
+                if (REFUND_SUBMIT_REJECTED_CODES.has(code)) {
+                    this.logger.warn(`微信明确拒绝退款: ${outRefundNo}, code=${code}`);
+                    return { state: 'rejected', code, message };
+                }
+                // 其余非 2xx（含用户账户异常等资金侧错误）：无法确认微信侧是否已建退款单
+                this.logger.error(`微信退款结果未知: ${outRefundNo}, code=${code}`, message);
+                return { state: 'unknown', code, message };
+            }
+            // 超时 / 连接断开 / 响应无法解析
+            const code = error instanceof PaymentRequestError ? error.code : 'REFUND_SUBMIT_UNKNOWN';
+            this.logger.error(`微信退款请求异常: ${outRefundNo}, code=${code}`, (error as Error)?.message);
+            return { state: 'unknown', code, message: (error as Error)?.message ?? '微信退款请求异常' };
         }
     }
 
@@ -647,6 +708,15 @@ export class WechatPayService {
         } else if (refundStatus === 'ABNORMAL' || refundStatus === 'CLOSED') {
             await this.bookingRepo.markRefundFailed(booking.bookingId, booking.outRefundNo);
             await this.bookingRepo.resolveAnomaly(booking.bookingId, AnomalyType.REFUND_QUERY_REPEATED_FAILURE, '退款回调确认终态失败', now);
+        }
+
+        // 批量退款订单：尽力而为重算任务状态（失败不影响订单退款状态，Cron 兜底）
+        if (booking.refundBatchTaskId) {
+            try {
+                await this.batchRefundRecalc?.(booking.refundBatchTaskId);
+            } catch {
+                // 尽力而为，忽略
+            }
         }
     }
 

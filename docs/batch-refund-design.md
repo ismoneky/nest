@@ -1,8 +1,7 @@
-# 一键批量退款 + 用户通知体系 — 产品与技术方案
+# 选择性批量退款（一期）— 产品与技术方案
 
-> 状态：方案设计（未实施）
-> 日期：2026-08-16
-> 关联：天气应急关闭场景；日单量 1000-1500，节假日峰值更高
+> 状态：方案更新（2026-08-21）。前一版为"按预约日期整批退款"，经产品复盘改为"订单列表勾选退款"；日期整批作为"筛选日期 + 全选"的特例被覆盖，不再单独存在。
+> 关联：天气应急关闭场景 + 日常运营零散退款；单次规模约数百单。
 
 ---
 
@@ -10,215 +9,326 @@
 
 ### 1.1 业务场景
 
-天气不稳定临时关闭景区时，管理员需要把"某日期预约但未完成核验"的订单**批量退款**并**触达用户**。核心诉求：
+- **应急**：天气不稳定临时关闭景区，把某日期已支付订单批量退款（几百到上千单）。
+- **日常**：运营/客服在订单管理中挑选特定订单退款（几单到几百单），包括已核验订单的售后处理。
 
-- 应急操作，路径要短、防误触
-- 量大（最多一次约 1500 单），不能卡页面
-- 用户必须知道"钱退了、为什么退、几天到账"
+两种场景共用同一个入口和同一条后端链路。
 
-### 1.2 已确认的产品决策
+### 1.2 已确认的产品决策（2026-08-21 定稿）
 
 | 决策点 | 结论 |
 |---|---|
-| 管理端入口 | **独立"批量退款"菜单页**（含历史任务列表） |
-| 退款范围 | **按预约日期整批**：该日全部"已支付未核验"订单，不做细分筛选 |
-| 用户感知 | **静默退款 + 多渠道告知**（见 1.4） |
-| 确认强度 | 预览（单数/金额/不可退明细）→ 填退款原因 → Popconfirm 点击确认 |
-| 通知形态 | **定向站内通知（新能力）**：管理员编辑文案 → 发给被执行退款的用户 → 小程序内未读展示 → 点"我知道了"标记已读 |
-| 权限 | 复用现有管理端登录，不做单独角色 |
-| 补退 | 本次不做；被排除订单（如已完成核验）走订单页详情手动处理 |
-| 执行模式 | 异步任务 + 进度轮询，页面可关闭，任务后台执行 |
+| 管理端入口 | **订单管理列表页**：复用已有日期等筛选，勾选订单后操作；不做独立菜单页 |
+| 选择方式 | 逐单勾选 + "全选当前筛选结果"（经 ID 列表接口收集，见 2.3） |
+| 退款资格 | **管理员不看业务状态**（已核验/已取消均可退），仅保留资金硬约束（见 1.4）；用户自助退款规则不变 |
+| 退款金额 | **只支持全额退**；一单只退一次，固定单号 `RF{bookingId}` 幂等 |
+| 单次规模 | 约数百单；持久化异步任务 + 进度轮询，页面可关闭 |
+| 用户感知 | 静默退款 + 微信支付原生退款通知；站内通知放二期 |
+| 确认强度 | 预览（单数/金额/不可退明细）→ 填退款原因 → 强确认 |
+| 权限 | 复用现有管理端登录；任务记录执行管理员 |
+| 补退 | 不做；失败订单从订单详情页人工处理 |
+| 暂停/撤销 | 不支持；确认后立即开始向微信提交 |
 
 ### 1.3 管理端交互流程
 
-```
-┌─ 批量退款页 ────────────────────────────────────────────┐
-│                                                          │
-│  ① 选预约日期 ────→ ② 预览                               │
-│     DatePicker        ├ 可退：1234 单 / ¥61,700 / 3100 人 │
-│                      ├ 不可退分桶：已完成 45 / 退款中 3 /    │
-│                      │   已退款 12 / 免费单 80 / 未支付 30  │
-│                      └ 折叠明细（前 200 条，掩码展示）      │
-│                                                          │
-│  ③ 退款原因（2-80 字，透传微信退款单，用户微信账单可见）      │
-│  ④ 通知标题 + 内容（预填建议文案，可编辑；含到账说明）        │
-│                                                          │
-│  ⑤ [红色按钮] 执行批量退款 ── Popconfirm："将向微信提交      │
-│     1234 笔退款申请，确认执行？"                            │
-│                                                          │
-│  ⑥ 进度面板：Progress 条 + 已退/成功/失败/跳过 计数          │
-│     + 已退金额；3s 轮询；完成后展示结果与失败单去向说明       │
-│                                                          │
-│  ⑦ 底部：历史任务表（最近 20 条，可查看每次执行详情）         │
-└──────────────────────────────────────────────────────────┘
+```text
+┌─ 订单管理页 ─────────────────────────────────────────────┐
+│  ① 用现有筛选（日期/时段/状态等）缩小范围                  │
+│  ② 勾选订单（逐单 / 全选本页 / 全选当前筛选结果）           │
+│  ③ 点【批量退款】→ 预览弹层：                             │
+│     ├ 可退：342 单 / ¥17,100 / 850 人                     │
+│     ├ 不可退：未支付 3 / 退款中 1 / 已退款 2 / …          │
+│     │   （每桶附具体订单号，供核对剔除）                    │
+│     └ 可退明细（掩码，前 200 条）                          │
+│  ④ 退款原因（2-80 字，透传微信退款申请）                    │
+│  ⑤ [红色按钮] 执行 ── 强确认：                            │
+│     "将立即向微信提交 342 笔退款申请，共 ¥17,100。          │
+│      执行后不能暂停或撤销，是否确认？"                       │
+│  ⑥ 进度面板：待提交 / 处理中 / 已确认 / 失败               │
+│     + 已确认退款金额；3-5 秒轮询                           │
+│  ⑦ 历史任务表（最近 20 条，可查看执行详情）                 │
+└───────────────────────────────────────────────────────────┘
 ```
 
-### 1.4 用户触达（三渠道，优先级从高到低）
+预览只反映查询时的状态。管理员确认后，后端按相同条件重新校验并冻结订单，最终任务单数以执行接口返回的 `totalTarget` 为准。
 
-| 渠道 | 内容 | 依赖 | 覆盖率 |
-|---|---|---|---|
-| 微信支付原生退款通知 | 微信"服务通知"里的绿字退款提醒 | 无需开发（APIv3 退款自带） | 100%（已关注服务通知的用户） |
-| 站内通知（本次新建） | 管理员编辑的文案，未读强提示，点"我知道了"变已读 | 新实体 + 小程序通知中心 | 100%（下次打开小程序时） |
-| 订阅消息 | 退款结果摘要（一次性订阅模板） | 后端 access_token + 小程序端授权采集 + 模板申请 | 有限（一次性授权，发一条耗一次） |
+### 1.4 管理员退款资格（相对用户自助的关键变化）
 
-设计要点：**站内通知为主渠道**（确定触达、可承载完整文案、可读状态闭环），订阅消息为增强（不依赖其成功），微信原生通知为兜底（零成本自带）。
+**不检查业务状态**：`status` 为 CONFIRMED / COMPLETED / CANCELLED 均可退。仅保留资金硬约束：
 
-### 1.5 小程序端通知交互
+```text
+paymentStatus = PAID
+refundStatus IN (NONE, FAILED)
+isFree = false
+amount > 0
+outTradeNo IS NOT NULL
+paidAt IS NOT NULL
+当前时间未超过 paidAt 后一年（微信侧退款有效期，管理员无法突破）
+```
 
-- **App onShow**：有登录态时静默拉未读数（失败无感），驱动 tabbar/首页红点
-- **首页**：公告轮播条上方显示"通知条"（有未读时），点击进入通知中心
-- **通知中心**（新页面）：未读在前 + 时间；内容展示 + "我知道了"按钮 → 调已读接口 → 未读数刷新
+不满足的订单按以下原因分桶（附具体订单号）：
+
+- 未支付
+- 免费单或金额为 0
+- 退款处理中
+- 已退款
+- 支付时间超过退款有效期
+- 数据异常：缺少 `outTradeNo`、`paidAt` 或金额非法
+
+用户自助退款维持原规则（已核验不可退等），两套规则在资格模块中显式分开，不互相复用条件。
+
+### 1.5 一期用户触达
+
+一期只依赖微信支付退款流程自带的原生退款通知。站内通知、订阅消息全部放到二期，一期不修改小程序端。
 
 ---
 
 ## 二、技术方案
 
-### 2.1 核心设计原则（已对现有代码验证）
+### 2.1 核心设计原则
 
-1. **不新建退款状态机**：逐单复用 `markRefundStarting`（条件 UPDATE：confirmed+paid+refundStatus IN(none,failed) → REFUNDING，原子防并发，与用户自助退款/退款对账 Cron 天然互斥）
-2. **先落库再调微信**：微信调用失败不回滚 REFUNDING，交给现有退款对账 Cron（每 15 分钟）+ 异常升级通道收敛——单笔退款的既有语义，批量照抄
-3. **执行引擎独立**：不共享 BookingService 的 writeChain/semaphore（避免上千单拖慢对账 Cron 写回），自建单写者 FIFO + 并发 5（对齐 `interactiveAgent` maxSockets=5，本身就是限流）
-4. **bookings 表即逐单真相**：任务表只存计数 + bookingId 快照（targetsJson），不建逐单明细表；恢复 = 重扫快照，幂等（已处理单 markRefundStarting 返回 0 自动跳过）
-5. **通知尽力而为**：收尾统一发送（openid 去重一人一条）、订阅消息 43101（未授权）静默、通知失败绝不影响退款状态
+1. **资格判断只有一份**：预览和执行共用同一个资格模块；执行时必须重新校验，不能信任预览结果。
+2. **任务创建和冻结订单同事务**：确认后在一个事务中创建任务并批量标记目标订单，不留半成品。
+3. **先冻结再调微信**：目标订单先写入 `REFUNDING + BATCH + PENDING + taskId`，立即阻止用户重复申请；worker 随后逐笔提交。
+4. **冻结不排对账**：PENDING 订单**不设置** `reconcileKind/reconcileNextAt`；只有提交拿到微信应答后才排对账（SUBMITTED→15 分钟，UNKNOWN→1 分钟）。PENDING 的恢复只走 worker + Cron 兜底，对账任务不得触碰未提交订单。（否则对账会按 NOT_EXIST 把未提交订单误判 FAILED，worker 随后仍提交，钱退了订单却卡死 FAILED。）
+5. **固定退款单号保证幂等**：始终使用已有 `outRefundNo`，没有时生成固定的 `RF${bookingId}`；结果未知时先查询，不生成新退款单号，也不立即重复 POST。
+6. **持久化任务、串行提交**：单实例、单 worker、微信请求并发 1；每次只领取一笔 PENDING 订单。
+7. **进度以订单真实状态为准**：任务详情按 `refundBatchTaskId` 实时聚合 bookings，不维护另一套逐单累加计数。
 
-### 2.2 后端架构（nest）
+### 2.2 管理员退款资格（资格模块改造）
 
-#### 新增模块
+`refund-eligibility.ts` 拆为两套显式规则：
 
-```
-src/entities/user-notification.entity.ts     # 站内通知（user_notifications 表）
-src/entities/batch-refund-task.entity.ts     # 批量任务（batch_refund_tasks 表）
-src/repositories/user-notification.repository.ts
-src/repositories/batch-refund-task.repository.ts
-src/modules/batch-refund/                    # 批量退款（controller + service + dto + module）
-src/modules/wechat-mp/                       # 小程序 access_token + 订阅消息发送
+- **管理员版**（选择性批量退款用）：1.4 的资金硬约束，无业务状态检查。
+  - `classifyAdminRefundEligibility(booking, now)`：预览分桶（勾选订单逐单分类）。
+  - `applyAdminRefundableConditions(qb, alias, now)`：执行冻结的 SQL 条件。
+- **用户版**：维持 `initiateRefund` 现有内联校验，不改动。
+
+预览与执行同源，一致性由对照测试保证。
+
+### 2.3 后端架构（nest）
+
+#### 模块结构（已存在，改造）
+
+```text
+src/entities/batch-refund-task.entity.ts        # bookingDate 列语义调整（见下）
+src/repositories/batch-refund-task.repository.ts # 不变
+src/repositories/booking.repository.ts          # 预览/冻结改为按 ID 列表 + 资金条件
+src/modules/batch-refund/                       # controller + service + dto + module
 ```
 
 #### 修改文件
 
 | 文件 | 变更 |
 |---|---|
-| `modules/wechat-pay/wechat-pay.service.ts` | `refund()` 加可选 `opts?: { reason?: string }`（截断 80 字符），现有调用点零改动 |
-| `repositories/booking.repository.ts` | 新增 3 个查询：预览聚合（GROUP BY 分桶）、不可退明细（限量 200）、可退目标列表 |
-| `entities/system-config.entity.ts` | 加 `mpMessageConfigJson` 列（订阅消息开关 + 模板 ID），照抄 noticeConfig 虚拟 getter/setter 模式 |
-| `modules/system-config/` | DTO 加 MpMessageConfigDto；加公开子端点 `GET /system-config/mp-message-config-public`（小程序拉模板 ID） |
-| `modules/user/user.controller.ts` | 用户侧通知端点：未读列表 / 标记已读 / 未读数（wx-login 响应顺带 unreadCount） |
-| `app.module.ts` | 注册新实体与模块 |
-| `docs/implementation-todo.md` | 生产环境手工 SQL（两张新表 + system_configs 加列） |
+| `modules/batch-refund/refund-eligibility.ts` | 改为管理员版资格（去 status 条件），预览按传入订单分类 |
+| `repositories/booking.repository.ts` | `getBatchRefundPreview(bookingIds)` 按 ID 列表取单分类；`freezeBookingsForBatchRefund(em, bookingIds, taskId)` 改 `bookingId IN` + 资金条件，**不再设置 reconcile 调度字段** |
+| `modules/batch-refund/dto/batch-refund.dto.ts` | preview/execute 入参改 `bookingIds: string[]`（1-1000 个）+ reason |
+| `modules/batch-refund/batch-refund.service.ts` | preview/execute 按 ID 列表；任务摘要写入 selectionSummary |
+| `entities/batch-refund-task.entity.ts` | `bookingDate` → `selectionSummary`（可空，存去重日期摘要） |
+| `modules/booking/booking.service.ts` | **P0-2 修复**：`initiateRefund` 非 accepted 一律抛 BadRequestException，保持小程序旧契约（fctl 只认 HTTP 状态/success） |
+| `modules/wechat-pay/wechat-pay.service.ts` | 已完成：结构化 RefundSubmitResult + batchRefundAgent，不变 |
+| `docs/implementation-todo.md` | 更新任务表建表 SQL（表未上生产，直接改不迁移） |
 
-#### API 设计（批量退款，全部 AdminAuthGuard）
+#### 任务表字段
 
+`batch_refund_tasks`（相对前版唯一变化：`bookingDate` → `selectionSummary`）：
+
+```text
+taskId                  唯一任务 ID
+selectionSummary        选择摘要（去重预约日期逗号拼接，截断 100 字符；可空）
+status                  RUNNING | SUBMISSION_COMPLETED | COMPLETED | COMPLETED_WITH_FAILURES
+totalTarget             事务冻结成功的实际订单数
+reason                  实际使用的退款原因
+operatorAdminId         执行管理员 ID
+createdAt / startedAt / submissionCompletedAt / completedAt / lastHeartbeatAt
+errorSummary            批量提交过程中的错误摘要
 ```
-GET  /admin/batch-refund/preview?bookingDate=YYYY-MM-DD
+
+`refundBatchTaskId` 就是订单目标快照。同一时刻最多一个 RUNNING 任务由数据库部分唯一索引保证。
+
+#### API 设计（全部使用 AdminAuthGuard）
+
+```text
+POST /admin/batch-refund/preview
+     ← { bookingIds: string[] }（1-1000）
      → { refundable: {count, totalAmount, peopleCount},
-         unrefundable: [{reason, label, count}...],
-         detailPreview: [...前200条掩码明细],
-         suggestedNotice: {title, content},   # 预填文案
-         runningTask: null | {taskId, processed, total} }
+         unrefundable: [{reason, label, count, bookingIds}...],
+         detailPreview: [...前 200 条掩码明细],
+         runningTask: null | {taskId, pending, total} }
 
 POST /admin/batch-refund/execute
-     ← { bookingDate, reason, notifyTitle, notifyContent }
-     → { taskId, totalTarget, status: 'running' }   # 立即返回
-     错误：409 已有任务执行中 / 400 无可退订单
+     ← { bookingIds: string[], reason }
+     → { taskId, totalTarget, status: 'RUNNING' }
+     错误：409 已有 RUNNING 任务（同时返回 taskId）/ 400 无可退订单
 
-GET  /admin/batch-refund/tasks            # 最近 20 条历史
-GET  /admin/batch-refund/tasks/:taskId    # 进度（前端 3s 轮询）
+GET  /admin/batch-refund/tasks        → 最近 20 条历史任务
+GET  /admin/batch-refund/tasks/:taskId → 任务元信息 + 实时聚合进度
 ```
 
-#### 执行引擎时序
+另需订单列表配套（"全选当前筛选结果"）：
 
-```
-管理员点执行 → INSERT task → 抢占 running → 返回 taskId
-→ setImmediate 主循环（逐单）：
-    markRefundStarting ── affected=0 → skipped（已被转 completed/并发退款等）
-    └─ 成功 → semaphore(5) 调 refund(outTradeNo, RF${bookingId}, amount, amount, {reason})
-              → 受理成功 succeeded / throw failed（不回滚，对账 Cron 接管）
-    进度计数进独立单写者 FIFO（与微信调用隔离，SQLite 写串行）
-→ 主循环完 → 写队列排空 → 等 90s（退款回调窗口）
-→ 收尾：
-    按 bookings 实际 REFUNDED 汇总 refundedTotalAmount
-    → targets 按 openid 去重，批量创建站内通知（一人一条：您有 N 单共 X 元已退款…）
-    → 订阅消息（去重，并发 2，43101 静默）
-    → markFinished('completed')
-→ 退款回调全程随时到达（markRefundSucceeded），与任务互不干扰
+```text
+GET  /admin/bookings/ids?<与订单列表相同的筛选参数>
+     → { ids: string[], total }（超过 1000 报错，提示缩小筛选范围）
 ```
 
-#### 防重入与恢复
+不提供暂停、继续、撤销或取消接口。
 
-- 同进程：service 内存锁 `runningTaskId` + controller 层 `findLatestRunning()` 双重检查（409）
-- 服务重启：任务表保持 running；恢复 Cron（`@Cron('0 11,41 * * * *')`，错开现有任务）发现无内存锁的 running 任务 → 从 targetsJson 筛"仍满足可退条件"的单幂等续跑；卡 REFUNDING 的交给对账 Cron
+### 2.4 创建任务与冻结订单
 
-#### 站内通知设计
+```text
+BEGIN（事务）
+→ 检查是否已有 RUNNING 任务（有则 409 + taskId）
+→ INSERT task（selectionSummary = 所选订单去重日期摘要）
+→ 批量 UPDATE bookings：
+     WHERE bookingId IN (:ids) AND <管理员资金硬条件>
+     SET refundStatus = REFUNDING
+         refundSource = BATCH
+         refundSubmitStatus = PENDING
+         refundBatchTaskId = taskId
+         outRefundNo = COALESCE(outRefundNo, 'RF' || bookingId)
+     -- 不设置 reconcileKind/reconcileNextAt（原则 4）
+→ 使用 UPDATE affected 作为 totalTarget
+→ affected = 0：ROLLBACK，返回 400
+→ 更新 task.totalTarget
+COMMIT
+→ 立即返回 taskId
+→ 启动 worker
+```
 
-- `user_notifications` 以 **openid 为键**（不依赖 users 表外键，历史订单用户未注册 users 也兼容）
-- 字段：notificationId(唯一)、wechatOpenId、type（'batch_refund'，留扩展）、title、content、relatedBookingDate、taskId、isRead、readAt
-- 批量插入分批 100 条；标记已读用"notificationId + openid"双条件 UPDATE（防越权）
-- 内容模板（收尾时按用户聚合）：`您预约 {date} 的 {N} 笔订单共 {X} 元已退款，预计 1-3 个工作日内原路退回。{管理员填写的原因补充}`
+事务中只做本地数据库操作，绝不调用微信。ID 列表由 DTO 限制 1-1000 个（请求体 192 KiB 内）。
 
-#### 订阅消息（WechatMpService）
+并发 execute 撞上唯一索引时，捕获唯一约束错误 → 查当前 RUNNING → 返回 409 + taskId（不暴露 500）。
 
-- `getAccessToken(force?)`：GET /cgi-bin/token（复用 WX_APPID/WX_SECRET 环境变量），进程内缓存（提前 5 分钟过期）+ 单飞刷新（防并发击穿）；不用 stable_token（单实例无必要）
-- `sendRefundNotify(openid, page, data)`：POST /cgi-bin/message/subscribe/send；errcode 40001/42001（token 失效）强刷重试一次；43101（未授权）/47003/40003 静默返回 false；**任何情况不抛异常**
-- 独立 https.Agent(maxSockets=2)，与支付通道隔离
-- 前置：微信公众平台申请"退款通知"一次性订阅模板，模板 ID 配置进 system-config（管理端可改，运营可自助换模板）
+### 2.5 退款提交结果接口
 
-### 2.3 管理端（admin）
+`WechatPayService.refund()` 已完成结构化改造：
 
-- **MainLayout 加菜单"批量退款"**（SafetyCertificateOutlined）+ 路由
-- **新页面 `src/pages/batch-refund/index.tsx`**：预览区（DatePicker + Statistic 四卡 + 不可退 Alert + Collapse 明细）→ 表单区（原因/通知标题/通知内容，通知文案预填可编辑）→ 执行按钮（红色 + Popconfirm）→ 进度面板（Progress + 计数 + 轮询，>90% 降频 10s）→ 历史任务表
-- **系统配置页**加"通知设置"卡片：订阅消息开关 + 退款模板 ID
-- 新建 `src/api/batchRefund.ts`（四个接口封装）
-- antd 6：Modal 用 `open`；不引入新依赖；页面组件拆分（PreviewPanel / ProgressPanel / HistoryTable）避免单文件膨胀
+```typescript
+type RefundSubmitResult =
+    | { state: 'accepted'; refundStatus?: string }
+    | { state: 'rejected'; code: string; message: string }
+    | { state: 'unknown'; code: string; message: string };
+```
 
-### 2.4 小程序端（fctl）
+**调用方契约（P0-2）**：
 
-- **新建 `utils/subscribe.js`**：拉公开配置拿模板 ID → enabled 才 `uni.requestSubscribeMessage`，全链路 catch 静默（免费单不采集，避免无谓弹窗）
-- **授权采集时机**：booking-detail"立即支付"按钮 tap 回调为主（手势链路内最稳）+ `payment.js checkPayStatusOnce` paid 分支为兜底（fire-and-forget）
-- **新建 `pages/notifications/notifications.vue`** + pages.json 注册：通知列表，未读在前，"我知道了"调已读接口
-- **App.vue onShow**：有 token 时静默拉未读数存 globalData（失败无感）
-- **首页 index.vue**：公告轮播条上方加通知条（未读 > 0 时显示），点击跳通知中心
+- 批量 worker：按 state 写回 SUBMITTED / FAILED / UNKNOWN。
+- 用户自助 `initiateRefund`：**非 accepted 一律抛 BadRequestException**（rejected 透传微信 message，unknown 提示稍后查看）。小程序端按 HTTP 状态/success 判断成败，一期不改 fctl，必须保持旧契约。
 
-### 2.5 边界情况
+### 2.6 worker 执行时序（不变）
+
+```text
+事务冻结完成
+→ 单 worker 循环领取当前 taskId 下一笔 PENDING 订单
+→ 并发 1，相邻请求启动间隔至少 300ms
+→ 调微信退款，固定使用订单 outRefundNo
+
+accepted → refundSubmitStatus = SUBMITTED；reconcileKind=refund，15 分钟后对账
+rejected → refundSubmitStatus = FAILED；refundStatus = FAILED；保存稳定错误码；清空调度
+unknown  → refundSubmitStatus = UNKNOWN；保持 REFUNDING；1 分钟后先查询，不立即重复 POST
+
+→ 无 PENDING → task.status = SUBMISSION_COMPLETED，写 submissionCompletedAt
+```
+
+订单结果由现有退款回调和退款对账收敛。NOT_EXIST 按"至少一次延迟复查"处理：第一次查无 → 5 分钟后复查；复查仍无 → FAILED（避免微信建单传播延迟误判；同 outRefundNo 重提幂等，不会双退）。
+
+任务状态推进：仍有 PENDING→RUNNING；无 PENDING 但有 REFUNDING→SUBMISSION_COMPLETED；全部 REFUNDED→COMPLETED；全部终态且有 FAILED→COMPLETED_WITH_FAILURES。回调更新订单后尽力重算关联任务；恢复 Cron 扫描 SUBMISSION_COMPLETED 兜底推进终态。
+
+### 2.7 进度统计（不变）
+
+按 `refundBatchTaskId` 聚合互斥计数：`pending + processing + confirmed + failed = total`；金额单位分。
+
+### 2.8 防重入与恢复（不变）
+
+- 数据库保证同一时刻最多一个 RUNNING 任务；创建与冻结同事务。
+- 执行接口重入返回 409 + 当前 taskId。
+- 应用启动恢复 RUNNING 任务的 PENDING 订单；Cron 每 10 分钟兜底无活跃 worker 的 RUNNING 任务。
+- 恢复依据只能是 `refundBatchTaskId + refundSubmitStatus=PENDING`，不按选择条件重新筛选。
+- 单实例部署前提不变。
+
+### 2.9 管理端（admin）
+
+- 订单管理列表页改造：勾选列、全选本页、全选当前筛选结果（调 `/admin/bookings/ids`）、【批量退款】操作按钮
+- 预览弹层组件（可退聚合 + 不可退分桶附订单号 + 掩码明细 + 原因输入 + 强确认）
+- 进度面板组件（3-5 秒轮询任务详情；失败去向说明）
+- 历史任务抽屉/弹层（最近 20 条 + 详情）
+- 新建 `src/api/batchRefund.ts`，封装四个接口
+- 执行成功后显示实际 `totalTarget` 并切换到进度面板；有 RUNNING 任务时禁止再次执行并跳转当前任务
+- 不提供暂停、继续、撤销按钮
+
+### 2.10 小程序端（fctl）
+
+一期不修改。用户自助退款契约保持不变（见 2.5）。
+
+### 2.11 边界情况
 
 | # | 场景 | 行为 |
 |---|---|---|
-| 1 | 部分成功部分失败 | succeeded/failed/skipped 如实展示；failed 单卡 REFUNDING 由退款对账 Cron 15min 后收敛（NOT_EXIST→failed 可重试 / attempts≥3→异常表人工处理） |
-| 2 | 并发点击执行 | DB findLatestRunning 409 + service 内存锁 |
-| 3 | 历史日期订单已被每小时 Cron 转 completed | 预览列入"已完成"分桶明示；执行时 markRefundStarting=0 → skipped |
-| 4 | isFree / amount=0 | 目标查询排除（isFree=false AND amount>0，微信拒绝 0 元退款单） |
-| 5 | 重复执行同一天 | 第二次预览只剩残余可退单；已 REFUNDING/REFUNDED 进不可退分桶；条件 UPDATE 防重复扣款 |
-| 6 | 用户自助退款撞上批量 | markRefundStarting 原子互斥，后到者 affected=0 → skipped |
-| 7 | 执行中服务重启 | 任务表保持 running；恢复 Cron 30 分钟内幂等续跑；窗口期前端显示进行中 |
-| 8 | 退款回调先于计数落库 | 无冲突：回调写 bookings，计数写任务表，两张表互不依赖 |
-| 9 | 微信退款网络超时（结果未知） | 保持 REFUNDING + 固定 RF 单号 → 对账 Cron 查证收敛（与单笔退款同语义） |
-| 10 | access_token 失效 | 强刷一次重试；再失败静默 |
-| 11 | 订阅消息发送失败 | 全静默；不影响退款与任务状态 |
-| 12 | 站内通知创建失败 | failureSummary 记录，任务仍 completed；管理员可手动补发 |
-| 13 | reason 超 80 字符 | DTO 校验 + 传微信前截断 |
-| 14 | 管理员执行中关页面 | 任务后台继续；重开页面通过历史任务/进行中提示续看 |
-| 15 | 用户不点"我知道了" | 未读持续保留，不强制消费 |
+| 1 | 预览后订单状态变化 | 执行时重新按资金条件冻结；最终数量以 totalTarget 为准 |
+| 2 | 并发点击执行 | 事务检查 + 唯一索引；后来的请求收到 409 + 当前 taskId |
+| 3 | 用户自助退款与批量退款竞争 | 通过 refundStatus 条件 UPDATE 竞争，只有一方能进入 REFUNDING |
+| 4 | 勾选了已在退款中/已退款的订单 | 预览分桶展示并排除；执行时条件不符自动剔除 |
+| 5 | 勾选已核验/已取消订单 | 管理员版规则允许，正常退款 |
+| 6 | 免费、0 元、未支付或数据异常 | 不进入任务，预览按原因分桶附订单号 |
+| 7 | 超过退款有效期 | 不进入任务，列入"超过退款有效期"分桶 |
+| 8 | 服务在创建任务时退出 | 创建任务与冻结订单同事务，不留半成品 |
+| 9 | 服务在微信请求中退出 | 固定退款单号；PENDING 由 worker 恢复续跑，UNKNOWN/SUBMITTED 由对账接管 |
+| 10 | 微信请求超时或断开 | 写 UNKNOWN 并先查询，不立即重复 POST |
+| 11 | 微信明确拒绝 | 写 FAILED 和错误码，后续从订单详情人工处理 |
+| 12 | 回调先于 worker 状态写回 | 使用当前状态条件更新，不允许把 REFUNDED 回退为 REFUNDING |
+| 13 | 管理员关闭页面 | worker 后台继续；重开页面从任务接口恢复进度 |
+| 14 | 对账扫到 PENDING 订单 | 不会发生：PENDING 不排对账（原则 4），对账候选排除 refundSubmitStatus=PENDING（双保险） |
+| 15 | NOT_EXIST 误判 | 第一次查无延迟 5 分钟复查，复查仍无才 FAILED；同单号重提幂等 |
 
-### 2.6 性能与容量估算
+### 2.12 性能与容量
 
-- 1500 单 × 每单约 300-500ms（并发 5）≈ **8-12 分钟**跑完，符合"轮询看进度"预期
-- 进度计数每单一次单行 UPDATE（SQLite 微秒级），无压力
-- 站内通知：1500 单 → 按 openid 去重后约 1000+ 条插入，分批 100 条 × 10 批
-- SQLite 全程无长事务（单写者 FIFO 模式），不影响在线业务
+- 单次规模约数百单；DTO 限制 bookingIds 1-1000 个（请求体 192 KiB 内，约 40 KB）
+- 批量通道并发 1，相邻请求启动间隔至少 300ms；500 单约 3-7 分钟完成提交
+- worker 每次只查询一笔 PENDING，不预加载全部订单
+- 微信 HTTP 不在 SQLite 事务内；事务只负责创建任务和冻结目标
+- 任务进度每 3-5 秒聚合一次当前 taskId 的订单
+- 首版不引入消息队列、分布式任务调度或多实例 worker 租约
+
+---
 
 ## 三、实施顺序（每步独立可验证）
 
 | 步骤 | 内容 | 验证方式 |
 |---|---|---|
-| 1 | 站内通知底座（实体/仓储/端点/小程序通知中心） | 独立可先上线积累能力 |
-| 2 | `refund()` 加 reason 参数 | 单笔退款回归 |
-| 3 | 任务实体 + system-config 加列 + 生产 SQL 文档 | dev 启动建表验证 |
-| 4 | 预览接口 | curl 对比订单页筛选结果 |
-| 5 | 执行引擎 + 进度端点 + 恢复 Cron | 测试库造数（含异常单）验证流转；kill 进程验证恢复 |
-| 6 | 收尾链路（金额汇总 + 站内通知 + 订阅消息） | 任务收尾后通知落库 |
-| 7 | WechatMpService（token + 发送） | 测试号模板自测 |
-| 8 | admin 前端（批量退款页 + 配置卡片） | dev 联调全流程 |
-| 9 | fctl 授权采集 + 首页通知条 | 支付授权弹窗 → 退款收消息 |
+| 0a | **P0-1 修复**：冻结不写 reconcile 调度字段；对账候选排除 PENDING | 回归测试：冻结后 15 分钟对账不触碰未提交订单 |
+| 0b | **P0-2 修复**：initiateRefund 非 accepted 抛 400 | 契约测试：rejected/unknown → 400，fctl 无需改动 |
+| 1 | 资格模块改管理员版（去 status），预览/执行同源 | 覆盖已核验可退、免费、未支付、超期等数据 |
+| 2 | 任务表 selectionSummary + 生产 SQL 更新 | dev 建表检查 |
+| 3 | preview/execute 改 ID 列表入参，冻结改 IN 条件 | 并发执行只一个 RUNNING；勾选混合状态订单验证分桶与冻结一致 |
+| 4 | 对账 NOT_EXIST 延迟复查（第一次 +5min，第二次 FAILED） | UNKNOWN 订单复查两次才判失败 |
+| 5 | execute 唯一索引冲突转 409 | 并发/重复提交返回 409 + taskId |
+| 6 | `/admin/bookings/ids` 全选接口 | 与订单列表筛选结果一致；超 1000 报错 |
+| 7 | admin 订单页改造（勾选 + 预览弹层 + 进度面板 + 历史） | 筛选 → 全选 → 预览 → 强确认 → 执行 → 关页恢复 |
 
-**前置条件**：微信公众平台申请"退款通知"订阅消息模板（拿模板 ID）；生产库执行手工 SQL。
+worker、幂等、恢复、进度聚合已在日期版中实现并通过测试，本次改造保持不变，仅需调整测试夹具（按 ID 列表构造）。
 
-依赖链：2→5、3→4、3→5、5→6、7→6、6→8、7→9；步骤 1 独立；8/9 可并行。
+### 前置条件
+
+- 生产环境执行手工 schema SQL（任务表从未部署，直接按新结构建表）
+- 确认生产环境为单实例部署
+- 使用测试商户或可控测试订单验证微信退款错误分类
+
+### 首版明确不做
+
+- 部分退款（一单只全额退一次）
+- 暂停、继续、撤销、取消批量退款
+- 站内通知、通知中心和未读数；一次性订阅消息
+- 用户自助退款规则调整（已核验仍不可退）
+- 多实例 worker、消息队列和分布式租约
+- 自动补退；失败订单由订单详情页人工处理
+
+## 四、二期候选范围（不影响一期上线）
+
+- 部分退款（单号规则改 `RF{bookingId}-{n}`，冻结/恢复逻辑配套）
+- 定向站内通知表和用户侧通知接口
+- 小程序通知中心、首页未读提示和已读状态
+- 批量退款结束后按用户聚合通知，区分已确认、处理中和部分失败
+- 通知去重、失败补发和管理端查看
+- 是否增加一次性订阅消息，根据一期微信原生通知的实际触达效果再决定

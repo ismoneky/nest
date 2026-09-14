@@ -86,13 +86,57 @@ sqlite3 data/logs.db "CREATE TABLE app_logs (
 
 > 删除或损坏 logs.db 时日志功能降级到 stdout，不影响 prod.db 的预约和支付。禁止把 `LOG_DATABASE_PATH` 与 `DATABASE_PATH` 配成同一文件。
 
-### 6. 回滚（如上线后发现问题需要撤销本期 schema 变更）
+### 6. 批量退款（batch-refund-design.md）：bookings 新增 4 列 + 新表 + 索引
+
+```bash
+sqlite3 data/prod.db "ALTER TABLE bookings ADD COLUMN refundSource varchar; ALTER TABLE bookings ADD COLUMN refundBatchTaskId varchar; ALTER TABLE bookings ADD COLUMN refundSubmitStatus varchar; ALTER TABLE bookings ADD COLUMN refundSubmitErrorCode varchar; CREATE INDEX idx_bookings_refund_batch_task ON bookings (refundBatchTaskId, refundSubmitStatus);"
+```
+
+```bash
+sqlite3 data/prod.db "CREATE TABLE batch_refund_tasks (
+    id integer PRIMARY KEY AUTOINCREMENT NOT NULL,
+    taskId varchar NOT NULL,
+    selectionSummary varchar,
+    status varchar NOT NULL,
+    totalTarget integer NOT NULL DEFAULT 0,
+    reason varchar NOT NULL,
+    operatorAdminId varchar NOT NULL,
+    createdAt integer NOT NULL,
+    startedAt integer,
+    submissionCompletedAt integer,
+    completedAt integer,
+    lastHeartbeatAt integer,
+    errorSummary varchar,
+    updatedAt integer NOT NULL
+); CREATE UNIQUE INDEX IDX_batch_refund_tasks_taskId ON batch_refund_tasks (taskId); CREATE UNIQUE INDEX IDX_batch_refund_tasks_running ON batch_refund_tasks (status) WHERE status = 'RUNNING';"
+```
+
+> `IDX_batch_refund_tasks_running` 是 SQLite 部分唯一索引，保证同一时刻最多一个 RUNNING 任务（批量退款设计 2.3）。回滚时按相反顺序 DROP。
+
+### 7. 回滚（如上线后发现问题需要撤销本期 schema 变更）
 
 ```bash
 sqlite3 data/prod.db "DROP TABLE booking_anomalies; DROP INDEX idx_bookings_status_date; DROP INDEX idx_bookings_payment_expired; DROP INDEX idx_bookings_reconcile; ALTER TABLE bookings DROP COLUMN reconcileLastErrorCode; ALTER TABLE bookings DROP COLUMN reconcileLastAt; ALTER TABLE bookings DROP COLUMN reconcileAttempts; ALTER TABLE bookings DROP COLUMN reconcileNextAt; ALTER TABLE bookings DROP COLUMN reconcileKind;"
 ```
 
 > 回滚会丢弃补齐的调度字段值（只影响本期新增数据，不影响原有列与订单数据）。SQLite 3.35+ 支持 `DROP COLUMN`。
+>
+> 批量退款部分的回滚（第 6 节）：`DROP TABLE batch_refund_tasks; DROP INDEX idx_bookings_refund_batch_task; ALTER TABLE bookings DROP COLUMN refundSubmitErrorCode; ALTER TABLE bookings DROP COLUMN refundSubmitStatus; ALTER TABLE bookings DROP COLUMN refundBatchTaskId; ALTER TABLE bookings DROP COLUMN refundSource;`（仅当没有进行中的批量任务时执行）。
+
+## 选择性批量退款（batch-refund-design.md，2026-08-21 由"日期整批"改为"订单列表勾选"）
+
+- [x] 管理员资格模块（不看业务状态，仅资金硬约束；`refund-eligibility.ts` 预览/执行同源对照测试）
+- [x] P0-1：冻结不写 reconcile 调度字段 + 对账候选排除 `refundSubmitStatus=PENDING`（双保险，附回归测试）
+- [x] P0-2：`initiateRefund` 非 accepted 一律抛 400，保持 fctl 旧契约（附契约测试）
+- [x] 任务实体 `selectionSummary`（替代 bookingDate，审计摘要）；生产建表 SQL 见上文 §6（表未上线，直接按新结构建）
+- [x] preview/execute 改 `bookingIds[]`（1-1000）入参，preview 改 POST；freeze 改 `bookingId IN` + 资金条件
+- [x] 不可退分桶附订单号（预览核对剔除）；execute 空列表防御
+- [x] execute 唯一索引冲突 → 409 + taskId；`HttpExceptionFilter` 透传 taskId
+- [x] 对账 NOT_EXIST 延迟复查：第一次打 `REFUND_NOT_EXIST` 标记 +5 分钟复查，复查仍无才 FAILED
+- [x] `GET /admin/bookings/ids` 全选接口（与订单列表筛选同源，超 1000 报 400）
+- [x] admin：订单页勾选/全选筛选结果/批量退款弹层（预览→强确认→进度轮询）/历史任务抽屉/进入页面自动恢复 RUNNING 任务
+- [ ] 生产上线：执行 §6 手工 SQL（先备份 prod.db）、确认单实例部署、测试商户验证退款错误分类
+- [ ] fctl：无需改动（一期）；二期站内通知另议
 
 ## 支付可靠性（payment-reliability-design.md）
 

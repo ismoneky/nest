@@ -1,7 +1,7 @@
-import { Injectable, InternalServerErrorException, NotFoundException } from '@nestjs/common';
+import { Injectable, BadRequestException, InternalServerErrorException, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, Not, LessThan, Like } from 'typeorm';
-import { Booking, BookingStatus, PaymentStatus, RefundStatus, TravelMode } from '../entities/booking.entity';
+import { Booking, BookingStatus, PaymentStatus, RefundStatus, RefundSource, RefundSubmitStatus, TravelMode } from '../entities/booking.entity';
 import { BookingAnomaly, AnomalyType, AnomalyStatus } from '../entities/booking-anomaly.entity';
 import { CreateBookingDto } from '../modules/booking/dto/createBooking.dto';
 import { GetBookingsDto } from '../modules/booking/dto/getBookings.dto';
@@ -9,11 +9,15 @@ import { UpdateBookingDto } from '../modules/booking/dto/updateBooking.dto';
 import { DataSource, EntityManager } from 'typeorm';
 import { randomUUID } from 'crypto';
 import { BookingDashboardResponse } from '../modules/admin/interfaces/booking-dashboard.interface';
+import { classifyAdminRefundEligibility, applyAdminRefundableConditions, RefundBucket } from '../modules/batch-refund/refund-eligibility';
 
 /**
  * 对账任务类型
  */
 export type ReconcileKind = 'payment' | 'refund' | 'close';
+
+/** 全选 ID 接口上限（与批量退款 DTO bookingIds 上限一致） */
+export const ADMIN_BOOKING_IDS_MAX = 1000;
 
 /**
  * 预约订单数据访问层
@@ -221,6 +225,42 @@ export class BookingRepository {
         }
     }
 
+    /** 管理端订单筛选条件（订单列表 / 导出 / 全选 ID 共用，保证三处口径一致） */
+    private applyAdminBookingFilters(
+        qb: { andWhere: (...args: any[]) => any },
+        query: {
+            bookingDate?: string;
+            createdStart?: string;
+            createdEnd?: string;
+            status?: BookingStatus[];
+            keyword?: string;
+        },
+    ): void {
+        if (query.bookingDate) {
+            qb.andWhere('booking.bookingDate = :bookingDate', { bookingDate: query.bookingDate });
+        }
+        // createdAt 存的是毫秒时间戳，createdStart 当天 00:00:00、createdEnd 当天 23:59:59.999
+        if (query.createdStart) {
+            const start = new Date(query.createdStart);
+            start.setHours(0, 0, 0, 0);
+            qb.andWhere('booking.createdAt >= :createdStart', { createdStart: start.getTime() });
+        }
+        if (query.createdEnd) {
+            const end = new Date(query.createdEnd);
+            end.setHours(23, 59, 59, 999);
+            qb.andWhere('booking.createdAt <= :createdEnd', { createdEnd: end.getTime() });
+        }
+        if (query.status?.length) {
+            qb.andWhere('booking.status IN (:...status)', { status: query.status });
+        }
+        if (query.keyword) {
+            qb.andWhere(
+                '(booking.name LIKE :kw OR booking.phone LIKE :kw OR booking.bookingId LIKE :kw)',
+                { kw: `%${query.keyword}%` },
+            );
+        }
+    }
+
     /**
      * 管理员查询订单列表（无 openid 限制，支持关键字搜索）
      */
@@ -246,29 +286,7 @@ export class BookingRepository {
                 .skip(skip)
                 .take(pageSize);
 
-            if (query.bookingDate) {
-                qb.andWhere('booking.bookingDate = :bookingDate', { bookingDate: query.bookingDate });
-            }
-            // createdAt 存的是毫秒时间戳，createdStart 当天 00:00:00、createdEnd 当天 23:59:59.999
-            if (query.createdStart) {
-                const start = new Date(query.createdStart);
-                start.setHours(0, 0, 0, 0);
-                qb.andWhere('booking.createdAt >= :createdStart', { createdStart: start.getTime() });
-            }
-            if (query.createdEnd) {
-                const end = new Date(query.createdEnd);
-                end.setHours(23, 59, 59, 999);
-                qb.andWhere('booking.createdAt <= :createdEnd', { createdEnd: end.getTime() });
-            }
-            if (query.status?.length) {
-                qb.andWhere('booking.status IN (:...status)', { status: query.status });
-            }
-            if (query.keyword) {
-                qb.andWhere(
-                    '(booking.name LIKE :kw OR booking.phone LIKE :kw OR booking.bookingId LIKE :kw)',
-                    { kw: `%${query.keyword}%` },
-                );
-            }
+            this.applyAdminBookingFilters(qb, query);
 
             const [bookings, total] = await qb.getManyAndCount();
 
@@ -282,6 +300,33 @@ export class BookingRepository {
         } catch (error) {
             throw new InternalServerErrorException(error instanceof Error ? error.message : 'Failed to get bookings');
         }
+    }
+
+    /**
+     * 全选当前筛选结果（选择性批量退款配套）：返回与订单列表相同筛选下的全部订单 ID。
+     * 超过 1000 个报错提示缩小范围（与批量退款 DTO 上限一致）。
+     */
+    async getBookingIdsForAdmin(query: {
+        bookingDate?: string;
+        createdStart?: string;
+        createdEnd?: string;
+        status?: BookingStatus[];
+        keyword?: string;
+    }): Promise<{ ids: string[]; total: number }> {
+        const qb = this.bookingRepository
+            .createQueryBuilder('booking')
+            .select('booking.bookingId', 'bookingId')
+            .orderBy('booking.createdAt', 'DESC')
+            .addOrderBy('booking.id', 'DESC')
+            .take(ADMIN_BOOKING_IDS_MAX + 1); // 多取一条用于超限检测
+
+        this.applyAdminBookingFilters(qb, query);
+
+        const rows = await qb.getRawMany<{ bookingId: string }>();
+        if (rows.length > ADMIN_BOOKING_IDS_MAX) {
+            throw new BadRequestException(`匹配订单超过 ${ADMIN_BOOKING_IDS_MAX} 个，请缩小筛选范围后再全选`);
+        }
+        return { ids: rows.map((r) => r.bookingId), total: rows.length };
     }
 
     /**
@@ -400,6 +445,11 @@ export class BookingRepository {
             qb.andWhere('booking.paymentExpiredAt >= :now', { now });
         } else if (kind === 'refund') {
             qb.andWhere('booking.refundStatus = :rs', { rs: RefundStatus.REFUNDING });
+            // 双保险（设计 2.1 原则 4）：批量退款 PENDING 订单尚未提交微信，
+            // 对账查询必得 NOT_EXIST 会误判 FAILED，对账不得触碰未提交订单
+            qb.andWhere(`(booking.refundSubmitStatus IS NULL OR booking.refundSubmitStatus != :pendingSubmit)`, {
+                pendingSubmit: RefundSubmitStatus.PENDING,
+            });
         } else {
             qb.andWhere('booking.paymentStatus IN (:...statuses)', {
                 statuses: [PaymentStatus.UNPAID, PaymentStatus.PAYING],
@@ -734,6 +784,219 @@ export class BookingRepository {
             .execute()).affected ?? 0;
     }
 
+    /**
+     * 退款查询第一次 NOT_EXIST：不判失败，打 REFUND_NOT_EXIST 标记并延迟复查
+     * （设计 2.6「至少一次延迟查询确认」：微信建单与可查之间可能有传播延迟；
+     * 复查仍 NOT_EXIST 才由调用方判 FAILED）。不累加 attempts、不升级异常。
+     */
+    async markRefundNotExistPending(bookingId: string, outRefundNo: string, nextAt: number, now: number): Promise<number> {
+        return (await this.bookingRepository
+            .createQueryBuilder()
+            .update(Booking)
+            .set({
+                reconcileKind: 'refund',
+                reconcileNextAt: nextAt,
+                reconcileLastAt: now,
+                reconcileLastErrorCode: 'REFUND_NOT_EXIST',
+            })
+            .where('bookingId = :bookingId', { bookingId })
+            .andWhere('refundStatus = :rs', { rs: RefundStatus.REFUNDING })
+            .andWhere('outRefundNo = :outRefundNo', { outRefundNo })
+            .execute()).affected ?? 0;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 批量退款（资格查询 / 事务冻结 / worker 领取 / 进度聚合）
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * 选择性批量退款预览聚合：对给定订单 ID 列表逐单分类。
+     * 可退（单数/金额/人数 + 掩码明细前 limit 条）+ 不可退分桶（附订单号，供管理端核对剔除）。
+     * 分桶由 classifyAdminRefundEligibility（管理员资格模块）完成，保证预览与执行条件同源。
+     */
+    async getBatchRefundPreview(bookingIds: string[], now: number, detailLimit = 200) {
+        const bookings = await this.bookingRepository
+            .createQueryBuilder('booking')
+            .where('booking.bookingId IN (:...ids)', { ids: bookingIds })
+            .getMany();
+
+        const buckets = new Map<Exclude<RefundBucket, 'refundable'>, string[]>();
+        let refundable = 0;
+        let totalAmount = 0;
+        let peopleCount = 0;
+        const details: Array<{ bookingId: string; name: string; phone: string; personCount: number; amount: number }> = [];
+
+        for (const booking of bookings) {
+            const bucket = classifyAdminRefundEligibility(booking, now);
+            if (bucket === 'refundable') {
+                refundable += 1;
+                totalAmount += booking.amount ?? 0;
+                peopleCount += booking.personCount ?? 0;
+                if (details.length < detailLimit) {
+                    details.push({
+                        bookingId: booking.bookingId,
+                        name: maskName(booking.name),
+                        phone: maskPhone(booking.phone),
+                        personCount: booking.personCount,
+                        amount: booking.amount ?? 0,
+                    });
+                }
+            } else {
+                const list = buckets.get(bucket) ?? [];
+                list.push(booking.bookingId);
+                buckets.set(bucket, list);
+            }
+        }
+
+        return {
+            refundable: { count: refundable, totalAmount, peopleCount },
+            unrefundable: Array.from(buckets.entries()).map(([reason, ids]) => ({ reason, count: ids.length, bookingIds: ids })),
+            detailPreview: details,
+        };
+    }
+
+    /**
+     * 事务内批量冻结：对给定订单 ID 列表按管理员资金硬条件 UPDATE 为
+     * REFUNDING + BATCH + PENDING + taskId，固定退款单号 RF{bookingId}。
+     * 返回 affected（= totalTarget）；条件不满足的订单自动排除。
+     *
+     * 不设置 reconcile 调度字段（设计 2.1 原则 4）：PENDING 订单未提交微信，
+     * 对账查询必得 NOT_EXIST 会被误判 FAILED；PENDING 的恢复只走 worker + Cron 兜底，
+     * 对账在提交拿到应答后才排（markRefundSubmitted / markRefundSubmitUnknown）。
+     */
+    async freezeBookingsForBatchRefund(em: EntityManager, bookingIds: string[], taskId: string, now: number): Promise<number> {
+        const qb = em
+            .createQueryBuilder()
+            .update(Booking)
+            .set({
+                refundStatus: RefundStatus.REFUNDING,
+                refundSource: RefundSource.BATCH,
+                refundSubmitStatus: RefundSubmitStatus.PENDING,
+                refundBatchTaskId: taskId,
+                // 固定退款单号：已有则保留（重试幂等），否则 RF + bookingId
+                outRefundNo: () => `COALESCE(outRefundNo, 'RF' || bookingId)`,
+            })
+            .where('bookingId IN (:...ids)', { ids: bookingIds });
+
+        applyAdminRefundableConditions(qb, '', now);
+        const result = await qb.execute();
+        return result.affected ?? 0;
+    }
+
+    /**
+     * worker 领取：当前任务下一笔 PENDING 订单（按 id 升序，保证进度可预期）。
+     * 每次只取一笔，不预加载全部目标（设计 2.12）。
+     */
+    async claimNextPendingBooking(taskId: string): Promise<Booking | null> {
+        return this.bookingRepository
+            .createQueryBuilder('booking')
+            .where('booking.refundBatchTaskId = :taskId', { taskId })
+            .andWhere('booking.refundSubmitStatus = :pending', { pending: RefundSubmitStatus.PENDING })
+            .orderBy('booking.id', 'ASC')
+            .getOne();
+    }
+
+    /**
+     * worker 提交结果写回（条件更新：仅 PENDING 可推进，防回调/恢复并发竞争）
+     * - SUBMITTED：已受理，转退款对账（15 分钟后）
+     * - FAILED：微信明确拒绝，退款失败终态，清提交字段与调度
+     * - UNKNOWN：保持 REFUNDING，1 分钟后先查询，不立即重复 POST
+     */
+    async markRefundSubmitted(bookingId: string, now: number): Promise<number> {
+        return (await this.bookingRepository
+            .createQueryBuilder()
+            .update(Booking)
+            .set({
+                refundSubmitStatus: RefundSubmitStatus.SUBMITTED,
+                refundSubmitErrorCode: null,
+                reconcileKind: 'refund',
+                reconcileNextAt: now + 15 * 60 * 1000,
+                reconcileAttempts: 0,
+                reconcileLastErrorCode: null,
+            })
+            .where('bookingId = :bookingId', { bookingId })
+            .andWhere('refundSubmitStatus = :pending', { pending: RefundSubmitStatus.PENDING })
+            .execute()).affected ?? 0;
+    }
+
+    async markRefundSubmitFailed(bookingId: string, errorCode: string): Promise<number> {
+        return (await this.bookingRepository
+            .createQueryBuilder()
+            .update(Booking)
+            .set({
+                refundSubmitStatus: RefundSubmitStatus.FAILED,
+                refundSubmitErrorCode: errorCode,
+                refundStatus: RefundStatus.FAILED,
+                reconcileKind: null,
+                reconcileNextAt: null,
+                reconcileAttempts: 0,
+                reconcileLastErrorCode: null,
+            })
+            .where('bookingId = :bookingId', { bookingId })
+            .andWhere('refundSubmitStatus = :pending', { pending: RefundSubmitStatus.PENDING })
+            .execute()).affected ?? 0;
+    }
+
+    async markRefundSubmitUnknown(bookingId: string, errorCode: string, now: number): Promise<number> {
+        return (await this.bookingRepository
+            .createQueryBuilder()
+            .update(Booking)
+            .set({
+                refundSubmitStatus: RefundSubmitStatus.UNKNOWN,
+                refundSubmitErrorCode: errorCode,
+                // 保持 refundStatus = REFUNDING；对账 1 分钟后先查询
+                reconcileKind: 'refund',
+                reconcileNextAt: now + 60 * 1000,
+                reconcileAttempts: 0,
+                reconcileLastErrorCode: null,
+            })
+            .where('bookingId = :bookingId', { bookingId })
+            .andWhere('refundSubmitStatus = :pending', { pending: RefundSubmitStatus.PENDING })
+            .execute()).affected ?? 0;
+    }
+
+    /**
+     * 任务进度聚合（设计 2.7）：按 refundBatchTaskId 实时聚合互斥计数。
+     * 互斥口径（约束 pending + processing + confirmed + failed = total）：
+     *   pending    = refundSubmitStatus PENDING
+     *   confirmed  = refundStatus REFUNDED
+     *   failed     = refundStatus FAILED（含提交拒绝与回调/对账失败）
+     *   processing = 其余（SUBMITTED/UNKNOWN 提交后、REFUNDING 中）
+     */
+    async aggregateBatchRefundProgress(taskId: string) {
+        const rows = await this.bookingRepository
+            .createQueryBuilder('booking')
+            .select('COUNT(*)', 'total')
+            .addSelect(`SUM(CASE WHEN booking.refundSubmitStatus = 'pending' THEN 1 ELSE 0 END)`, 'pending')
+            .addSelect(`SUM(CASE WHEN booking.refundStatus = 'refunded' THEN 1 ELSE 0 END)`, 'confirmed')
+            .addSelect(`SUM(CASE WHEN booking.refundStatus = 'failed' AND (booking.refundSubmitStatus IS NULL OR booking.refundSubmitStatus != 'pending') THEN 1 ELSE 0 END)`, 'failed')
+            .addSelect(`SUM(CASE WHEN booking.refundStatus = 'refunded' THEN COALESCE(booking.amount, 0) ELSE 0 END)`, 'confirmedAmount')
+            .where('booking.refundBatchTaskId = :taskId', { taskId })
+            .getRawOne();
+
+        const total = rows?.total ? Number(rows.total) : 0;
+        const pending = rows?.pending ? Number(rows.pending) : 0;
+        const confirmed = rows?.confirmed ? Number(rows.confirmed) : 0;
+        const failed = rows?.failed ? Number(rows.failed) : 0;
+        return {
+            total,
+            pending,
+            confirmed,
+            failed,
+            processing: total - pending - confirmed - failed,
+            confirmedAmount: rows?.confirmedAmount ? Number(rows.confirmedAmount) : 0,
+        };
+    }
+
+    /**
+     * 提交阶段是否完成：任务下已无 PENDING 订单
+     */
+    async countPendingByTaskId(taskId: string): Promise<number> {
+        return this.bookingRepository.count({
+            where: { refundBatchTaskId: taskId, refundSubmitStatus: RefundSubmitStatus.PENDING },
+        });
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // 异常订单
     // ─────────────────────────────────────────────────────────────────────────
@@ -1021,6 +1284,23 @@ function toNumber(value: unknown): number {
     if (value == null || value === '') return 0;
     const n = Number(value);
     return Number.isFinite(n) ? n : 0;
+}
+
+/**
+ * 姓名掩码：保留姓氏，其余用 *（预览明细用，避免整列明文）
+ */
+function maskName(name?: string): string {
+    if (!name) return '';
+    if (name.length <= 1) return name;
+    return name[0] + '*'.repeat(Math.min(name.length - 1, 3));
+}
+
+/**
+ * 手机号掩码：保留前 3 后 4
+ */
+function maskPhone(phone?: string): string {
+    if (!phone || phone.length < 7) return phone ?? '';
+    return `${phone.substring(0, 3)}****${phone.substring(phone.length - 4)}`;
 }
 
 /**

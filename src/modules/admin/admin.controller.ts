@@ -66,6 +66,17 @@ export class AdminController {
     }
 
     /**
+     * 全选当前筛选结果（批量退款"全选"配套）：与列表相同筛选下的全部订单 ID
+     * GET /admin/bookings/ids —— 超过 1000 个返回 400，提示缩小筛选范围
+     */
+    @Get('bookings/ids')
+    @UseGuards(AdminAuthGuard)
+    async getBookingIds(@Query() query: GetBookingsAdminDto, @Res() res: Response) {
+        const data = await this.bookingService.getBookingIdsForAdmin(query);
+        return res.status(HttpStatus.OK).send({ success: true, data });
+    }
+
+    /**
      * 经营统计看板
      * GET /admin/bookings/dashboard?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD
      * 所有统计以预约游玩日期 bookingDate 为筛选条件，起止日期均包含。

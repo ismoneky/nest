@@ -654,6 +654,13 @@ export class BookingService {
     }
 
     /**
+     * 全选当前筛选结果（选择性批量退款配套）：与订单列表相同筛选下的全部订单 ID
+     */
+    async getBookingIdsForAdmin(query: { bookingDate?: string; createdStart?: string; createdEnd?: string; status?: BookingStatus[]; keyword?: string }) {
+        return await this.bookingRepository.getBookingIdsForAdmin(query);
+    }
+
+    /**
      * 统计当前用户指定状态下的订单数量
      * @param openid 用户 openid
      * @param status 可选，指定状态；不传则返回所有订单数量
@@ -1082,9 +1089,9 @@ export class BookingService {
             throw new BadRequestException('订单状态不允许退款');
         }
 
-        // 申请退款；微信拒绝或结果未知时订单保持 REFUNDING，由退款对账任务接管
-        try {
-            const refundResult = await this.wechatPayService.refund(booking.outTradeNo, outRefundNo, booking.amount, booking.amount);
+        // 申请退款；结构化结果不抛异常，rejected/unknown 时订单保持 REFUNDING，由退款对账任务接管
+        const refundResult = await this.wechatPayService.refund(booking.outTradeNo, outRefundNo, booking.amount, booking.amount);
+        if (refundResult.state === 'accepted') {
             // 记录点：退款申请成功（日志失败不影响业务结果）
             this.loggingService.write({
                 source: AppLogSource.BACKEND,
@@ -1095,18 +1102,22 @@ export class BookingService {
                 context: { bookingId, outRefundNo },
             });
             return refundResult;
-        } catch (error) {
-            // 记录点：退款申请失败（订单保持 REFUNDING，退款对账任务接管）
-            this.loggingService.write({
-                source: AppLogSource.BACKEND,
-                level: AppLogLevel.WARN,
-                category: AppLogCategory.PAYMENT,
-                message: '退款申请失败',
-                route: `/bookings/${bookingId}/refund`,
-                context: { bookingId, outRefundNo, error: (error as Error).message },
-            });
-            throw error;
         }
+        // 记录点：退款申请失败（订单保持 REFUNDING，退款对账任务接管）
+        this.loggingService.write({
+            source: AppLogSource.BACKEND,
+            level: AppLogLevel.WARN,
+            category: AppLogCategory.PAYMENT,
+            message: '退款申请失败',
+            route: `/bookings/${bookingId}/refund`,
+            context: { bookingId, outRefundNo, state: refundResult.state, code: refundResult.code },
+        });
+        // 契约保持（fctl 一期不改）：小程序按 HTTP 状态/success 判断退款成败，
+        // 非 accepted 必须抛 400，绝不能把 rejected/unknown 包成 200 success
+        if (refundResult.state === 'rejected') {
+            throw new BadRequestException(`申请退款失败：${refundResult.message}`);
+        }
+        throw new BadRequestException('申请退款结果确认中，请稍后重试');
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -1465,10 +1476,21 @@ export class BookingService {
                 break;
             case 'CLOSED':
             case 'ABNORMAL':
-            case 'NOT_EXIST':
-                // 微信明确终态失败或退款单不存在：标记失败，清空调度字段
+                // 微信明确终态失败：标记失败，清空调度字段
                 await this.bookingRepository.markRefundFailed(booking.bookingId, booking.outRefundNo);
                 await this.bookingRepository.resolveAnomaly(booking.bookingId, AnomalyType.REFUND_QUERY_REPEATED_FAILURE, '退款对账确认终态失败', now);
+                break;
+            case 'NOT_EXIST':
+                // 退款单不存在：至少一次延迟复查确认后才判 FAILED（设计 2.6）。
+                // 微信建单与可查之间可能有传播延迟；同 outRefundNo 重提幂等，误判不会双退。
+                if (booking.reconcileLastErrorCode === 'REFUND_NOT_EXIST') {
+                    // 上一次查询已是 NOT_EXIST（复查仍无）：确认未建单，标记失败
+                    await this.bookingRepository.markRefundFailed(booking.bookingId, booking.outRefundNo);
+                    await this.bookingRepository.resolveAnomaly(booking.bookingId, AnomalyType.REFUND_QUERY_REPEATED_FAILURE, '退款对账复查确认未建单', now);
+                } else {
+                    // 第一次查无：打标记，5 分钟后复查（不累加 attempts、不升级异常）
+                    await this.bookingRepository.markRefundNotExistPending(booking.bookingId, booking.outRefundNo, now + 5 * 60 * 1000, now);
+                }
                 break;
             case 'PROCESSING':
                 // 仍在处理中：15 分钟后再查
