@@ -33,10 +33,24 @@ export enum VehicleType {
 export enum BookingStatus {
     PENDING = 'pending',       // 待确认（已创建，等待支付完成激活）
     CONFIRMED = 'confirmed',   // 已确认（支付完成，预约生效）
-    COMPLETED = 'completed',   // 已完成（游览日期已过）
+    COMPLETED = 'completed',   // 已完成（**已核销**，即闸机实际核销过；语义已收窄，见下）
     CANCELLED = 'cancelled',   // 已取消（支付超时或主动取消）
     REFUNDED = 'refunded',     // 已退款
+    EXPIRED = 'expired',       // 已过期（预约日已过且未核销）
 }
+
+/**
+ * `completed` 语义说明（2026-09-13 起）
+ *
+ * 改动前 `completed` 有两个写入方，含义是混合的、事后无法区分：
+ *   ① verifyBooking —— 游客在闸机扫码核销
+ *   ② runHistoricalBookingUpdate（每小时 :13）—— 预约日一过就**无条件**刷成 completed
+ * 所以历史上「真来过」和「根本没来」都是 `completed`。
+ *
+ * 改动后定时任务不再写 `completed`（改由 T1 写 `expired`），
+ * **`completed` 严格等价于「已核销」**，唯一写入方是 `markVerified`。
+ * 这是 `verifiedAt` / `verifiedBy` 两个字段有意义的前提。
+ */
 
 /**
  * 支付状态枚举（描述这笔钱的状态）
@@ -182,6 +196,22 @@ export class Booking {
     /** 退款时间 */
     @Column({ type: 'integer', nullable: true, transformer: timestampTransformer })
     refundedAt: Date;
+
+    /** 被 T1 翻转为 expired 的时刻。**退款申请时限（7 天）的计算基准** */
+    @Column({ type: 'integer', nullable: true, transformer: timestampTransformer })
+    expiredAt: Date;
+
+    /** 「已过期」通知已发出的时刻。防漏发的标记位（NULL = 尚未通知，下轮继续扫到） */
+    @Column({ type: 'integer', nullable: true, transformer: timestampTransformer })
+    expireNotifiedAt: Date;
+
+    /** 核销时刻。核销留痕（改动前核销不留任何记录，与定时任务刷出来的 completed 无法区分） */
+    @Column({ type: 'integer', nullable: true, transformer: timestampTransformer })
+    verifiedAt: Date;
+
+    /** 核销人 openid（改动前日志 context 里不含核销人） */
+    @Column({ type: 'varchar', nullable: true })
+    verifiedBy: string;
 
     /** 支付超时时间 */
     @Column({ type: 'integer', nullable: true, transformer: timestampTransformer })

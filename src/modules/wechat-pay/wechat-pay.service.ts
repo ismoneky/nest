@@ -4,6 +4,10 @@ import { Repository } from 'typeorm';
 import { Booking, BookingStatus, PaymentStatus, RefundStatus } from '../../entities/booking.entity';
 import { AnomalyType } from '../../entities/booking-anomaly.entity';
 import { BookingRepository } from '../../repositories/booking.repository';
+import { RefundApplyRepository } from '../../repositories/refund-apply.repository';
+import { MessageService } from '../message/message.service';
+// 纯函数、无 DI：ABNORMAL 记异常时要排下次重试时刻，与对账/异常任务同一套退避
+import { nextAnomalyRetryAt } from '../booking/anomaly-policy';
 import { readFileSync } from 'fs';
 import { join } from 'path';
 import { randomUUID, createSign, createVerify, createDecipheriv } from 'crypto';
@@ -127,6 +131,14 @@ export class WechatPayService {
         @InjectRepository(Booking)
         private readonly bookingRepository: Repository<Booking>,
         private readonly bookingRepo: BookingRepository,
+        // 直接注入仓库而非 RefundApplyService：本服务在 WechatPayModule 里，
+        // 该模块已直接注册 BookingRepository 以避免与 BookingModule 的循环依赖，
+        // 退款申请单沿用同一手法（见 wechat-pay.module.ts 的注释）。
+        private readonly refundApplyRepository: RefundApplyRepository,
+        // 到账站内信。⚠️ 正因为上面这个「直接注入仓库」的选择，通知**不能**写在
+        // RefundApplyService 里——那条路在真实回调路径上根本不会被执行（见
+        // MessageService.notifyRefundSettled 的注释与 mirrorRefundSettlement）。
+        private readonly messageService: MessageService,
     ) {
         this.init();
     }
@@ -489,7 +501,9 @@ export class WechatPayService {
                 status === 'SUCCESS' || status === 'PROCESSING' || status === 'CLOSED' || status === 'ABNORMAL'
                     ? status
                     : 'UNKNOWN';
-            return { state, refundStatus: status };
+            // ABNORMAL 附一个稳定错误码：它不是终态失败，对账侧会继续查询并记异常，
+            // 这个码会落进 booking_anomalies.lastErrorCode，是运营排查「这笔钱卡在哪」的入口
+            return { state, refundStatus: status, errorCode: state === 'ABNORMAL' ? 'REFUND_ABNORMAL' : undefined };
         } catch (error) {
             if (error instanceof WechatApiError && error.statusCode === 404) {
                 return { state: 'NOT_EXIST', errorCode: 'RESOURCE_NOT_EXISTS' };
@@ -585,7 +599,7 @@ export class WechatPayService {
      * 解析退款回调 body，解密并返回退款信息
      * 仅在验签通过后调用（验签复用 verifyPaymentNotify）
      */
-    parseRefundNotify(body: any): { outTradeNo: string; refundStatus: string } | null {
+    parseRefundNotify(body: any): { outTradeNo: string; refundStatus: string; outRefundNo: string } | null {
         const { resource, event_type } = body;
 
         if (event_type !== 'REFUND.SUCCESS' && event_type !== 'REFUND.ABNORMAL' && event_type !== 'REFUND.CLOSED') {
@@ -598,9 +612,11 @@ export class WechatPayService {
             resource.nonce,
         );
 
-        const { out_trade_no, refund_status } = decryptedData;
+        const { out_trade_no, refund_status, out_refund_no } = decryptedData;
 
-        return { outTradeNo: out_trade_no, refundStatus: refund_status };
+        // out_refund_no 一并带回：退款终态要镜像到退款申请单，而申请单按 outRefundNo 反查。
+        // 不能改用订单上当前的 outRefundNo 代替——回调携带的才是**本次**退款单号。
+        return { outTradeNo: out_trade_no, refundStatus: refund_status, outRefundNo: out_refund_no };
     }
 
     /**
@@ -631,8 +647,14 @@ export class WechatPayService {
      * 退款回调后更新本地退款状态（幂等）
      * 成功/终态失败后自动 RESOLVED 退款相关 OPEN 异常（REFUND_QUERY_REPEATED_FAILURE），
      * 与退款对账路径一致。
+     *
+     * 订单终态落定后把结果镜像到退款申请单（§4.3.3 改动 3）。镜像在**既有链路之后**、
+     * 且失败不抛给调用方：它不该让资金回调失败（微信会重推，回调整体仍可重入）。
+     *
+     * @param outRefundNo 回调携带的本次退款单号；缺省时退回用订单上的 outRefundNo
+     *        （历史回调报文/测试桩不带该字段时的兼容路径）
      */
-    async handleRefundCallback(outTradeNo: string, refundStatus: string): Promise<void> {
+    async handleRefundCallback(outTradeNo: string, refundStatus: string, outRefundNo?: string): Promise<void> {
         let booking: Booking;
         try {
             booking = await this.bookingRepo.getBookingByOutTradeNo(outTradeNo);
@@ -641,13 +663,51 @@ export class WechatPayService {
         }
 
         const now = Date.now();
+        const settledRefundNo = outRefundNo ?? booking.outRefundNo;
         if (refundStatus === 'SUCCESS') {
-            await this.bookingRepo.markRefundSucceeded(booking.bookingId, booking.outRefundNo, new Date());
+            await this.bookingRepo.markRefundSucceeded(booking.bookingId, settledRefundNo, new Date());
+            await this.mirrorRefundSettlement(settledRefundNo, true);
             await this.bookingRepo.resolveAnomaly(booking.bookingId, AnomalyType.REFUND_QUERY_REPEATED_FAILURE, '退款成功回调确认', now);
-        } else if (refundStatus === 'ABNORMAL' || refundStatus === 'CLOSED') {
-            await this.bookingRepo.markRefundFailed(booking.bookingId, booking.outRefundNo);
+        } else if (refundStatus === 'ABNORMAL') {
+            // ⚠️ 「退款异常」是**非终态**，不能与 CLOSED 一起判失败。
+            // 微信侧常见原因是商户可用余额不足，补足后仍可能完成这笔退款；而判成失败会让
+            // 用户重新申请 → 换号重发（`RF{id}-2`）→ 第一笔后来成功就是**重复退款**。
+            // 旧实现用固定单号 `RF{bookingId}` + 微信幂等天然不可能退两次，换号之后这个
+            // 保护没有了，只能靠「不判终态」来兜（见 implementation-todo.md 说明 33）。
+            // 因此：保留 REFUNDING、继续对账，并记一条异常（同类型异常用 upsert 收敛为一行）。
+            await this.bookingRepo.markRefundResultUnknown(booking.bookingId, settledRefundNo, 'REFUND_ABNORMAL', now);
+            await this.bookingRepo.upsertAnomaly(
+                booking.bookingId,
+                AnomalyType.REFUND_QUERY_REPEATED_FAILURE,
+                'REFUND_ABNORMAL',
+                '微信退款异常（非终态）：常见原因是商户可用余额不足，需人工核查商户账户',
+                nextAnomalyRetryAt(1, now),
+                now,
+            );
+        } else if (refundStatus === 'CLOSED') {
+            await this.bookingRepo.markRefundFailed(booking.bookingId, settledRefundNo);
+            await this.mirrorRefundSettlement(settledRefundNo, false);
             await this.bookingRepo.resolveAnomaly(booking.bookingId, AnomalyType.REFUND_QUERY_REPEATED_FAILURE, '退款回调确认终态失败', now);
         }
+    }
+
+    /**
+     * 把资金终态镜像到退款申请单（success / failed）
+     *
+     * 申请单反查不到时静默返回：用户自助退款、管理员直接退款产生的退款单没有申请单，
+     * 回调照样会走到这里，那是**正常路径**而非异常。
+     *
+     * 不加 try/catch：`markSettled` 自身是条件更新，重复收敛返回 affected=0 而非抛错；
+     * 若真抛出（如数据库不可用），让上层记日志比吞掉更可取。
+     */
+    private async mirrorRefundSettlement(outRefundNo: string, success: boolean): Promise<void> {
+        if (!outRefundNo) return;
+        const apply = await this.refundApplyRepository.findByOutRefundNo(outRefundNo);
+        if (!apply) return;
+        const affected = await this.refundApplyRepository.markSettled(apply.applyNo, success);
+        // 到账通知（三处镜像共用一个出口，见 MessageService.notifyRefundSettled 的注释）。
+        // 它**自身不抛异常**——这里是微信回调路径，抛出去会让回调失败并被微信重推。
+        if (affected > 0) await this.messageService.notifyRefundSettled(apply, success);
     }
 
     /**

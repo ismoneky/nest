@@ -26,6 +26,7 @@
         "test:cov": "jest --coverage",
         "test:debug": "node --inspect-brk -r tsconfig-paths/register -r ts-node/register node_modules/.bin/jest --runInBand",
         "test:e2e": "jest --config ./test/jest-e2e.json",
+        "smoke:expire": "ts-node scripts/smoke-booking-expire.ts",
         "init-config": "ts-node -r tsconfig-paths/register scripts/init-system-config.ts",
         "migrate": "ts-node -r tsconfig-paths/register scripts/migrate-from-mongodb.ts"
     },
@@ -86,6 +87,7 @@
         ],
         "rootDir": "src",
         "testRegex": ".spec.ts$",
+        "globalSetup": "<rootDir>/../test/jest-tz-setup.js",
         "transform": {
             "^.+\\.(t|j)s$": "ts-jest"
         },

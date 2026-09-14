@@ -4,9 +4,9 @@ import { DataSource, EntityManager } from 'typeorm';
 import { randomUUID } from 'crypto';
 import { BookingRepository } from '../../repositories/booking.repository';
 import { AdminApplicationRepository } from '../../repositories/admin-application.repository';
+import { RefundApplyRepository } from '../../repositories/refund-apply.repository';
 import { CreateBookingDto, PassengerDto } from './dto/createBooking.dto';
 import { GetBookingsDto } from './dto/getBookings.dto';
-import { UpdateBookingDto } from './dto/updateBooking.dto';
 import { TimeSlot, TravelMode, VehicleType, BookingStatus, PaymentStatus, RefundStatus, Booking } from '../../entities/booking.entity';
 import { AnomalyType, BookingAnomaly, AnomalyStatus } from '../../entities/booking-anomaly.entity';
 import { SystemConfig, PaymentConfig } from '../../entities/system-config.entity';
@@ -18,6 +18,7 @@ import { DailyFreeQuotaInfo, FreeEligibilityResult } from './dto/free-eligibilit
 import { TodayQuotaOverview } from './dto/today-quota.dto';
 import { normalizeIdCard } from '../../common/utils/id-card.util';
 import { PaymentException, PaymentErrorCode } from '../../common/payment-errors';
+import { BookingException, BookingErrorCode } from '../../common/booking-errors';
 import { PassengerBusinessException, PassengerErrorCode } from '../../common/passenger-business.exception';
 import { serialTransaction, serialWrite } from '../../common/transaction-runner';
 import {
@@ -31,6 +32,11 @@ import { isAutoRecoverable, nextAnomalyRetryAt } from './anomaly-policy';
 import { BookingDashboardResponse } from '../admin/interfaces/booking-dashboard.interface';
 import { LoggingService } from '../logging/logging.service';
 import { AppLogLevel, AppLogSource, AppLogCategory } from '../../entities/app-log.entity';
+import { beijingDateStr } from '../../common/date-utils';
+import { MessageService } from '../message/message.service';
+import { MESSAGE_SCAN_BATCH_LIMIT } from '../message/message-policy';
+import { resolveApplyDeadlineStr } from '../refund/refund-deadline';
+import { MessageType } from '../../entities/message.entity';
 
 /**
  * 支付准备整体预算（22 秒）。前端 25 秒超时为响应留出余量。
@@ -130,15 +136,13 @@ class ReconcileSemaphore {
 
 /**
  * 北京时间（UTC+8）日期字符串 YYYY-MM-DD。
- * “当天”的业务口径（每日免费名额、预约是否当天）以北京时间为准：
- * 直接 new Date().toISOString() 取的是 UTC 日期，服务器时区非 UTC+8 时，
- * 会在北京时间 00:00–08:00 期间把当天误判为前一天。
- * 实现为 UTC 时刻 +8 小时后取 ISO 日期，与服务器本地时区无关。
+ *
+ * 实现在 `src/common/date-utils.ts`（站内信的「每日上限」也要按北京日切分，
+ * 两处必须同源，否则会在凌晨出现「同一时刻两个今天」）。此处**原样再导出**，
+ * 是为了不动既有的 `import { beijingDateStr } from './booking.service'` 调用点——
+ * 那些调用点很多，逐个改只会增加一次无收益的 diff。
  */
-export function beijingDateStr(now: Date = new Date()): string {
-    const beijing = new Date(now.getTime() + 8 * 60 * 60 * 1000);
-    return beijing.toISOString().substring(0, 10);
-}
+export { beijingDateStr };
 
 /**
  * 组合订单级定价：整单免费（会员/每日名额）优先于人员级年龄定价。
@@ -216,7 +220,8 @@ export class BookingService {
         refund: false,
         anomaly: false,
         anomalyCleanup: false,
-        historical: false,
+        expire: false,   // 原 historical（T1 过期扫描），沿用同一槽位与重入保护
+        dailyReminder: false, // T2 每日 22:00 提醒（当天未核销 + 近 7 天已过期未通知）
     };
 
     // ── 对账开关与批量/并发配置（payment-reliability-design.md「SQLite 写锁预算」）──
@@ -248,6 +253,17 @@ export class BookingService {
         private readonly memberService: MemberService,
         private readonly userProfileRepository: UserProfileRepository,
         private readonly loggingService: LoggingService,
+        // 直接注入 RefundApply 的仓库而非 RefundApplyService：审核通过要调本服务的
+        // initiateRefund，若此处再依赖 RefundApplyService 就构成模块循环。
+        // 与 WechatPayModule 直接注册 BookingRepository 是同一手法（见该模块注释）。
+        private readonly refundApplyRepository: RefundApplyRepository,
+        /**
+         * 站内信（T1 ② / T2 的扫描类通知）。
+         *
+         * `MessageModule` 是叶子模块，`BookingModule → MessageModule` 无环。
+         * 反向不成立：`MessageService` 不认识任何业务实体，订单由本服务读好后传进去。
+         */
+        private readonly messageService: MessageService,
     ) {}
 
 
@@ -688,21 +704,69 @@ export class BookingService {
      * @param updateBookingDto 更新数据对象
      * @returns 更新后的订单
      */
-    async updateBooking(bookingId: string, updateBookingDto: UpdateBookingDto) {
-        return await this.bookingRepository.updateBooking(bookingId, updateBookingDto);
+    /**
+     * 用户主动取消「待支付」订单。
+     *
+     * 归属校验 → 状态判定 → 条件更新（markCancelledByUser 原子防并发）。
+     * 与旧实现的关键差异：旧路径是 `PUT /bookings/:id` 的裸读-改-写，
+     * 既无归属校验也无状态守卫，任何人都能按订单号把别人的订单置为 cancelled。
+     */
+    async cancelBooking(bookingId: string, openid: string) {
+        const booking = await this.bookingRepository.getBookingById(bookingId);
+        // 先校验归属，再谈状态：不向非本人泄露订单当前处于什么状态
+        if (booking.wechatOpenId !== openid) {
+            throw new BadRequestException('无权操作该订单');
+        }
+
+        // PAYING 可能已在微信侧建单，钱随时可能落到账上，不能在此杀掉，
+        // 否则会出现「已取消却收到钱」。交给已有的超时关单对账收敛。
+        // 详见 markCancelledByUser 的注释。
+        if (booking.status === BookingStatus.PENDING && booking.paymentStatus === PaymentStatus.PAYING) {
+            throw new BookingException(BookingErrorCode.ORDER_PAYMENT_IN_PROGRESS, '支付处理中，请稍后重试');
+        }
+
+        const affected = await this.bookingRepository.markCancelledByUser(bookingId);
+        if (affected === 0) {
+            // 条件不满足：并发下已被支付回调/关单对账推进，或本就不是待支付订单
+            throw new BookingException(BookingErrorCode.ORDER_CANNOT_CANCEL, '订单状态已变化，无法取消');
+        }
+
+        return await this.bookingRepository.getBookingById(bookingId);
     }
 
     /**
-     * 根据订单ID查询订单
+     * 根据订单ID查询订单（用户侧，含归属校验）
+     *
+     * openid 为必填：旧签名开了 `openid?: string`，传空即静默跳过归属校验，
+     * 任何人拿到订单号就能读到姓名/手机号/身份证。改为必填由类型系统兜住。
+     * 管理端读订单走 getBookingByIdForAdmin。
+     *
      * @param bookingId 订单ID
+     * @param openid 当前登录用户 openid
      * @returns 订单详情
      */
-    async getBookingById(bookingId: string, openid?: string) {
+    async getBookingById(bookingId: string, openid: string) {
         const booking = await this.bookingRepository.getBookingById(bookingId);
-        if (openid && booking.wechatOpenId !== openid) {
+        if (booking.wechatOpenId !== openid) {
             throw new BadRequestException('无权访问该订单');
         }
         return booking;
+    }
+
+    /**
+     * 读取订单（**管理端专用，不做归属校验**）
+     *
+     * 与 `getBookingById` 是两个方法而不是同一个方法的可选参数：归属校验一旦
+     * 变成「可传入参数关掉」，任何一次调用点写错都在静默降级为越权读取。
+     * 拆开后，管理端的越权面就是本方法本身，grep 一下就能审完。
+     *
+     * 仅供已挂 `AdminAuthGuard` 的控制器调用（退款审核详情需要展示订单快照）。
+     *
+     * @param bookingId 订单ID
+     * @returns 订单详情
+     */
+    async getBookingByIdForAdmin(bookingId: string) {
+        return await this.bookingRepository.getBookingById(bookingId);
     }
 
     /**
@@ -1149,16 +1213,50 @@ export class BookingService {
      * 申请退款
      * markRefundStarting 条件 UPDATE 落库 REFUNDING + 调度字段后再调微信，
      * 并发重复提交由条件更新保证只有一次进入 REFUNDING
+     *
+     * **已过期订单的自助入口在此关闭**（方案 §1.4 Q1）：`expired` 的资金出口只有
+     * 「用户提交申请 → 管理员审核 → 通过后由服务端带 asAdmin 调用本方法」这一条。
+     * 必须在此拦截，而不是只靠前端隐藏按钮——隐藏只是体验，拦截才是安全边界。
+     *
+     * ⚠️ 与阶段 3 的先后顺序（硬约束）：`markRefundStarting` 一旦放开
+     * `status IN ('confirmed','expired')`，仓库层对过期单的 status 守卫就恒真了，
+     * **本方法这道判断会成为过期订单唯一的自助退款拦截面**。两者必须同一次发布，
+     * 且本判断先落地——顺序颠倒会出现「审核制形同虚设」的窗口。
+     *
      * @param bookingId 订单ID
+     * @param openid 申请人 openid。**审核路径（asAdmin=true）下本参数被忽略**——
+     *        该路径由服务端内部发起，归属校验跳过（见方法内注释）
+     * @param options.asAdmin 审核通过后的服务端调用路径（阶段 3 起启用）；
+     *        为 true 时跳过归属校验并放行 `expired`。默认 false＝用户自助退款，
+     *        既校验归属、也拒绝过期订单
+     * @param options.outRefundNo 审核路径下由审核服务按申请序号算出的退款单号
+     *        （`buildOutRefundNo`：首次 `RF{bookingId}`，二次 `RF{bookingId}-2`…）。
+     *        传入时不走 `booking.outRefundNo ?? 'RF'+bookingId`——那条幂等规则是为
+     *        「自助退款重试单号不变」设计的，而审核路径下**同一次退款成功的重试**
+     *        由 `prepareApproval` 复用申请单上已落库的 `outRefundNo` 保证，
+     *        不能退化成「永远用 RF{bookingId}」——否则用户第二次申请退款会命中
+     *        微信对同一个 out_refund_no 的幂等返回（同一单已退过），资金永远退不出去。
      * @returns 退款结果
      */
-    async initiateRefund(bookingId: string, openid: string) {
+    async initiateRefund(
+        bookingId: string,
+        openid: string,
+        options?: { asAdmin?: boolean; outRefundNo?: string },
+    ) {
         const booking = await this.bookingRepository.getBookingById(bookingId);
         if (!booking) {
             throw new BadRequestException('订单不存在');
         }
 
-        if (booking.wechatOpenId !== openid) {
+        // 归属校验：**审核路径（asAdmin）必须跳过**。
+        // 该路径的调用者是服务端自己（AdminService.approveRefundApply），操作者是管理员、
+        // 不是下单人，它手里根本没有下单人的 openid（调用时传空串）。
+        // ⚠️ 这一条曾经漏掉：`asAdmin` 只放行了下面那道 `expired` 拦截，归属校验仍是无条件的，
+        // 于是「审核通过」永远抛「无权操作该订单」——单据已落 approved、钱一分没动，
+        // 且因为状态已不是 pending 而无法重试。回归锁在 `refund-approve-chain.spec.ts`
+        // （链路级：会真的把 refundStatus 走到 refunding）。
+        // 用户自助路径（`POST /bookings/:id/refund`）不带 asAdmin，校验原样保留。
+        if (!options?.asAdmin && booking.wechatOpenId !== openid) {
             throw new BadRequestException('无权操作该订单');
         }
         if (booking.isFree) {
@@ -1166,6 +1264,12 @@ export class BookingService {
         }
         if (booking.status === BookingStatus.COMPLETED) {
             throw new BadRequestException('订单已完成，无法退款');
+        }
+        // 已过期订单必须走「申请 → 审核」，不允许自助退款（Q1）。
+        // 过期订单 status 为 expired，上面那条 COMPLETED 判断不会命中，
+        // 而这条是它与「用户点旧入口直接退款」之间唯一的拦截面——见方法注释的时序说明。
+        if (booking.status === BookingStatus.EXPIRED && !options?.asAdmin) {
+            throw new BadRequestException('订单已过期，退款需经管理员审核，请在小程序订单详情页提交退款申请');
         }
 
         if (booking.paymentStatus !== PaymentStatus.PAID) {
@@ -1189,8 +1293,9 @@ export class BookingService {
             }
         }
 
-        // 幂等保护：固定退款单号（不含时间戳），保证重试时单号不变，避免重复退款
-        const outRefundNo = booking.outRefundNo ?? `RF${booking.bookingId}`;
+        // 幂等保护：固定退款单号（不含时间戳），保证重试时单号不变，避免重复退款。
+        // 审核路径（options.outRefundNo）由审核服务按申请序号给号，见方法注释。
+        const outRefundNo = options?.outRefundNo ?? booking.outRefundNo ?? `RF${booking.bookingId}`;
 
         // 条件更新：只有 CONFIRMED + PAID + refund NONE/FAILED 才能进入 REFUNDING
         const affected = await this.bookingRepository.markRefundStarting(bookingId, outRefundNo, Date.now() + 15 * 60 * 1000);
@@ -1491,21 +1596,201 @@ export class BookingService {
     }
 
     /**
-     * 历史订单更新：每小时（13 分），不调用微信，保留批量 UPDATE
+     * T1 过期扫描：每小时（13 分，沿用原 `runHistoricalBookingUpdate` 的槽位与重入保护），
+     * 不调用微信，批量条件 UPDATE。
+     *
+     * **取代原 `runHistoricalBookingUpdate`**。原实现把「预约日已过且未核销」的订单置为
+     * `completed`，使「没来」与「来过」在数据上再也无法区分；现在改为置 `expired`。
+     * 由此 `completed` 语义收窄为「已核销」，唯一写入方是 `markVerified`。
+     *
+     * 频率说明（§4.2.2）：过期判定是 `bookingDate < 今天`，一天只在跨零点时变化一次，
+     * 每小时跑已是超额覆盖，不改频率。
+     *
+     * 「今天」固定取**北京时间**，不用服务器本地日期：
+     * 原实现用 `new Date()` 的服务器本地年月日，服务器若跑 UTC，过期边界会比北京零点
+     * 晚最多 8 小时（当天凌晨的订单要多挂 8 小时才下沉）。
+     *
+     * ⚠️ 边界以**日期字符串**交给仓库（`beijingDateStr()` 的返回值），不构造 `Date`。
+     * 这里曾写 `new Date(\`${beijingDateStr()}T00:00:00\`)` 并注释"TypeORM 对 date 列按
+     * 本地分量格式化，故时区无关"——**该判断是错的**：`where` 里的 `Date` 参数由 TypeORM 走
+     * `mixedDateToUtcDatetimeString`，绑定成 **UTC 分量**的 `'2026-09-13 00:00:00.000'`；
+     * 与纯 `'2026-09-13'` 列做字符串比较时 `'2026-09-13' < '2026-09-13 00:00:00.000'`
+     * 为真，于是「< 今天」退化成「≤ 今天」，**UTC 服务器下当天订单会被误置为 expired**。
+     * 详见 `markExpired` 的注释与 `implementation-todo.md` 说明 23（含实测绑定值）。
+     *
+     * 顺序：先状态流转，再发通知（§4.2.3 步骤①②）。两步**完全解耦**：
+     *   ① 只改状态，失败了下轮重跑（`WHERE status='confirmed'` 已不匹配的不会重复处理）；
+     *   ② 只发通知，靠 `expireNotifiedAt IS NULL` 标记位补发。
+     * 任一步骤失败都不会造成永久漏发——这是 v1「用扫描窗口挑待通知订单」的替代方案。
      */
     @Cron('0 13 * * * *', { timeZone: 'Asia/Shanghai' })
-    async runHistoricalBookingUpdate() {
-        if (this.taskRunning.historical) return;
-        this.taskRunning.historical = true;
+    async runExpireScan() {
+        if (this.taskRunning.expire) return;
+        this.taskRunning.expire = true;
         try {
-            const todayStart = new Date(new Date().getFullYear(), new Date().getMonth(), new Date().getDate());
-            await this.bookingRepository.updatePastBookings(todayStart);
-            this.logTask('historical', AppLogLevel.INFO, '完成', { task: 'historical' });
+            const now = Date.now();
+            // 步骤①：状态流转
+            const affected = await this.bookingRepository.markExpired(beijingDateStr(), now);
+            // 步骤②：发通知（按标记位捞，跑几次都安全）
+            const notified = await this.notifyExpiredBookings(now);
+
+            this.logTask('expire', AppLogLevel.INFO, '完成', {
+                task: 'expire',
+                expiredCount: affected,
+                notifiedCount: notified,
+            });
         } catch (error) {
-            this.logger.error('历史订单更新任务失败', error);
-            this.logTask('historical', AppLogLevel.ERROR, '失败', { task: 'historical', error: (error as Error).message });
+            this.logger.error('过期扫描任务失败', error);
+            this.logTask('expire', AppLogLevel.ERROR, '失败', { task: 'expire', error: (error as Error).message });
         } finally {
-            this.taskRunning.historical = false;
+            this.taskRunning.expire = false;
+        }
+    }
+
+    /**
+     * T2 每日 22:00 提醒（§4.2.4，一次扫描覆盖两件事）
+     *
+     *   ① 当天预约、仍未核销的 → 「订单即将过期，请尽快核销」
+     *      `dedupeKey = ORDER_EXPIRE_REMINDER:{bookingId}`，**不写任何标记位**：
+     *      这张订单当天只会被扫到一次（`bookingDate = 今天` 在次日即不成立），
+     *      去重键只是为了防「同一轮里被重复处理」，不需要 `expireNotifiedAt`。
+     *   ② 近 7 天已过期、从未通知、且未提交退款申请的 → 「订单已过期，可申请退款」
+     *      `dedupeKey = ORDER_EXPIRED:{bookingId}`，**发送后写 `expireNotifiedAt`**。
+     *      它兜底三件事（§4.2.4）：T1 的漏发、被 A 规则挡掉的人（23:50 下单、
+     *      00:13 被翻成过期的用户，此刻 `createdAt` 早已满足 2 小时）、以及唤回
+     *      「过期了但不知道自己能退款」的用户。7 天窗口与退款申请时限**同源**
+     *      （`getRefundApplyDeadlineDays()`），保证提醒只落在「还能退」的区间内。
+     *
+     * 22:00 而不是更晚：当天核销的提醒必须在**当天还能核销**的时候送达，
+     * 22:00 留出 2 小时余量；再晚用户已入睡，推送等于白发。
+     *
+     * ⚠️ 与 T1 用的是**同一个 dedupeKey**（`ORDER_EXPIRED:{bookingId}`），
+     * 这是刻意的：两条路径谁先到谁生效，另一条被去重拦下、照样写标记位，
+     * 用户不会收到两条「已过期」。若两处 key 不一致，就会轰炸。
+     */
+    @Cron('0 0 22 * * *', { timeZone: 'Asia/Shanghai' })
+    async runDailyReminderScan() {
+        if (this.taskRunning.dailyReminder) return;
+        this.taskRunning.dailyReminder = true;
+        try {
+            const now = Date.now();
+
+            // ① 当天未核销 → 提醒核销
+            const todayPending = await this.bookingRepository.findTodayUnverified(
+                beijingDateStr(),
+                MESSAGE_SCAN_BATCH_LIMIT,
+                now,
+            );
+            let reminded = 0;
+            for (const booking of todayPending) {
+                await this.notifyQuietly(MessageType.ORDER_EXPIRE_REMINDER, booking, now);
+                reminded++;
+            }
+
+            // ② 近 N 天已过期未通知 → 提醒可退款（兜底 + 唤回）
+            const deadlineDays = this.systemConfigService.getRefundApplyDeadlineDays();
+            const expiredPending = await this.bookingRepository.findExpiredForRefundReminder(
+                MESSAGE_SCAN_BATCH_LIMIT,
+                now,
+                deadlineDays * 24 * 60 * 60 * 1000,
+            );
+            let recalled = 0;
+            for (const booking of expiredPending) {
+                if (await this.notifyExpiredBooking(booking, now)) recalled++;
+            }
+
+            this.logTask('daily-reminder', AppLogLevel.INFO, '完成', {
+                task: 'daily-reminder',
+                todayPendingCount: todayPending.length,
+                remindedCount: reminded,
+                expiredPendingCount: expiredPending.length,
+                recalledCount: recalled,
+            });
+        } catch (error) {
+            this.logger.error('每日提醒任务失败', error);
+            this.logTask('daily-reminder', AppLogLevel.ERROR, '失败', {
+                task: 'daily-reminder',
+                error: (error as Error).message,
+            });
+        } finally {
+            this.taskRunning.dailyReminder = false;
+        }
+    }
+
+    /**
+     * T1 步骤②的实现：把「已过期但未通知」的订单逐条发出去（§4.2.3）
+     *
+     * @returns 已发出（或早已存在）的条数
+     */
+    private async notifyExpiredBookings(now: number): Promise<number> {
+        const pending = await this.bookingRepository.findExpiredNotNotified(
+            MESSAGE_SCAN_BATCH_LIMIT,
+            now,
+        );
+        let notified = 0;
+        for (const booking of pending) {
+            if (await this.notifyExpiredBooking(booking, now)) notified++;
+        }
+        return notified;
+    }
+
+    /**
+     * 发一条「订单已过期，可申请退款」，并按结果决定是否写标记位
+     *
+     * **只有 `sent=true` 才写 `expireNotifiedAt`**（含「早已存在」——那说明
+     * 上一轮发过而标记位没写上，两条路径共用同一个 dedupeKey，写标记位是正确收尾）。
+     * 被每日配额挡下时 `sent=false`，**不写**：下轮继续扫到，明日额度重置后自然补发。
+     * 若不写，`ORDER_EXPIRED` 会在同一用户身上一轮一轮地丢——这是「防打扰」与
+     * 「不漏发」之间的正确一侧。
+     *
+     * 申请截止日走 `resolveApplyDeadlineStr`（与退款入口**同一个公式**）：
+     * 站内信里写的日期必须和接口判定的一致，否则用户会按信里的日期卡点来申请却被拒。
+     */
+    private async notifyExpiredBooking(booking: Booking, now: number): Promise<boolean> {
+        const applyDeadline = resolveApplyDeadlineStr(
+            booking.expiredAt,
+            this.systemConfigService.getRefundApplyDeadlineDays(),
+        );
+        try {
+            const sent = await this.messageService.sendOrderExpired(
+                { bookingId: booking.bookingId, wechatOpenId: booking.wechatOpenId },
+                applyDeadline,
+                new Date(now),
+            );
+            if (sent) {
+                await this.bookingRepository.markExpireNotified(booking.bookingId, now);
+            }
+            return sent;
+        } catch (error) {
+            // 单条失败不中断整批：这批是「历史积压」形态，一条卡住不应让后面全部推迟一小时。
+            // 该条的标记位没写，下轮还会被扫到。
+            this.logger.error(
+                `过期通知发送失败: bookingId=${booking.bookingId}`,
+                error instanceof Error ? error.stack : String(error),
+            );
+            return false;
+        }
+    }
+
+    /**
+     * T2 ① 的发送（提醒核销）
+     *
+     * 不写标记位（理由见 `runDailyReminderScan`），因此也不需要处理配额——
+     * 被挡下就挡下了，次日该订单若仍未核销会转成 T1/T2 ② 的「已过期可退款」，
+     * 不存在永久漏发。
+     */
+    private async notifyQuietly(msgType: MessageType, booking: Booking, now: number): Promise<void> {
+        try {
+            await this.messageService.send(
+                msgType,
+                { userId: booking.wechatOpenId, bookingId: booking.bookingId },
+                new Date(now),
+            );
+        } catch (error) {
+            this.logger.error(
+                `每日提醒发送失败: msgType=${msgType}, bookingId=${booking.bookingId}`,
+                error instanceof Error ? error.stack : String(error),
+            );
         }
     }
 
@@ -1577,6 +1862,30 @@ export class BookingService {
     }
 
     /**
+     * 把资金终态镜像到退款申请单（§4.3.3 改动 3）
+     *
+     * 三条路径都会收敛同一笔退款：微信回调、15 分钟对账 Cron、异常通道重试。
+     * 这里做的是「申请单跟随资金结果」，**不参与任何状态决策**——`markSettled`
+     * 内部限定 `WHERE status='approved'`，已是终态时 affected=0，重复调用无害。
+     *
+     * 非申请单发起的退款（用户自助、管理员直接退款）反查不到申请单，静默返回，
+     * 这是正常路径而非异常（见 RefundApplyRepository.findByOutRefundNo 的注释）。
+     *
+     * @param outRefundNo 本次退款的商户退款单号
+     * @param success 资金是否到账
+     */
+    private async mirrorRefundSettlement(outRefundNo: string, success: boolean): Promise<void> {
+        const apply = await this.refundApplyRepository.findByOutRefundNo(outRefundNo);
+        if (!apply) return;
+        const affected = await this.refundApplyRepository.markSettled(apply.applyNo, success);
+        // 到账通知：只在**本次真的推动了状态**时发（三条收敛路径并发时只有先到的拿到 1）。
+        // 不放在 `RefundApplyService.syncSettledByOutRefundNo` 里，是因为本方法（以及
+        // WechatPayService 的同名方法）**刻意不经过那个服务**——写在那边会让真实回调
+        // 路径上的通知永远发不出去。方法自身不抛异常，故这里不套 try/catch。
+        if (affected > 0) await this.messageService.notifyRefundSettled(apply, success);
+    }
+
+    /**
      * 退款对账结果应用
      */
     private async applyRefundReconcileResult(booking: Booking, result: any) {
@@ -1584,22 +1893,30 @@ export class BookingService {
         switch (result.state) {
             case 'SUCCESS':
                 await this.bookingRepository.markRefundSucceeded(booking.bookingId, booking.outRefundNo, new Date());
+                await this.mirrorRefundSettlement(booking.outRefundNo, true);
                 await this.bookingRepository.resolveAnomaly(booking.bookingId, AnomalyType.REFUND_QUERY_REPEATED_FAILURE, '退款对账确认成功', now);
                 break;
             case 'CLOSED':
-            case 'ABNORMAL':
             case 'NOT_EXIST':
                 // 微信明确终态失败或退款单不存在：标记失败，清空调度字段
                 await this.bookingRepository.markRefundFailed(booking.bookingId, booking.outRefundNo);
+                await this.mirrorRefundSettlement(booking.outRefundNo, false);
                 await this.bookingRepository.resolveAnomaly(booking.bookingId, AnomalyType.REFUND_QUERY_REPEATED_FAILURE, '退款对账确认终态失败', now);
                 break;
             case 'PROCESSING':
                 // 仍在处理中：15 分钟后再查
                 await this.bookingRepository.rescheduleRefundCheck(booking.bookingId, booking.outRefundNo, now + 15 * 60 * 1000, now);
                 break;
+            case 'ABNORMAL':
             case 'UNKNOWN':
             default:
-                // 临时错误：attempts 加一，连续三次后升级异常
+                // 临时错误 / 微信退款异常：attempts 加一，连续三次后升级异常。
+                //
+                // ⚠️ `ABNORMAL` 必须留在**这一侧**，不能跟 CLOSED 一起判终态失败：
+                // 微信的「退款异常」常见原因是商户可用余额不足，补足后微信侧仍可能完成这笔退款。
+                // 判成失败会让用户重新申请 → 换号重发（`RF{id}-2`）→ 第一笔后来成功就是**重复退款**。
+                // 旧实现靠固定单号 `RF{bookingId}` + 微信幂等天然不可能退两次，换号之后这个保护没了，
+                // 所以只能靠「不判终态」来兜。代价是异常单可能多挂一会儿，由人工/后续对账收敛。
                 await this.bookingRepository.markRefundResultUnknown(booking.bookingId, booking.outRefundNo, result.errorCode ?? 'QUERY_REFUND_UNKNOWN', now);
                 const fresh = await this.bookingRepository.getBookingById(booking.bookingId);
                 if (fresh.refundStatus === RefundStatus.REFUNDING && fresh.reconcileAttempts >= 3) {
@@ -1607,7 +1924,9 @@ export class BookingService {
                         fresh.bookingId,
                         AnomalyType.REFUND_QUERY_REPEATED_FAILURE,
                         result.errorCode ?? 'QUERY_REFUND_UNKNOWN',
-                        '退款查询连续失败',
+                        result.state === 'ABNORMAL'
+                            ? '微信退款异常（非终态）：常见原因是商户可用余额不足，需人工核查商户账户'
+                            : '退款查询连续失败',
                         nextAnomalyRetryAt(fresh.reconcileAttempts, now),
                     );
                 }
@@ -1739,10 +2058,12 @@ export class BookingService {
                 return;
             case 'refundSucceeded':
                 await this.bookingRepository.markRefundSucceeded(booking.bookingId, booking.outRefundNo, new Date());
+                await this.mirrorRefundSettlement(booking.outRefundNo, true);
                 await this.bookingRepository.resolveAnomaly(booking.bookingId, anomaly.type, action.resolution, now);
                 return;
             case 'refundFailed':
                 await this.bookingRepository.markRefundFailed(booking.bookingId, booking.outRefundNo);
+                await this.mirrorRefundSettlement(booking.outRefundNo, false);
                 await this.bookingRepository.resolveAnomaly(booking.bookingId, anomaly.type, action.resolution, now);
                 return;
             case 'paymentClosed':
@@ -1761,9 +2082,15 @@ export class BookingService {
 
     /**
      * 核验订单（管理员扫码）
-     * 将 CONFIRMED 订单标记为 COMPLETED
+     * 将 CONFIRMED 订单标记为 COMPLETED，并写入核销留痕（verifiedAt / verifiedBy）
+     *
+     * 互斥保证：真正的状态流转由 `markVerified` 的条件更新完成（WHERE status='confirmed'）；
+     * 下方的前置校验只为给出友好错误文案，**不是**并发保护。
+     * 这样核销与 T1 的 `markExpired` 严格互斥——若核销晚于 T1，affected=0，
+     * 不会把已过期订单写回 completed（那等于一次绕过审核的补核销，Q2 不允许）。
+     *
      * @param bookingId 订单ID
-     * @param openid 操作者 openid
+     * @param openid 操作者 openid（核销员，写入 verifiedBy 留痕）
      */
     async verifyBooking(bookingId: string, openid: string) {
         const admin = await this.adminApplicationRepository.findApprovedByOpenid(openid);
@@ -1786,17 +2113,31 @@ export class BookingService {
             throw new BadRequestException(`订单状态不可核验，当前状态：${booking.status}`);
         }
 
-        const updated = await this.bookingRepository.updateBooking(bookingId, { status: BookingStatus.COMPLETED } as any);
-        // 记录点：核验成功
+        const affected = await this.bookingRepository.markVerified(bookingId, openid, Date.now());
+        if (affected === 0) {
+            // 读到写之间状态被其他流程推进（典型：T1 已把订单翻成 expired，或并发重复核销）
+            const fresh = await this.bookingRepository.getBookingById(bookingId);
+            this.loggingService.write({
+                source: AppLogSource.BACKEND,
+                level: AppLogLevel.WARN,
+                category: AppLogCategory.BOOKING,
+                message: '预约核验失败',
+                route: `/bookings/${bookingId}/verify`,
+                context: { bookingId, currentStatus: fresh.status, reason: 'conditional-update-missed' },
+            });
+            throw new BadRequestException(`订单状态不可核验，当前状态：${fresh.status}`);
+        }
+
+        // 记录点：核验成功（含核销员，便于核销故障统计与追责）
         this.loggingService.write({
             source: AppLogSource.BACKEND,
             level: AppLogLevel.INFO,
             category: AppLogCategory.BOOKING,
             message: '预约核验成功',
             route: `/bookings/${bookingId}/verify`,
-            context: { bookingId },
+            context: { bookingId, verifiedBy: openid },
         });
-        return updated;
+        return await this.bookingRepository.getBookingById(bookingId);
     }
 
     /**

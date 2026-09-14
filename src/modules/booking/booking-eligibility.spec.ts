@@ -13,7 +13,9 @@ import { WechatPayService } from '../wechat-pay/wechat-pay.service';
 import { SystemConfigService } from '../system-config/system-config.service';
 import { AdminApplicationRepository } from '../../repositories/admin-application.repository';
 import { UserProfileRepository } from '../../repositories/user-profile.repository';
+import { RefundApplyRepository } from '../../repositories/refund-apply.repository';
 import { LoggingService } from '../logging/logging.service';
+import { MessageService } from '../message/message.service';
 import { calculateAgePricing, PassengerType } from './passenger-pricing';
 import { PassengerErrorCode } from '../../common/passenger-business.exception';
 import { PreviewBookingDto } from './dto/previewBooking.dto';
@@ -178,7 +180,12 @@ describe('determineFreeEligibility / createBooking 集成', () => {
                 },
                 { provide: AdminApplicationRepository, useValue: {} },
                 { provide: UserProfileRepository, useValue: userProfileRepositoryMock },
+                // 退款申请仓库（资金结果镜像用）：本文件只走资格校验路径，不会被触达
+                { provide: RefundApplyRepository, useValue: {} },
                 { provide: LoggingService, useValue: loggingServiceMock },
+                // 站内信（T1 ② / T2 发送用）：本文件只走资格校验路径，不会被触达。
+                // 必填依赖，桩不能省——Nest 在装配阶段就会报 can't resolve。
+                { provide: MessageService, useValue: {} },
             ],
         }).compile();
 

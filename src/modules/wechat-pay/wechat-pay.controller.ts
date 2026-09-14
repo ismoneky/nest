@@ -120,7 +120,7 @@ export class WechatPayController {
             try {
                 const result = this.wechatPayService.parseRefundNotify(body);
                 if (result) {
-                    await this.wechatPayService.handleRefundCallback(result.outTradeNo, result.refundStatus);
+                    await this.wechatPayService.handleRefundCallback(result.outTradeNo, result.refundStatus, result.outRefundNo);
                     this.logger.log(`退款回调处理完成: ${result.outTradeNo}, 状态: ${result.refundStatus}`);
                     // 记录点：退款回调处理结果（日志失败不影响业务结果）
                     this.loggingService.write({
@@ -129,7 +129,12 @@ export class WechatPayController {
                         category: AppLogCategory.PAYMENT,
                         message: '退款回调处理完成',
                         route: '/wechat-pay/refund-notify',
-                        context: { outTradeNo: result.outTradeNo, refundStatus: result.refundStatus },
+                        // outRefundNo 入日志：申请单是按它反查镜像的，排查退款单与申请单对不上时这是唯一线索
+                        context: {
+                            outTradeNo: result.outTradeNo,
+                            refundStatus: result.refundStatus,
+                            outRefundNo: result.outRefundNo,
+                        },
                     });
                 }
             } catch (error) {

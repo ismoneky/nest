@@ -9,7 +9,10 @@ import { UpdateBookingDto } from './dto/updateBooking.dto';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { BookingStatus } from '../../entities/booking.entity';
 import { PaymentException } from '../../common/payment-errors';
+import { BookingException } from '../../common/booking-errors';
 import { IsEnum, IsOptional } from 'class-validator';
+import { RefundApplyService } from '../refund/refund-apply.service';
+import { SubmitRefundApplyDto } from '../refund/dto/submit-refund-apply.dto';
 
 class GetBookingCountDto {
     @IsOptional()
@@ -25,6 +28,7 @@ class GetBookingCountDto {
 export class BookingController {
     constructor(
         private readonly bookingService: BookingService,
+        private readonly refundApplyService: RefundApplyService,
     ) {}
 
     /**
@@ -164,27 +168,121 @@ export class BookingController {
     async getBookingById(@Param('bookingId') bookingId: string, @Req() req: Request, @Res() res: Response) {
         const { openid } = req['user'] as { openid: string };
         const booking = await this.bookingService.getBookingById(bookingId, openid);
+        // 退款入口显隐由后端下发（§4.3.5）：前端只读 refundEntry.visible，
+        // 时限、次数、进行中申请的判定全部在服务端，规则改动零前端发版。
+        const refundEntry = await this.refundApplyService.buildRefundEntry(booking);
         return res.status(HttpStatus.OK).send({
             success: true,
-            data: booking,
+            data: { ...booking, refundEntry },
         });
     }
 
     /**
-     * 更新预约订单
-     * PUT /bookings/:bookingId
-     * @param bookingId 订单ID (UUID)
-     * @param updateBookingDto 更新数据
-     * @param res Express 响应对象
+     * 提交退款申请（过期订单的资金出口，§4.3.1）
+     * POST /bookings/:bookingId/refund-apply
+     *
+     * 与 `POST /bookings/:bookingId/refund`（自助退款，仅 confirmed 单）是两条路：
+     * 过期订单必须先申请、经管理员审核，通过后由服务端带 asAdmin 走同一套退款链路。
+     *
+     * 这里**不 catch 异常**：`RefundException` 自带稳定 errorCode，
+     * 由全局过滤器透传成 `{ success: false, code, message }`；自己包装会把错误码丢掉。
+     *
+     * @param dto 退款原因（必填）
      */
-    @Put(':bookingId')
-    async updateBooking(@Param('bookingId') bookingId: string, @Body() updateBookingDto: UpdateBookingDto, @Res() res: Response) {
-        const booking = await this.bookingService.updateBooking(bookingId, updateBookingDto);
+    @Post(':bookingId/refund-apply')
+    @UseGuards(JwtAuthGuard)
+    async submitRefundApply(
+        @Param('bookingId') bookingId: string,
+        @Body() dto: SubmitRefundApplyDto,
+        @Req() req: Request,
+        @Res() res: Response,
+    ) {
+        const { openid } = req['user'] as { openid: string };
+        // getBookingById 会做归属校验（不属于该用户直接 400），订单不存在也在此拦下
+        const booking = await this.bookingService.getBookingById(bookingId, openid);
+        const apply = await this.refundApplyService.submitApply(booking, openid, dto.reason);
         return res.status(HttpStatus.OK).send({
             success: true,
-            message: 'Booking updated successfully',
-            data: booking,
+            message: '退款申请已提交，请等待审核',
+            data: apply,
         });
+    }
+
+    /**
+     * 取消预约订单（推荐入口）
+     * POST /bookings/:bookingId/cancel
+     * @param bookingId 订单ID (UUID)
+     * @param req Express 请求对象
+     * @param res Express 响应对象
+     */
+    @Post(':bookingId/cancel')
+    @UseGuards(JwtAuthGuard)
+    async cancelBooking(@Param('bookingId') bookingId: string, @Req() req: Request, @Res() res: Response) {
+        const { openid } = req['user'] as { openid: string };
+        try {
+            const booking = await this.bookingService.cancelBooking(bookingId, openid);
+            return res.status(HttpStatus.OK).send({
+                success: true,
+                message: '预约已取消',
+                data: booking,
+            });
+        } catch (error) {
+            // 与 /pay 同一套稳定错误码契约：结构不变，另附 errorCode 供前端按码分支
+            const errorCode = error instanceof BookingException ? error.code : undefined;
+            return res.status(HttpStatus.BAD_REQUEST).send({
+                success: false,
+                message: '取消预约失败',
+                error: error.message,
+                ...(errorCode ? { errorCode } : {}),
+            });
+        }
+    }
+
+    /**
+     * 更新预约订单 —— **已废弃，仅为兼容未更新的小程序版本保留取消语义**
+     *
+     * 旧实现没有 @UseGuards、没有归属校验，且 UpdateBookingDto 允许任意 status 与业务字段，
+     * 任何人拿到订单号即可改写他人订单（含伪造核销码）。见 dto/updateBooking.dto.ts 的说明。
+     * 现在：加 Guard + 归属校验，且只有 `status: 'cancelled'` 会被受理，其余一律 400。
+     *
+     * @deprecated 改用 `POST /bookings/:bookingId/cancel`；小程序全量更新后删除本端点
+     */
+    @Put(':bookingId')
+    @UseGuards(JwtAuthGuard)
+    async updateBooking(
+        @Param('bookingId') bookingId: string,
+        @Body() updateBookingDto: UpdateBookingDto,
+        @Req() req: Request,
+        @Res() res: Response,
+    ) {
+        const { openid } = req['user'] as { openid: string };
+
+        // 兜底判定：DTO 的 @IsOptional 允许 status 缺失，@IsIn 只在校验管道生效时拦非 cancelled 取值，
+        // 所以这里必须自己判一次 —— 缺 status 与传错值都走同一个 400。
+        if (updateBookingDto.status !== 'cancelled') {
+            return res.status(HttpStatus.BAD_REQUEST).send({
+                success: false,
+                message: '该接口已废弃，仅支持取消订单',
+                error: '请使用 POST /bookings/:bookingId/cancel',
+            });
+        }
+
+        try {
+            const booking = await this.bookingService.cancelBooking(bookingId, openid);
+            return res.status(HttpStatus.OK).send({
+                success: true,
+                message: '预约已取消',
+                data: booking,
+            });
+        } catch (error) {
+            const errorCode = error instanceof BookingException ? error.code : undefined;
+            return res.status(HttpStatus.BAD_REQUEST).send({
+                success: false,
+                message: '取消预约失败',
+                error: error.message,
+                ...(errorCode ? { errorCode } : {}),
+            });
+        }
     }
 
     /**

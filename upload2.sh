@@ -11,23 +11,19 @@ cd "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 echo "本地目录：$(pwd)"
 
 HOST=root@82.157.111.208
-REMOTE=/app/backend
+REMOTE=/app/test
 
 # 每个 scp 只问一次密码，免得输错还要连问三次
 SCP="scp -o NumberOfPasswordPrompts=1"
 
 rm -rf dist
-npm run build
+# npm run build
 
 $SCP -r package.json      $HOST:$REMOTE/package.json
 $SCP -r package-lock.json $HOST:$REMOTE/package-lock.json
 $SCP -r dist/*            $HOST:$REMOTE/dist/
 # $SCP -r certs/*         $HOST:$REMOTE/certs/          # 本机没有 certs/，跳过
-$SCP -r .env              $HOST:$REMOTE/.env
+$SCP -r .env-test              $HOST:$REMOTE/.env
 $SCP -r scripts/*         $HOST:$REMOTE/scripts/
-
-# —— upload.sh 里没有的（本次事故恢复要用）——
-$SCP -r recovery-export-20260913-b/bookings.json $HOST:$REMOTE/bookings.json
-$SCP -r docs/booking-recovery-runbook.md         $HOST:$REMOTE/booking-recovery-runbook.md
 
 echo "传完了。"

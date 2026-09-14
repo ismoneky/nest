@@ -64,7 +64,7 @@ async function bootstrap() {
   app.enableCors({
     origin: corsOrigin === '*' ? '*' : corsOrigin.split(',').map(o => o.trim()),
     methods: 'GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS',
-    allowedHeaders: 'Content-Type, Accept, Authorization, x-admin-key',
+    allowedHeaders: 'Content-Type, Accept, Authorization, x-admin-key, x-admin-token',
     credentials: corsOrigin !== '*',
   });
 

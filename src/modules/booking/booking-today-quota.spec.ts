@@ -11,7 +11,9 @@ import { WechatPayService } from '../wechat-pay/wechat-pay.service';
 import { SystemConfigService } from '../system-config/system-config.service';
 import { AdminApplicationRepository } from '../../repositories/admin-application.repository';
 import { UserProfileRepository } from '../../repositories/user-profile.repository';
+import { RefundApplyRepository } from '../../repositories/refund-apply.repository';
 import { LoggingService } from '../logging/logging.service';
+import { MessageService } from '../message/message.service';
 import { BookingController } from './booking.controller';
 
 /**
@@ -135,7 +137,13 @@ describe('getTodayQuotaOverview（今日名额概览）', () => {
                 },
                 { provide: AdminApplicationRepository, useValue: {} },
                 { provide: UserProfileRepository, useValue: {} },
+                // 退款申请仓库（资金结果镜像用）：本文件只走名额概览路径，不会被触达
+                { provide: RefundApplyRepository, useValue: {} },
                 { provide: LoggingService, useValue: { write: jest.fn().mockResolvedValue(undefined) } },
+                // 站内信（T1 ② / T2 发送用）：本文件只走名额概览路径，不会被触达。
+                // 它是一个**必填**依赖（不是可选注入），所以必须显式给一个桩，
+                // 否则 Nest 在装配阶段就报 can't resolve dependencies。
+                { provide: MessageService, useValue: {} },
             ],
         }).compile();
 
@@ -378,7 +386,11 @@ describe('getTodayQuotaOverview（今日名额概览）', () => {
 
         it('15c. 控制器只透传服务结果，不额外拼装字段', async () => {
             const payload = { date: TODAY, capacity: { level: 'plenty' }, freeQuota: { enabled: true, limit: 5, remaining: 5 } };
-            const controller = new BookingController({ getTodayQuotaOverview: jest.fn().mockResolvedValue(payload) } as any);
+            // 第二参数是退款申请服务（订单详情下发 refundEntry 用），本用例不触及
+            const controller = new BookingController(
+                { getTodayQuotaOverview: jest.fn().mockResolvedValue(payload) } as any,
+                null as any,
+            );
             const res: any = { status: jest.fn().mockReturnThis(), send: jest.fn().mockReturnThis() };
 
             await controller.getTodayQuota(res);

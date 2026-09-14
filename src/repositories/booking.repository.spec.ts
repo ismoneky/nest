@@ -9,6 +9,10 @@ import { BookingRepository } from './booking.repository';
 /**
  * 经营统计聚合口径回归测试
  *
+ * 两套口径刻意不同，勿合并：
+ *   「量」（有效订单数/人数/车辆数）= confirmed + completed
+ *   「钱」（实收金额）              = confirmed + completed + expired（未退款，钱还在手上）
+ *
  * 夹具均为虚构数据，不含真实用户信息。
  */
 describe('BookingRepository.getBookingDashboard', () => {
@@ -77,7 +81,7 @@ describe('BookingRepository.getBookingDashboard', () => {
         expect(res.summary.totalPeople).toBe(4);
     });
 
-    it('只有 paid 且 confirmed/completed 的金额进入实收', async () => {
+    it('只有 paid 且状态在 validStatuses 内的金额进入实收', async () => {
         const res = await repo.getBookingDashboard('2026-08-01', '2026-08-05');
         // 有效订单：8/1 confirmed paid amount=6600；8/4 completed paid amount=0(免费)；8/5 confirmed unpaid amount=6600(不计实收)
         // 8/2 pending 不计；8/3 cancelled/refunded 不计
@@ -101,7 +105,7 @@ describe('BookingRepository.getBookingDashboard', () => {
         expect(res.summary.selfDrivingVehicleCount).toBe(3);
     });
 
-    it('状态分布包含全部五种状态，即使为 0 也有元素', async () => {
+    it('状态分布包含全部六种状态，即使为 0 也有元素', async () => {
         const res = await repo.getBookingDashboard('2026-08-01', '2026-08-07');
         const statuses = res.statusDistribution.map((d) => d.status);
         expect(statuses).toEqual(
@@ -111,9 +115,12 @@ describe('BookingRepository.getBookingDashboard', () => {
                 BookingStatus.COMPLETED,
                 BookingStatus.CANCELLED,
                 BookingStatus.REFUNDED,
+                BookingStatus.EXPIRED,
             ]),
         );
-        expect(res.statusDistribution.length).toBe(5);
+        // 这条 length 断言是防「后端加了新状态但状态分布漏列」的唯一守卫：
+        // 结果数组是按 allStatuses 组装而非按 SQL 结果组装的，漏列不会报错，只会静默少一项。
+        expect(res.statusDistribution.length).toBe(6);
     });
 
     it('出行方式分布包含全部三种方式，仅统计有效订单', async () => {
@@ -153,6 +160,50 @@ describe('BookingRepository.getBookingDashboard', () => {
         expect(d1.peopleCount).toBe(1);
         expect(d1.selfDrivingVehicleCount).toBe(1);
         expect(d1.receivedAmount).toBe(6600);
+    });
+
+    // ===== expired 的双口径（「量」不计 / 「钱」要计，2026-09-13 起）=====
+    // 背景：T1 上线后订单由 completed 变为 expired，若实收也把 expired 排除，
+    // 同一批订单的金额会凭空下降。以下四条锁住这个口径，防止后人"顺手"把 expired 加回 validStatuses。
+
+    it('expired 进入状态分布，但不计入有效订单数/人数/车辆数', async () => {
+        const res = await repo.getBookingDashboard('2026-08-12', '2026-08-12');
+        expect(res.statusDistribution.find((d) => d.status === BookingStatus.EXPIRED)?.orderCount).toBe(1);
+        // 「有多少人真的来了」——expired 没来，不计
+        expect(res.summary.validOrderCount).toBe(0);
+        expect(res.summary.totalPeople).toBe(0);
+        expect(res.summary.selfDrivingVehicleCount).toBe(0);
+    });
+
+    it('【关键】expired 的 paid 金额计入实收（未退款＝钱还在景区手上）', async () => {
+        const res = await repo.getBookingDashboard('2026-08-12', '2026-08-12');
+        expect(res.summary.receivedAmount).toBe(13200);
+    });
+
+    it('【关键】混合区间：expired 只加钱不加量', async () => {
+        // 8/1~8/12 区间内的有效订单：TL001(1人,车) TL005(3人) TL006(1人,车) TL007(2人,车) TL008(1人,无车牌) TL009(4人)
+        //   → 量：6 单 / 12 人 / 3 车
+        // 实收：6600 + 0(免费) + 9900 + 6600 + 13200 = 36300；TL006 未支付不计
+        // 再加 8/12 expired paid 13200 → 49500，而量一项都不加
+        const res = await repo.getBookingDashboard('2026-08-01', '2026-08-12');
+        expect(res.summary.validOrderCount).toBe(6);
+        expect(res.summary.totalPeople).toBe(12);
+        expect(res.summary.selfDrivingVehicleCount).toBe(3);
+        expect(res.summary.receivedAmount).toBe(49500);
+    });
+
+    it('expired 但未支付的订单不计入实收', async () => {
+        const res = await repo.getBookingDashboard('2026-08-13', '2026-08-13');
+        expect(res.statusDistribution.find((d) => d.status === BookingStatus.EXPIRED)?.orderCount).toBe(1);
+        expect(res.summary.receivedAmount).toBe(0);
+    });
+
+    it('每日趋势允许「有效订单 0 但实收 > 0」（当天订单全部过期）', async () => {
+        // 这是双口径的正常表现，不是缺陷——见 getBookingDashboard 方法注释
+        const res = await repo.getBookingDashboard('2026-08-12', '2026-08-12');
+        const d = res.dailyTrend[0];
+        expect(d.validOrderCount).toBe(0);
+        expect(d.receivedAmount).toBe(13200);
     });
 
     it('空范围返回全 0 和连续日期，不返回 null/NaN', async () => {
@@ -222,6 +273,12 @@ async function seedFixtures(bookingRepo: Repository<Booking>) {
         makeBooking({ bookingId: 'TL008', bookingDate: '2026-08-07', status: BookingStatus.CONFIRMED, travelMode: TravelMode.SELF_DRIVING, vehicleType: VehicleType.SMALL_CAR, licensePlate: null, personCount: 1, paymentStatus: PaymentStatus.PAID, amount: 6600 }),
         // 8/8 confirmed paid 收费 4人 观光团 amount=13200
         makeBooking({ bookingId: 'TL009', bookingDate: '2026-08-08', status: BookingStatus.CONFIRMED, travelMode: TravelMode.TOUR_GROUP, personCount: 4, paymentStatus: PaymentStatus.PAID, amount: 13200 }),
+        // ===== 以下两条只为验 expired 的双口径，日期均落在上面各用例区间之外，不影响既有断言 =====
+        // 8/12 expired paid 收费 2人 自驾 有车牌 amount=13200
+        // 「量」不计（人没来），「钱」要计（未退款，钱还在景区手上）
+        makeBooking({ bookingId: 'TL010', bookingDate: '2026-08-12', status: BookingStatus.EXPIRED, travelMode: TravelMode.SELF_DRIVING, vehicleType: VehicleType.SMALL_CAR, licensePlate: '豫C11111', personCount: 2, paymentStatus: PaymentStatus.PAID, amount: 13200 }),
+        // 8/13 expired 未支付 收费 1人（expired 但不计实收：钱没收到过）
+        makeBooking({ bookingId: 'TL011', bookingDate: '2026-08-13', status: BookingStatus.EXPIRED, travelMode: TravelMode.SELF_DRIVING, vehicleType: VehicleType.SMALL_CAR, licensePlate: '豫C22222', personCount: 1, paymentStatus: PaymentStatus.UNPAID, amount: 6600 }),
     ];
     await bookingRepo.save(fixtures);
 }

@@ -17,7 +17,9 @@ import { MemberService } from '../member/member.service';
 import { WechatPayService } from '../wechat-pay/wechat-pay.service';
 import { AdminApplicationRepository } from '../../repositories/admin-application.repository';
 import { UserProfileRepository } from '../../repositories/user-profile.repository';
+import { RefundApplyRepository } from '../../repositories/refund-apply.repository';
 import { LoggingService } from '../logging/logging.service';
+import { MessageService } from '../message/message.service';
 
 /**
  * 「后台设置今日最大预约单量 → 下单真的被拦住」全链路诊断。
@@ -131,7 +133,12 @@ describe('后台「今日最大预约单量」全链路', () => {
                 { provide: WechatPayService, useValue: {} },
                 { provide: AdminApplicationRepository, useValue: {} },
                 { provide: UserProfileRepository, useValue: {} },
+                // 退款申请仓库（资金结果镜像用）：本文件只走限额路径，不会被触达
+                { provide: RefundApplyRepository, useValue: {} },
                 { provide: LoggingService, useValue: { write: jest.fn().mockResolvedValue(undefined) } },
+                // 站内信（T1 ② / T2 发送用）：本文件只走限额路径，不会被触达。
+                // 必填依赖，桩不能省——Nest 在装配阶段就会报 can't resolve。
+                { provide: MessageService, useValue: {} },
             ],
         }).compile();
 
@@ -277,7 +284,8 @@ describe('后台「今日最大预约单量」全链路', () => {
         // 这一层是此前测试的盲区：前面 E~H 都是裸对象直调 service，绕过了全局管道。
         // 若管道剥掉/改写了 bookingDate 或 personCount，判定就会静默失效。
         const dto = await realPipe.transform(fctlBody, { type: 'body', metatype: CreateBookingDto });
-        const controller = new BookingController(bookingService);
+        // 第二参数是退款申请服务（订单详情下发 refundEntry 用），本用例不触及
+        const controller = new BookingController(bookingService, null as any);
         const res: any = { status: jest.fn().mockReturnThis(), send: jest.fn().mockReturnThis() };
 
         await expect(
@@ -304,7 +312,8 @@ describe('后台「今日最大预约单量」全链路', () => {
             },
             { type: 'body', metatype: CreateBookingDto },
         );
-        const controller = new BookingController(bookingService);
+        // 第二参数是退款申请服务（订单详情下发 refundEntry 用），本用例不触及
+        const controller = new BookingController(bookingService, null as any);
 
         const err = await controller
             .createBooking(dto, { user: { openid: 'o-jwt' } } as any, {

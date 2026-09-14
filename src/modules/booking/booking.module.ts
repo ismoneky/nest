@@ -12,6 +12,8 @@ import { SystemConfigModule } from '../system-config/system-config.module';
 import { UserModule } from '../user/user.module';
 import { MemberModule } from '../member/member.module';
 import { LoggingModule } from '../logging/logging.module';
+import { RefundModule } from '../refund/refund.module';
+import { MessageModule } from '../message/message.module';
 
 @Module({
   imports: [
@@ -21,6 +23,12 @@ import { LoggingModule } from '../logging/logging.module';
     UserModule,
     MemberModule,
     LoggingModule,
+    // 退款申请单：BookingService 注入 RefundApplyRepository 做资金结果镜像。
+    // 单向依赖（RefundModule 不 import 本模块），无环。
+    RefundModule,
+    // 站内信：T1 步骤② / T2 每日提醒的发送出口。MessageModule 是叶子模块
+    // （只依赖 TypeOrmModule.forFeature([Message]) 与 UserModule），无环。
+    MessageModule,
   ],
   controllers: [BookingController],
   providers: [BookingService, BookingRepository, AdminApplicationRepository],
