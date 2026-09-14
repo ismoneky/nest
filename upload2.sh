@@ -17,7 +17,7 @@ REMOTE=/app/test
 SCP="scp -o NumberOfPasswordPrompts=1"
 
 rm -rf dist
-# npm run build
+npm run build
 
 $SCP -r package.json      $HOST:$REMOTE/package.json
 $SCP -r package-lock.json $HOST:$REMOTE/package-lock.json

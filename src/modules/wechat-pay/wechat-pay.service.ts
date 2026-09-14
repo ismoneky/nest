@@ -183,8 +183,25 @@ export class WechatPayService {
         }
     }
 
+    /**
+     * 微信回调的对外基址（`notify_url` / `refund_notify_url` 拼在它后面）
+     *
+     * ── 为什么必须读环境变量，不能硬编码 ──────────────────────────────────
+     * 这个地址是交给**微信服务器**去回调的，而各环境的后端入口不同
+     * （生产 `/api`、测试 `/test`）。写死之后所有环境都回调到同一个地方：
+     * 非生产环境永远收不到回调，而微信那边拿到 200（请求落到了别的服务，
+     * 或 nginx 兜底把 SPA 的 index.html 返回了）之后**不会重试**——
+     * 表现为「用户付了钱、订单一直是待支付」，且两端都没有任何报错。
+     *
+     * 默认值刻意等于原硬编码值：生产不配这两个变量时行为与改动前完全一致。
+     *
+     * ⚠️ 改这个值**只影响之后新发起的支付**：已经用旧地址下单的在途订单，
+     * 微信仍会回调到旧 URL，只能靠 `runPaymentReconciliation` 兜底捞回来。
+     */
     private getApiBaseUrl(): string {
-        return 'https://hbfctl.com.cn/api';
+        const protocol = process.env.API_PROTOCOL || 'https';
+        const host = process.env.API_HOST || 'hbfctl.com.cn/api';
+        return `${protocol}://${host}`;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
