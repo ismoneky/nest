@@ -171,6 +171,10 @@ export class BookingController {
         // 退款入口显隐由后端下发（§4.3.5）：前端只读 refundEntry.visible，
         // 时限、次数、进行中申请的判定全部在服务端，规则改动零前端发版。
         const refundEntry = await this.refundApplyService.buildRefundEntry(booking);
+        // 小程序端**不下发核销人**：用户只需要知道「几点核销的」，
+        // 核销员姓名（`verifiedByName`）是给后台追责用的，对游客没有意义。
+        // 也就不在这里调 attachVerifierNames —— 省掉一次查库，
+        // 详情接口是会被轮询的热点路径。
         return res.status(HttpStatus.OK).send({
             success: true,
             data: { ...booking, refundEntry },

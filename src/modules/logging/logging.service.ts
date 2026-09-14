@@ -68,6 +68,32 @@ const LEVEL_RANK: Record<AppLogLevel, number> = {
 };
 
 /**
+ * 落库的最低级别（默认 WARN，`APP_LOG_MIN_LEVEL` 可调）
+ *
+ * 低于这个级别的一律**在入队前丢弃**：不进内存队列、不写 logs.db、也不进 stdout。
+ * 必须拦在最前面 —— 放进队列再等刷盘时过滤，等于白占一个队列名额和一个写事务。
+ *
+ * ── 为什么默认卡在 WARN 而不是 INFO ────────────────────────────────────────
+ * 峰值时日志量几乎全部来自 INFO，而 INFO **全是成功回执**
+ * （预约创建成功 / 支付回调处理成功 / 支付准备命中缓存）——
+ * 这些事实在 `bookings` 表里本来就有，日志里再存一份是纯冗余。
+ * WARN 只有 4 个写入点，且全是「失败了但被正常处理」的场景
+ * （核验失败 / 容量不足 / 退款申请失败），量几乎为零，
+ * 却是排查用户投诉时最需要的信息。所以默认卡在 WARN。
+ *
+ * 要只留 ERROR：`.env` 里加 `APP_LOG_MIN_LEVEL=error`，不用改代码。
+ * 值写错（拼错、空串、大小写）一律回落到 WARN ——
+ * 配置写错不该让日志静默全丢，那是最难查的一种故障。
+ */
+const MIN_LOG_LEVEL: AppLogLevel = resolveMinLevel(process.env.APP_LOG_MIN_LEVEL);
+
+function resolveMinLevel(raw: string | undefined): AppLogLevel {
+    const value = (raw ?? '').trim().toLowerCase();
+    const known = Object.values(AppLogLevel) as string[];
+    return known.includes(value) ? (value as AppLogLevel) : AppLogLevel.WARN;
+}
+
+/**
  * logs.db 体积监控阈值（默认 512 MiB，可通过 LOG_DB_SIZE_WARN_MB 调整）
  */
 const LOG_DB_SIZE_WARN_BYTES = (parseInt(process.env.LOG_DB_SIZE_WARN_MB ?? '512', 10) || 512) * 1024 * 1024;
@@ -149,6 +175,7 @@ export class LoggingService implements AppLogWriter, OnModuleInit {
      * 写一条后端业务日志：进入内存队列后即 resolve，不等待 SQLite
      */
     async write(entry: LogEntry): Promise<void> {
+        if (!this.passesLevelFilter(entry.level)) return;
         if (!this.sqliteEnabled) {
             this.logToStdout(entry);
             return;
@@ -164,13 +191,15 @@ export class LoggingService implements AppLogWriter, OnModuleInit {
         if (entries.length > FLUSH_BATCH_SIZE) {
             throw new Error(`writeMany 每次最多接受 ${FLUSH_BATCH_SIZE} 条日志，请由调用方拆批`);
         }
+        // 先按级别过滤再看 sqlite 开关：被策略丢弃的日志不该出现在任何一个出口
+        const kept = entries.filter((entry) => this.passesLevelFilter(entry.level));
         if (!this.sqliteEnabled) {
-            for (const entry of entries) {
+            for (const entry of kept) {
                 this.logToStdout(entry);
             }
             return;
         }
-        this.enqueue(entries.map((entry) => this.buildRow(entry)));
+        this.enqueue(kept.map((entry) => this.buildRow(entry)));
     }
 
     /**
@@ -181,7 +210,17 @@ export class LoggingService implements AppLogWriter, OnModuleInit {
         if (!this.sqliteEnabled) {
             throw new Error('SQLite 日志持久化已禁用');
         }
-        const rows = entries.map((entry) => this.buildRow(entry));
+        const allRows = entries.map((entry) => this.buildRow(entry));
+
+        // ⚠️ 被级别过滤掉的那些**仍然回执为 accepted**。
+        // 它们是「按策略丢弃」，不是「写失败」——若不出现在 acceptedLogIds 里，
+        // 小程序会当成上报失败并一直重传同一批，把本地上报队列堵死，
+        // 真正该上来的 ERROR 反而挤不出去。
+        const acceptedLogIds = allRows.map((row) => row.logId);
+        const rows = allRows.filter((row) => this.passesLevelFilter(row.level));
+        if (rows.length === 0) {
+            return { acceptedLogIds };
+        }
 
         // 串行 writer 中插入并等待完成（INSERT OR IGNORE：重复 logId 幂等，重复视为已接受）
         const writePromise = this.enqueueWrite(async () => {
@@ -189,7 +228,17 @@ export class LoggingService implements AppLogWriter, OnModuleInit {
         });
         await this.withTimeout(writePromise, 3000, '日志 writer 繁忙或超时');
 
-        return { acceptedLogIds: rows.map((row) => row.logId) };
+        return { acceptedLogIds };
+    }
+
+    /**
+     * 是否达到落库级别。低于阈值的**直接丢弃** —— 不是延迟、不是压缩、不是降级到 stdout。
+     *
+     * 未知级别按最低处理（丢弃）：级别是枚举，出现别值说明调用方写错了，
+     * 这时候宁可少存一条，也不要让一个写错的字符串绕过整道闸门。
+     */
+    private passesLevelFilter(level: AppLogLevel): boolean {
+        return (LEVEL_RANK[level] ?? 0) >= LEVEL_RANK[MIN_LOG_LEVEL];
     }
 
     // ─────────────────────────────────────────────────────────────────────────

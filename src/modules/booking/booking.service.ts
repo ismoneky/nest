@@ -846,10 +846,55 @@ export class BookingService {
     }
 
     /**
+     * 给订单挂上「核销人姓名」（`verifiedByName`）
+     *
+     * `bookings.verifiedBy` 落的是核销员的 openid，直接展示是一串 28 位随机字符，
+     * 解析成 `admin_applications.name` 才对人有意义。
+     *
+     * 【解析不到为什么给 null，而不是回落到 openid】这一层只管「能不能解析出名字」，
+     * 展示成什么由调用方定：后台要能追责（回落显示 openid），小程序端给游客看
+     * openid 则毫无意义（回落到不显示）。策略塞在这里，两个端就没得选了。
+     *
+     * 【为什么只对 completed 发起查询】其余状态 `verifiedBy` 必为 null。
+     * 小程序详情会被 5 秒轮询、后台列表一页最多 100 行，白查是常态开销。
+     */
+    async attachVerifierNames<T extends { status?: BookingStatus; verifiedBy?: string | null }>(
+        rows: T[],
+    ): Promise<(T & { verifiedByName: string | null })[]> {
+        const openids = rows
+            .filter((row) => row.status === BookingStatus.COMPLETED && row.verifiedBy)
+            .map((row) => row.verifiedBy as string);
+
+        if (openids.length === 0) {
+            return rows.map((row) => ({ ...row, verifiedByName: null }));
+        }
+
+        // 姓名是**装饰**，不是订单数据本身。这一步挂掉不能让整页订单打不开——
+        // 后台订单列表是运营的主入口，为了一个「谁核的」把列表整个 500 掉不值当。
+        // 失败就回落成 null，前端退到显示 openid：信息少一点，页面还在。
+        const names = await this.adminApplicationRepository
+            .findApprovedNamesByOpenids(openids)
+            .catch((error) => {
+                this.logger.error(
+                    `核销人姓名解析失败（不影响订单列表）: ${openids.length} 个 openid`,
+                    error instanceof Error ? error.stack : String(error),
+                );
+                return new Map<string, string>();
+            });
+
+        return rows.map((row) => ({
+            ...row,
+            verifiedByName: (row.verifiedBy && names.get(row.verifiedBy)) || null,
+        }));
+    }
+
+    /**
      * 管理员查询订单列表（无 openid 限制）
      */
     async getBookingsForAdmin(query: { bookingDate?: string; createdStart?: string; createdEnd?: string; status?: BookingStatus[]; keyword?: string; page?: number; pageSize?: number }) {
-        return await this.bookingRepository.getBookingsForAdmin(query);
+        const result = await this.bookingRepository.getBookingsForAdmin(query);
+        // 核销人姓名随列表一起下发；订单详情接口另有自己的接入点
+        return { ...result, bookings: await this.attachVerifierNames(result.bookings) };
     }
 
     /**
