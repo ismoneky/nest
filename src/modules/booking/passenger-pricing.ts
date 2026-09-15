@@ -63,10 +63,18 @@ export interface AgePricingSummary {
 }
 
 /**
- * 年龄免费总开关：false 时儿童/老人一律正常收费（自动分类仅用于打标），
- * 会员/每日名额整单免费不受影响。想恢复年龄免费时改回 true 即可。
+ * 年龄免费总开关：true 时 13 岁及以下儿童、70 岁及以上老人（须有合法身份证）
+ * 按人员级年龄免费，订单金额 = 收费人数 * 单价；全员命中时整单金额为 0、
+ * `freeReason='age'`，创建即 confirmed，不走微信支付。
+ * false 时上述人员一律正常收费（自动分类仅用于打标）。
+ * 两种取值下，会员 / 每日名额整单免费都不受影响。
+ *
+ * ⚠️ 这是一个**收费开关**：改它等于改用户实付金额，不是显示开关。
+ * 前端 `fctl/utils/passenger-pricing.js` 有个同名同值的常量（只影响绿色标签文案），
+ * 必须同步改；`passenger-pricing.spec.ts` / `booking-eligibility.spec.ts` 里
+ * 有一组按当前取值写的断言，切开关时要一起改，否则测试红。
  */
-export const AGE_FREE_ENABLED = false;
+export const AGE_FREE_ENABLED = true;
 
 /** 儿童年龄免费边界：年龄值 <= 13 */
 export const CHILD_MAX_AGE = 13;

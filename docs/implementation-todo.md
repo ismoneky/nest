@@ -780,3 +780,18 @@ serialWrite(...)        存活=true
     - **没有改通知链路**：当天被刷过期的单会被步骤②按既有规则扫到（受 A 规则静默期约束），文案与截止日照旧。
     - **验证**：`npx tsc --noEmit` 通过；`npx jest` **25 套 / 357 条全绿**（`booking-expire.spec.ts` 的 `includeToday` 子 describe 4 条 + `admin-tasks-endpoint.spec.ts` 的「过期边界」describe 3 条 + 响应结构 1 条）；`admin` 的 `tsc -b` 通过。
     - **顺带记录一次实测（回答「日期累积会不会拖慢扫描」）**：10 万行 / 3 年的合成库上，`markExpired` 的实际计划是 `SEARCH bookings USING INDEX idx_bookings_status_date (status=? AND bookingDate<?)`——**索引第一列是 `status`**，所以它定位的是「当前还挂在 confirmed 的行」，而不是按日期扫全部历史；被刷过的行永久离开这个集合，工作集只与近日单量有关、与历史总量无关。首次（469 单待刷）47 ms，排空后再跑 0 ms；即使去掉复合索引只剩单列 `status` 索引，计划仍是 `SEARCH ... USING INDEX IDX_status`（43 ms）。作为对照，**强制**走单列 `IDX_bookingDate`（等价于扫全部 3 年历史）是 265 ms——那才是「累积」会发生的样子。上生产后按 7b 节的规矩用 `EXPLAIN QUERY PLAN` 自检一次，只要不是按 `bookingDate` 单列索引打头就没有累积问题。
+
+37. **年龄免费开关打开：13 岁及以下、70 岁及以上恢复人员级免费**（2026-09-15）
+    - **改的是什么**：`AGE_FREE_ENABLED` 由 `false` 改为 `true`，两处同名同值的常量必须同改——后端 `nest/src/modules/booking/passenger-pricing.ts`（**唯一有效的那处**，决定实付金额）与前端 `fctl/utils/passenger-pricing.js`（只决定人员卡片上那行绿色「13岁及以下，年龄免费」标签显不显示）。前端改慢一步不会算错钱，只是标签晚一轮小程序版本出现；**后端先发是安全的**。
+    - **这个开关的来历**：`93af88b`（2026-08-17，commit message 只有「更新」）在**把儿童边界从 7 岁提到 13 岁**的同一次提交里加了这个开关并置 false，之后无人记录原因。后果是「13 岁/70 岁」这组数字一切可见的地方（校验文案、类型自动分类、管理端标签）都在，唯独**不再免费**——因为 `calculateAgePricing` 里 `ageFree = true` 的整个分支被 `AGE_FREE_ENABLED &&` 短路掉了。本次是把它恢复到该提交之前的语义（边界数字按新口径 13/70），不是新功能。
+    - **打开后的计费口径**（`composeOrderPricing`）：`金额 = 收费人数 × 单价`，收费人数 = 总人数 − 年龄免费人数。部分免费（如 1 成人 + 1 儿童）→ `isFree=false`、`freeReason=null`、金额为 1 个单价，走正常微信支付；**全员免费 → `amount=0`、`isFree=true`、`freeReason='age'`，`createBooking` 直接落 `confirmed` + `paid`，不调微信支付**。
+    - **`ageValue` 仍照常落快照**（`idCardUnavailable` 的儿童/老人仍按 `id_card_unavailable` 正常收费，与 `regular` 区分）。这一点在开关关闭期间也是成立的，所以**历史订单不受本次改动影响**——订单详情读的是 `passengers` JSON 里存下的 `ageFree`/`pricingReason`，不按当前开关重算。同理，2026-08-17 之前产生的老年龄免费订单本来就在库里，本次不会把它们变回收费。
+    - **不受影响的三处**（改开关时逐条确认过，均有测试守着）：
+      1. **会员 / 每日名额整单免费**优先级更高，命中时 `pricingReason` 统一成 `member_order_free` / `daily_quota_order_free`；被覆盖的人员 `ageFree` 仍保留为 true，`ageFreePeople` 统计不归零（这是 `composeOrderPricing` 的既有语义，不是本次引入）。
+      2. **年龄全免费订单不占每日免费名额**——名额统计只认 `freeReason='dailyQuota'`，`booking-eligibility.spec.ts` 有专条守着，否则会出现「用儿童单消耗掉当天的免费名额」。
+      3. **退款入口对 `isFree` 订单本就不可见**（`refund-apply.service.ts` 的 `!isFree` 条件），所以全额免费单不会出现「申请退 0 元」的入口；部分免费单退的是它真正付过的那笔金额（`booking.amount`）。
+    - **边界**：13 岁免费、14 岁不免费；70 岁免费、69 岁不免费。年龄仍是 `预约游玩年份 − 出生年份` 的粗算（生日误差是既有口径，未改）。未来出生年份（`age < 0`）即使漏过前置校验也不免费——`calculateAgePricing` 里有独立守卫。
+    - **没有 schema 变更，不需要任何手工 SQL**。上线的两件事：后端发版（金额立即变）、小程序发新版本（绿色标签才会出现）。小程序未更新期间，老版本用户拿到的 preview 金额**已经是 0**，因为金额以后端返回为准，前端只是不显示那行标签。
+    - **测试改动不是「顺手删」而是「按打开后的预期重写」**：`passenger-pricing.spec.ts` 与 `booking-eligibility.spec.ts` 里有 9 条断言是按关闭状态写的（标题含「年龄免费关闭」），逐条改写成打开后的金额与 `pricingReason`，并新增 4 条：13/14 与 70/69 的**双向边界**、未显式选类型的 13 岁联系人**单人成单直接全免**、**全员年龄免费经 `createBooking` 落 `confirmed`/`paid` 且金额 0**（这条路径在开关关闭期间不可达，此前没有覆盖）。
+    - **验证**：`npx tsc --noEmit` 通过；`npx jest` **25 套 / 359 条全绿**；`fctl` 的 `node --test tests/` **91/91**。
+    - ⚠️ **要不要改成运行时开关**（挪进 `SystemConfig`，像 `freeQuotaEnabled` 那样让运营自己开关）**未做**：那会把一个编译期常量变成每次下单都要读一次的配置项，且管理端要新增开关与文案。本次按「恢复业务规则」处理，需要再关时仍改代码。

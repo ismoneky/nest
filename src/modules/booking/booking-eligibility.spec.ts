@@ -62,8 +62,7 @@ describe('beijingDateStr（每日免费的“当天”口径）', () => {
 });
 
 describe('composeOrderPricing 纯函数（优惠顺序与金额公式）', () => {
-    it('年龄免费关闭：两名 70 岁老人均收费，金额 2*unitPrice、isFree=false', () => {
-        // 两名 70 岁老人（AGE_FREE_ENABLED=false，仅自动打标 senior，不免费）
+    it('两名 70 岁老人全部年龄免费：金额 0、isFree=true、freeReason=age', () => {
         const ageSummary = calculateAgePricing(
             [
                 { name: '老人甲', phone: '13800000001', idCard: SENIOR_70_CARD, passengerType: PassengerType.SENIOR },
@@ -71,27 +70,28 @@ describe('composeOrderPricing 纯函数（优惠顺序与金额公式）', () =>
             ],
             BOOKING_DATE,
         );
-        expect(ageSummary.ageFreePeople).toBe(0);
+        expect(ageSummary.ageFreePeople).toBe(2);
         const result = composeOrderPricing(ageSummary, 2, UNIT_PRICE, null);
-        expect(result.amount).toBe(2 * UNIT_PRICE);
-        expect(result.isFree).toBe(false);
-        expect(result.freeReason).toBeNull();
-        expect(result.chargedPeople).toBe(2);
-        expect(result.ageFreePeople).toBe(0);
+        expect(result.amount).toBe(0);
+        expect(result.isFree).toBe(true);
+        expect(result.freeReason).toBe('age');
+        expect(result.chargedPeople).toBe(0);
+        expect(result.ageFreePeople).toBe(2);
+        expect(result.passengerPricing.every((p) => p.pricingReason === 'senior_age_free')).toBe(true);
     });
 
-    it('一名 13 岁儿童 + 一名成人：年龄免费关闭，收费人数 2、金额 2*unitPrice', () => {
+    it('一名 13 岁儿童 + 一名成人（部分年龄免费）：收费人数 1、金额 unitPrice、isFree=false', () => {
         const ageSummary = calculateAgePricing(
             [adult(), { name: '儿童', phone: '13800000002', idCard: CHILD_13_CARD, passengerType: PassengerType.CHILD }],
             BOOKING_DATE,
         );
         const result = composeOrderPricing(ageSummary, 2, UNIT_PRICE, null);
-        expect(result.amount).toBe(2 * UNIT_PRICE);
+        expect(result.amount).toBe(UNIT_PRICE);
         expect(result.isFree).toBe(false);
         expect(result.freeReason).toBeNull();
-        expect(result.chargedPeople).toBe(2);
-        expect(result.ageFreePeople).toBe(0);
-        expect(result.passengerPricing[1].pricingReason).toBe('regular');
+        expect(result.chargedPeople).toBe(1);
+        expect(result.ageFreePeople).toBe(1);
+        expect(result.passengerPricing[1].pricingReason).toBe('child_age_free');
         expect(result.passengerPricing[0].pricingReason).toBe('regular');
     });
 
@@ -105,7 +105,8 @@ describe('composeOrderPricing 纯函数（优惠顺序与金额公式）', () =>
         expect(result.isFree).toBe(true);
         expect(result.freeReason).toBe('member');
         expect(result.chargedPeople).toBe(0);
-        expect(result.ageFreePeople).toBe(0);
+        // 整单免费改的是 finalCharged 与 pricingReason，年龄资格统计照旧保留（儿童仍是 ageFree）
+        expect(result.ageFreePeople).toBe(1);
         expect(result.passengerPricing.every((p) => p.finalCharged === false)).toBe(true);
         expect(result.passengerPricing.every((p) => p.pricingReason === 'member_order_free')).toBe(true);
     });
@@ -221,7 +222,8 @@ describe('determineFreeEligibility / createBooking 集成', () => {
         expect(result.freeReason).toBe('member');
         expect(result.amount).toBe(0);
         expect(result.chargedPeople).toBe(0);
-        expect(result.ageFreePeople).toBe(0);
+        // 13 岁儿童本身也是年龄免费，整单免费只是把最终计费口径统一成 member_order_free
+        expect(result.ageFreePeople).toBe(1);
         expect(result.passengerPricing.every((p) => p.finalCharged === false)).toBe(true);
         expect(result.passengerPricing.every((p) => p.pricingReason === 'member_order_free')).toBe(true);
         expect(result.passengerPricing[1].ageValue).toBe(13);
@@ -235,7 +237,7 @@ describe('determineFreeEligibility / createBooking 集成', () => {
         expect(result.passengerPricing[0].pricingReason).toBe('daily_quota_order_free');
     });
 
-    it('前两项未命中，一名 13 岁儿童 + 一名成人：年龄免费关闭，收费人数 2、金额 2*unitPrice', async () => {
+    it('前两项未命中，一名 13 岁儿童 + 一名成人：部分年龄免费，收费人数 1、金额 unitPrice', async () => {
         const result = await service.determineFreeEligibility(
             'user-3',
             [adult(), { name: '儿童', phone: '13800000002', idCard: CHILD_13_CARD, passengerType: PassengerType.CHILD }],
@@ -244,12 +246,12 @@ describe('determineFreeEligibility / createBooking 集成', () => {
         );
         expect(result.isFree).toBe(false);
         expect(result.freeReason).toBeNull();
-        expect(result.amount).toBe(2 * UNIT_PRICE);
-        expect(result.chargedPeople).toBe(2);
-        expect(result.ageFreePeople).toBe(0);
+        expect(result.amount).toBe(UNIT_PRICE);
+        expect(result.chargedPeople).toBe(1);
+        expect(result.ageFreePeople).toBe(1);
     });
 
-    it('未显式选择类型的 13 岁联系人自动打标 child，但年龄免费关闭不免费', async () => {
+    it('未显式选择类型的 13 岁联系人自动打标 child 并年龄免费：单人成单直接全免', async () => {
         const result = await service.determineFreeEligibility(
             'user-auto-child-contact',
             [adult({ idCard: CHILD_13_CARD, passengerType: PassengerType.ADULT })],
@@ -257,16 +259,16 @@ describe('determineFreeEligibility / createBooking 集成', () => {
             TravelMode.SCENIC_BUS,
         );
 
-        expect(result.isFree).toBe(false);
-        expect(result.freeReason).toBeNull();
-        expect(result.amount).toBe(UNIT_PRICE);
-        expect(result.ageFreePeople).toBe(0);
+        expect(result.isFree).toBe(true);
+        expect(result.freeReason).toBe('age');
+        expect(result.amount).toBe(0);
+        expect(result.ageFreePeople).toBe(1);
         expect(result.passengerPricing[0]).toMatchObject({
             passengerType: PassengerType.CHILD,
             ageValue: 13,
-            ageFree: false,
-            finalCharged: true,
-            pricingReason: 'regular',
+            ageFree: true,
+            finalCharged: false,
+            pricingReason: 'child_age_free',
         });
     });
 
@@ -378,7 +380,7 @@ describe('determineFreeEligibility / createBooking 集成', () => {
         ).rejects.toMatchObject({ code: PassengerErrorCode.COUNT_MISMATCH });
     });
 
-    it('含 13 岁儿童的订单（年龄免费关闭）保持 PENDING/UNPAID，金额为 2 * unitPrice', async () => {
+    it('含 13 岁儿童的部分年龄免费订单：保持 PENDING/UNPAID，金额为 1 * unitPrice', async () => {
         const booking = await service.createBooking({
             passengers: [
                 adult(),
@@ -394,7 +396,7 @@ describe('determineFreeEligibility / createBooking 集成', () => {
         expect(booking.paymentStatus).toBe('unpaid');
         expect(booking.isFree).toBe(false);
         expect(booking.freeReason).toBeNull();
-        expect(booking.amount).toBe(2 * UNIT_PRICE);
+        expect(booking.amount).toBe(UNIT_PRICE);
         expect(booking.personCount).toBe(2);
 
         const stored = JSON.parse(booking.passengers);
@@ -410,13 +412,42 @@ describe('determineFreeEligibility / createBooking 集成', () => {
             passengerType: 'child',
             idCardUnavailable: false,
             ageValue: 13,
-            ageFree: false,
-            finalCharged: true,
-            pricingReason: 'regular',
+            ageFree: true,
+            finalCharged: false,
+            pricingReason: 'child_age_free',
         });
     });
 
-    it('普通同行人的 70 岁身份证自动打标 senior，年龄免费关闭仍收费', async () => {
+    it('全员年龄免费：create 直接 confirmed/paid、金额 0、freeReason=age', async () => {
+        // 联系人是 13 岁儿童也合法（第一人只要求有身份证，不限类型），
+        // 这条路径走 createBooking 里的 isFree 分支：跳过微信支付直接生效
+        const booking = await service.createBooking({
+            passengers: [
+                { name: '儿童', phone: '13800000001', idCard: CHILD_13_CARD, passengerType: PassengerType.CHILD },
+            ] as any,
+            bookingDate: BOOKING_DATE,
+            travelMode: 'scenicBus',
+            personCount: 1,
+            wechatOpenId: 'user-age-free-all',
+        } as any);
+
+        expect(booking.status).toBe('confirmed');
+        expect(booking.paymentStatus).toBe('paid');
+        expect(booking.isFree).toBe(true);
+        expect(booking.freeReason).toBe('age');
+        expect(booking.amount).toBe(0);
+
+        const stored = JSON.parse(booking.passengers);
+        expect(stored[0]).toMatchObject({
+            passengerType: 'child',
+            ageValue: 13,
+            ageFree: true,
+            finalCharged: false,
+            pricingReason: 'child_age_free',
+        });
+    });
+
+    it('普通同行人的 70 岁身份证自动打标 senior 并年龄免费：金额为 1 * unitPrice', async () => {
         const booking = await service.createBooking({
             passengers: [
                 adult(),
@@ -428,14 +459,14 @@ describe('determineFreeEligibility / createBooking 集成', () => {
             wechatOpenId: 'user-auto-senior-companion',
         } as any);
 
-        expect(booking.amount).toBe(2 * UNIT_PRICE);
+        expect(booking.amount).toBe(UNIT_PRICE);
         const stored = JSON.parse(booking.passengers);
         expect(stored[1]).toMatchObject({
             passengerType: 'senior',
             ageValue: 70,
-            ageFree: false,
-            finalCharged: true,
-            pricingReason: 'regular',
+            ageFree: true,
+            finalCharged: false,
+            pricingReason: 'senior_age_free',
         });
     });
 

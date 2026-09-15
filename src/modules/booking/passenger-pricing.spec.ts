@@ -303,7 +303,7 @@ describe('getPassengerLimit / validatePassengerLimit', () => {
 });
 
 describe('calculateAgePricing', () => {
-    it('普通联系人/同行人按身份证年龄解析有效类型，14 岁保持普通收费', () => {
+    it('普通联系人/同行人按身份证年龄解析有效类型：13 岁与 70 岁年龄免费，14 岁保持普通收费', () => {
         const childContact = adult({ idCard: makeIdCard('20130101'), passengerType: PassengerType.ADULT });
         const seniorCompanion = adult({ name: '老人', phone: '13800000002', idCard: makeIdCard('19560101'), passengerType: PassengerType.ADULT });
         const regularCompanion = adult({ name: '普通', phone: '13800000003', idCard: makeIdCard('20120101'), passengerType: PassengerType.ADULT });
@@ -313,22 +313,22 @@ describe('calculateAgePricing', () => {
         expect(resolveEffectivePassengerType(regularCompanion, BOOKING_2026)).toBe(PassengerType.ADULT);
 
         const summary = calculateAgePricing([childContact, seniorCompanion, regularCompanion], BOOKING_2026);
-        expect(AGE_FREE_ENABLED).toBe(false);
-        expect(summary.ageFreePeople).toBe(0);
-        expect(summary.chargedPeople).toBe(3);
+        expect(AGE_FREE_ENABLED).toBe(true);
+        expect(summary.ageFreePeople).toBe(2);
+        expect(summary.chargedPeople).toBe(1);
         expect(summary.passengerPricing[0]).toMatchObject({
             passengerType: PassengerType.CHILD,
             ageValue: 13,
-            ageFree: false,
-            finalCharged: true,
-            pricingReason: 'regular',
+            ageFree: true,
+            finalCharged: false,
+            pricingReason: 'child_age_free',
         });
         expect(summary.passengerPricing[1]).toMatchObject({
             passengerType: PassengerType.SENIOR,
             ageValue: 70,
-            ageFree: false,
-            finalCharged: true,
-            pricingReason: 'regular',
+            ageFree: true,
+            finalCharged: false,
+            pricingReason: 'senior_age_free',
         });
         expect(summary.passengerPricing[2]).toMatchObject({
             passengerType: PassengerType.ADULT,
@@ -338,24 +338,46 @@ describe('calculateAgePricing', () => {
         });
     });
 
-    it('2013 年出生儿童：年龄 13，年龄免费关闭时正常收费', () => {
-        const passengers = [adult(), { name: '儿童', phone: '13800000002', idCard: makeIdCard('20130101'), passengerType: PassengerType.CHILD }];
-        const summary = calculateAgePricing(passengers, BOOKING_2026);
-        expect(summary.ageFreePeople).toBe(0);
+    it('年龄边界：13 岁免费 / 14 岁不免费，70 岁免费 / 69 岁不免费', () => {
+        // 都不显式选类型：由身份证年龄自动归类，14 岁与 69 岁正确落回 adult 而不免费
+        const summary = calculateAgePricing(
+            [
+                { name: '十三岁', phone: '13800000001', idCard: makeIdCard('20130101') },
+                { name: '十四岁', phone: '13800000002', idCard: makeIdCard('20120101') },
+                { name: '七十岁', phone: '13800000003', idCard: makeIdCard('19560101') },
+                { name: '六十九岁', phone: '13800000004', idCard: makeIdCard('19570101') },
+            ],
+            BOOKING_2026,
+        );
+        expect(summary.passengerPricing.map((p) => p.passengerType)).toEqual([
+            PassengerType.CHILD,
+            PassengerType.ADULT,
+            PassengerType.SENIOR,
+            PassengerType.ADULT,
+        ]);
+        expect(summary.passengerPricing.map((p) => p.ageFree)).toEqual([true, false, true, false]);
+        expect(summary.ageFreePeople).toBe(2);
         expect(summary.chargedPeople).toBe(2);
-        const child = summary.passengerPricing[1];
-        expect(child.ageValue).toBe(13);
-        expect(child.ageFree).toBe(false);
-        expect(child.finalCharged).toBe(true);
-        expect(child.pricingReason).toBe('regular');
     });
 
-    it('1956 年出生老人：年龄 70，年龄免费关闭时正常收费', () => {
+    it('2013 年出生儿童：年龄 13，命中儿童年龄免费', () => {
+        const passengers = [adult(), { name: '儿童', phone: '13800000002', idCard: makeIdCard('20130101'), passengerType: PassengerType.CHILD }];
+        const summary = calculateAgePricing(passengers, BOOKING_2026);
+        expect(summary.ageFreePeople).toBe(1);
+        expect(summary.chargedPeople).toBe(1);
+        const child = summary.passengerPricing[1];
+        expect(child.ageValue).toBe(13);
+        expect(child.ageFree).toBe(true);
+        expect(child.finalCharged).toBe(false);
+        expect(child.pricingReason).toBe('child_age_free');
+    });
+
+    it('1956 年出生老人：年龄 70，命中老人年龄免费', () => {
         const passengers = [adult(), { name: '老人', phone: '13800000002', idCard: makeIdCard('19560101'), passengerType: PassengerType.SENIOR }];
         const summary = calculateAgePricing(passengers, BOOKING_2026);
-        expect(summary.ageFreePeople).toBe(0);
-        expect(summary.chargedPeople).toBe(2);
-        expect(summary.passengerPricing[1]).toMatchObject({ ageFree: false, finalCharged: true, pricingReason: 'regular' });
+        expect(summary.ageFreePeople).toBe(1);
+        expect(summary.chargedPeople).toBe(1);
+        expect(summary.passengerPricing[1]).toMatchObject({ ageFree: true, finalCharged: false, pricingReason: 'senior_age_free' });
     });
 
     it('无身份证人员结果固定为 id_card_unavailable，与 regular 区分', () => {
