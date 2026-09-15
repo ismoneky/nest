@@ -133,6 +133,16 @@ sqlite3 data/prod.db "EXPLAIN QUERY PLAN SELECT id FROM bookings WHERE status='e
 
 预期第一条走 `idx_bookings_status_date`，第二条走 `status` 单列索引或不走索引（因命中行数极少，全表扫反而更快）。**T2 的「近 7 天已过期」查询上线前另测一次**（`status='expired' AND expiredAt >= ?`），它是唯一可能真正需要 `(status, expiredAt)` 的查询。
 
+> **2026-09-15 订正**：第二条样本里的 `LIMIT 200`（`MESSAGE_SCAN_BATCH_LIMIT`）已随站内信
+> 分批限制一并删除，实测请用下面这条（同时含新增的软删除过滤）：
+>
+> ```bash
+> sqlite3 data/prod.db "EXPLAIN QUERY PLAN SELECT id FROM bookings WHERE status='expired' AND expireNotifiedAt IS NULL AND createdAt <= (strftime('%s','now')*1000 - 7200000) AND deletedByUserAt IS NULL ORDER BY expiredAt ASC;"
+> ```
+>
+> 计划不应变化：`LIMIT` 与 `deletedByUserAt IS NULL` 都不参与索引选择。
+> 删除理由、代价与「将来如何恢复保护」见 `BookingRepository.findExpiredNotNotified` 的注释。
+
 ### 7c. 回滚（阶段 2A）
 
 ```bash
@@ -288,7 +298,39 @@ sqlite3 data/prod.db "DROP TABLE IF EXISTS messages;"
 ### 9c. 服务号相关表（**本阶段不建**）
 
 方案 §4.6 的 `user_wx_oa` 表属于独立分支 `feat/oa-template-message`，
-**不在本期手工 SQL 范围内**。该分支落地时在此处追加第 10 节。
+**不在本期手工 SQL 范围内**。该分支落地时在文档末尾继续追加（第 10 节已被占用）。
+
+### 10. bookings 新增用户删除标记字段（1 个列）— C 端订单软删除
+
+```bash
+sqlite3 data/prod.db "ALTER TABLE bookings ADD COLUMN deletedByUserAt integer;"
+```
+
+| 列 | 类型 | 含义 |
+|---|------|------|
+| `deletedByUserAt` | integer（毫秒 epoch） | 用户在小程序端删掉该订单的时刻。**只影响用户侧可见性**：用户列表、角标计数、订单详情、退款申请入口、三个扫描类通知的取单查询都会过滤它；后台列表/导出/看板、资金链路（支付、退款、对账）、核销、名额与统计**一律不过滤** |
+
+全部可空、无默认值 → `ALTER TABLE ADD COLUMN` 只改表头元数据，不重建表、不触碰任何已有行。存量订单该列为 NULL，语义即「未被用户删除」。
+
+**不建索引**：用户侧列表走既有的 `wechatOpenId`（+`status`）索引，`IS NULL` 只是过滤条件、不是索引列；本库是 SQLite 单写者，无 `EXPLAIN` 证据不加索引（与 7b 同一口径）。
+
+**⚠️ 上线顺序（硬约束）**：生产 `synchronize=false`，**必须先执行本 SQL、再发代码**。反过来的话，用户端每一次订单一览 / 详情 / 角标计数都会 500（`no such column: deletedByUserAt`）。这与第 17 条「删 `updatePastBookings` 与上 T1 必须同一次发布」是同一类约束。
+
+删除**不会**让任何已有数据消失，只是给了用户一个「不再看到它」的开关；因此它不需要 backfill、也不参与状态机。
+
+### 10b. 回滚（C 端订单软删除）
+
+```bash
+sqlite3 data/prod.db "ALTER TABLE bookings DROP COLUMN deletedByUserAt;"
+```
+
+> 回滚会让**所有被用户删掉的订单重新出现在用户列表里**（标记列被丢弃）。
+> 订单与资金数据本身完好，没有任何不可逆的损失。
+> 若需要保留「谁删过」这一事实，回滚前先导出：
+>
+> ```bash
+> sqlite3 data/prod.db "SELECT bookingId, wechatOpenId, deletedByUserAt FROM bookings WHERE deletedByUserAt IS NOT NULL;"
+> ```
 
 ## 支付可靠性（payment-reliability-design.md）
 
@@ -349,6 +391,7 @@ sqlite3 data/prod.db "DROP TABLE IF EXISTS messages;"
 - [x] 支付回调 / 退款回调处理结果（wechat-pay.controller.ts）
 - [x] 退款申请成功 / 失败（booking.service.ts）
 - [x] 预约核验成功或失败（booking.service.ts）
+- [x] 用户删除订单（booking.service.ts，软删除；后台排查「用户说订单不见了」的唯一依据）
 - [x] 定时任务完成摘要 / 分支失败（5 个任务，每轮一条）
 - [x] 全局异常过滤器捕获的未处理异常（5xx，category=runtime，改为 APP_FILTER 注入 LoggingService）
 
@@ -524,6 +567,11 @@ serialWrite(...)        存活=true
     - **上线硬约束**：删 `updatePastBookings` 与上 T1 必须同一次发布。T1 先上而旧 cron 还在 → 旧 cron 抢先把订单刷成 `completed`，T1 的 `WHERE status='confirmed'` 永远匹配不到，`expired` 形同虚设。
     - **阶段拆分**：2A 只实现 T1 的**步骤①（状态流转）**。步骤②（发「已过期」通知）与 T2 双扫描依赖 `messages` 表与 MessageService，**已于阶段 4 接线完成**（说明 28）。两者解耦，通知靠 `expireNotifiedAt IS NULL` 标记位补发，**先上状态流转不会造成永久漏发**。
     - ⚠️ **补发突发**（本节原写作「2B 上线时的风险」，现已按此实施）：步骤②的扫描条件是「`status='expired' AND expireNotifiedAt IS NULL`」，而 2A 到 4 之间累积的所有过期订单一旦接线会**一次性补发**。实际做法：`ORDER BY expiredAt ASC LIMIT 200`（`MESSAGE_SCAN_BATCH_LIMIT`）每轮消化一批 + 每个用户每日 5 条上限（`MESSAGE_DAILY_LIMIT`）双重收敛，按小时级别的 T1 扫描逐轮排空积压。**若某景区积压量远超 200 × 每小时，需要临时调大 `MESSAGE_SCAN_BATCH_LIMIT` 或接受数天的排空期**——不要改成「无 LIMIT」，那会在同一分钟把全部积压发出去并写满 SQLite 的单写者预算。
+    - 🔴 **2026-09-15 订正：上面这整套分批与配额都已删除，原文「不要改成「无 LIMIT」」不再成立。**
+      - **删了什么**：`MESSAGE_SCAN_BATCH_LIMIT`（单轮 200）与 `MESSAGE_DAILY_LIMIT`（每用户每日 5 条）**双双移除**。三个扫描查询（`findExpiredNotNotified` / `findTodayUnverified` / `findExpiredForRefundReminder`）不再收 `limit` 形参；`MessageService.send` 不再查配额，`MessageRepository.countTodaySystemMessages` 与 `common/date-utils.ts` 的 `beijingDayStartMs` 随之删除（后者唯一调用方就是那条配额统计）。
+      - **为什么可以改**：原文依据是「2A→4 累积的历史积压会被一次性倾泻」，而那批积压早已被 hourly 扫描排空。稳态下待通知池 = **当天过期未核销的几十单**（`markExpired` 在北京零点后那一轮一次性写入），200 这条上限从未成为有效约束；它带来的却是一个真实代价——任何积压都只能**逐小时**排空，而「已过期可退款」的正文里写着**退款申请截止日**，迟到比打扰严重。配额同理：它唯一的作用是把通知推迟到次日。
+      - **代价（有意接受）**：若某天真的出现巨量积压，一轮扫描会把它们全部 INSERT 出去，占用 SQLite 单写者数秒到数十秒（每条一次自动提交，不存在长事务持锁；支付回调与对账只是排队变慢，不会失败）。届时手动触发接口的 `notifiedCount` 会是个刺眼的四位数，**这是可观测的**。
+      - **要恢复保护怎么做**：给那三个仓库方法加回 `limit` 形参（不要写死常量）、调用点显式传值、常量放回 `message-policy.ts`。入口写在 `BookingRepository.findExpiredNotNotified` 的注释里；更彻底的替代是键集分页，不要在方法里藏魔法数。
 18. **核销改条件更新 + 留痕**（同阶段）：`verifyBooking` 原来调 `updateBooking(bookingId, {status: COMPLETED})`——`Object.assign` + `save` 的**无条件写**，与 T1 并发时后写者赢，会把已过期订单写回 `completed`（等价于一次绕过审核的补核销，Q2 不允许）。改为 `markVerified(bookingId, openid, now)` 条件更新（`WHERE status='confirmed'`），`affected=0` 时重读最新状态并报明确错误。`verifiedBy` 记的是**核销员** openid（`openid` 入参已由 `findApprovedByOpenid` 校验权限）。`verifyBooking` 的返回值由「save 后的实体」改为「重读的实体」，字段更全（含 `verifiedAt`/`verifiedBy`），响应结构不变。
 19. `markExpired` 的判定谓词与 `updatePastBookings` 一致（同为 `bookingDate < 今天` 的 `<` 比较、同为「昨天及更早」），只改 SET 内容与补排除条件。
     - ⚠️ **本节原有一处错误判断，已于 2026-09-13 订正**：原文写「同为 Date 参数…这是刻意的，不应顺手改动边界语义」，并称「边界用例证明 TypeORM 对 date 列按**本地分量**而非 `toISOString()` 格式化」。**这两句都是错的**——Date 参数并不是安全的边界载体，它使谓词的正确性依赖进程时区（UTC 服务器下会把当天订单也置为 expired）。详见说明 23。现已改为传日期字符串，边界语义（{bookingDate ≤ 昨天}）在 UTC+8 下与改动前完全等价。
@@ -590,7 +638,9 @@ serialWrite(...)        存活=true
     - **`send()` 的三步顺序是有意的**：① 先按键查重（命中直接返回）→ ② 再查当日配额 → ③ 最后插入。第 ① 步必须在 ② 之前：配额统计的是「今天已有几条」，若先插再统计，任务重跑会把同一条消息重复计数、把配额提前吃满。第 ③ 步的唯一索引兜住 ① 到 ③ 之间的并发窗口。
     - **`markRead` / `markAllRead` 的归属校验写在 SQL 的 `WHERE userId = :userId` 里**，不是先查后判——先查后判有「查完到更新之间」的窗口且多一次查询；条件更新天然把别人的消息过滤成 `affected=0`：传别人的 id 不报错、也不越权，只是不计入 affected。
       - **「全部已读」必须是显式动作**（`{ all: true }`）：若定义成「`ids` 为空 = 全部已读」，一个空 body、一次拼错的请求、一个被序列化成 `null` 的数组都会**静默清空用户全部未读**，而用户察觉不到（角标先没了，消息还躺在列表里）。两个参数都没给 → 控制器 400。
-    - **每日上限按北京日切分**，且上限 5 只统计**系统消息**：`ADMIN_NOTICE` 不计入，因为那是人对人的沟通，被系统配额挡住会出现「管理员想解释却发不出去」。超限**不是错误**：返回 `{ sent: false, reason: 'DAILY_LIMIT' }` 且不落库，调用方据此不写「已通知」标记位、留给下一轮补发。`MESSAGE_DAILY_LIMIT=0` 表示不限。
+    - ~~**每日上限按北京日切分**，且上限 5 只统计**系统消息**：`ADMIN_NOTICE` 不计入，因为那是人对人的沟通，被系统配额挡住会出现「管理员想解释却发不出去」。超限**不是错误**：返回 `{ sent: false, reason: 'DAILY_LIMIT' }` 且不落库，调用方据此不写「已通知」标记位、留给下一轮补发。`MESSAGE_DAILY_LIMIT=0` 表示不限。~~
+      - 🔴 **2026-09-15：整套每日配额已删除**，本段描述不再适用。`SendResult.reason` 字段与 `countTodaySystemMessages` 一并移除；`SendResult.sent` 保留但恒为 true（调用方仍拿它当「可以写已通知标记位」的判据）。理由与代价见本章第 17 条的订正说明与 `MessageService.send` 的注释。
+      - 连带变化：`ADMIN_NOTICE` 与系统消息的**唯一**区别现在只剩「不去重」（`dedupeKey` 为 NULL，可无限多条）。
     - **OA 分支只留了一个空方法** `trySendOa()`，由 `OA_ENABLED`（默认 false）门控；未启用时 `oaSendStatus` 落 `SKIPPED`。服务号属独立分支 `feat/oa-template-message`，那三列**本期不写入任何业务逻辑但已建好**，届时只改代码、不碰 schema。误开 `OA_ENABLED=true` 时会打一条 warn 而不是静默 return——否则「消息发出去了但用户没收到推送」无从查起。
     - **`MessageModule` 是叶子模块**：只依赖 `TypeOrmModule.forFeature([Message])` 与 `UserModule`（后者仅为 `MessageController` 的 `JwtAuthGuard` 提供 JwtService），**不 import 任何业务模块**。发消息需要的一切业务数据（订单号、申请单号、金额、驳回理由）由调用方读好后传参进来。这不是洁癖：`MessageService` 会被 Booking / Refund / WechatPay / Admin / Feedback 五个模块同时导入，只要它反过来依赖其中任何一个就会立刻成环。**只导出 Service、不导出 Repository**——仓库层的条件更新是归属校验的落点，暴露出去等于给「绕过归属校验直接写 messages 表」开门；治理类操作（T3 置已读/删除）已由 Service 转发。
     - **模板单独成文件**（`message-templates.ts`，纯函数无 IO）：这 8 种消息的文案是产品口径、会被反复调整，拆出来后改文案的 diff 只落在一个文件里，评审时一眼看全，也不会碰到幂等/配额那段代码。
@@ -600,8 +650,8 @@ serialWrite(...)        存活=true
     - **前端已接线**（小程序消息中心 / 角标、管理端发消息页），见说明 29。
 28. **阶段 4「站内信」发送点接线**（T1 ② / T2 / T3、四个退款发送点、`POST /admin/messages/send`）
     - **无 schema 变更**：`messages` 表与 `bookings.expireNotifiedAt` 分别已在第 9、7 节登记，本批次只写代码。**不需要执行任何手工 SQL。**
-    - **T1 步骤②（`BookingService.runExpireScan` 内，cron 槽位 `0 13 * * * *` 不变）**：先 `markExpired`（状态流转），再 `findExpiredNotNotified(200, now)` 逐条发。两步各自可重入——**这是 v1 漏发缺陷的修复点**：v1 用「`expiredAt` 落在本轮扫描窗口内」挑待通知订单，某轮中途失败/进程重启时那批订单的 `expiredAt` 已写入而通知未发，下一轮它们早于窗口下限，**永远不再被取到**。`dedupeKey` 只防重复、不防漏发，标记位才能防漏发。
-    - **A 规则（`now - createdAt >= 2h`）的作用域**：只在 `findExpiredNotNotified` 与 `findTodayUnverified` 两条查询里（常量 `MESSAGE_QUIET_WINDOW_MS`，`src/modules/message/message-policy.ts`）。**两个不满足 A 规则的陷阱都已锁死**：① 不满足时**不写** `expireNotifiedAt`（写了 = 这条通知永远发不出去，而库里显示「已通知」——这是标记位方案唯一可能失效的方式）；② 被每日配额挡下时同样**不写**。退款受理/通过/驳回/到账四条**不套** A 规则，否则会出现「申请了退款却收不到审核结果」。
+    - **T1 步骤②（`BookingService.runExpireScan` 内，cron 槽位 `0 13 * * * *` 不变）**：先 `markExpired`（状态流转），再 `findExpiredNotNotified(now, quietWindowMs)` 逐条发（**2026-09-15 去掉了 200 条上限**，见第 17 条订正）。两步各自可重入——**这是 v1 漏发缺陷的修复点**：v1 用「`expiredAt` 落在本轮扫描窗口内」挑待通知订单，某轮中途失败/进程重启时那批订单的 `expiredAt` 已写入而通知未发，下一轮它们早于窗口下限，**永远不再被取到**。`dedupeKey` 只防重复、不防漏发，标记位才能防漏发。
+    - **A 规则（`now - createdAt >= 2h`）的作用域**：只在 `findExpiredNotNotified` 与 `findTodayUnverified` 两条查询里（常量 `MESSAGE_QUIET_WINDOW_MS`，`src/modules/message/message-policy.ts`）。**两个不满足 A 规则的陷阱都已锁死**：① 不满足时**不写** `expireNotifiedAt`（写了 = 这条通知永远发不出去，而库里显示「已通知」——这是标记位方案唯一可能失效的方式）；② ~~被每日配额挡下时同样**不写**~~（配额已于 2026-09-15 删除，现在只剩「单条发送抛异常」这一种不写的情形，见第 17 条订正）。退款受理/通过/驳回/到账四条**不套** A 规则，否则会出现「申请了退款却收不到审核结果」。
     - **T2 每日 22:00**（`BookingService.runDailyReminderScan`，新 cron 槽位 `0 0 22 * * *`，`taskRunning.dailyReminder`）：① 当天未核销 → `ORDER_EXPIRE_REMINDER`，**不写标记位**（次日 `bookingDate = 今天` 已不成立，该订单自然不再被扫到，不会永久漏发）；② 近 N 天已过期未通知 → `ORDER_EXPIRED` + 写标记位。② 的 N **与退款申请时限同源**（`getRefundApplyDeadlineDays()`），保证提醒只落在「还能退」的区间内。22:00 而非更晚：当天核销提醒必须在**当天还能核销**时送达。
     - **两条路径共用 dedupeKey `ORDER_EXPIRED:{bookingId}`**（T1 ② 与 T2 ②），谁先到谁生效、另一条被去重拦下也照样写标记位。**若两处 key 不一致，同一个用户会收到两条「订单已过期」**——这是本批次最容易在后续改动中被破坏的不变式，`booking-notify.spec.ts` 有专门一条守着。
     - **T2 ② 的 `refundStatus = 'none'` 条件**：已提交申请（`refunding`）的不再推「可申请退款」（文案与事实矛盾），且**不写标记位**——将来退款失败回到 `none` 时仍应能提醒。`refunding/refunded` 的订单不满足扫描条件，也就不会形成「取到却不标记」的队头堵塞。
@@ -704,3 +754,29 @@ serialWrite(...)        存活=true
     - **入口短路**：`buildRefundEntry` 在 `status !== 'expired'` 时**直接返回，不查申请单表**。原先无条件执行 3 个查询（`countConsumedApplies`/`hasOpenApply`/`hasRejectedApply`/`findLatestByBookingId`），而它们的结论在非 expired 时必然用不到（`resolveEntryReason` 第一行就返回 `NOT_EXPIRED`）。订单详情是热点接口——小程序在 `pending`/`confirmed` 下**每 5 秒轮询一次详情**，不短路等于每个打开着的详情页每分钟多 36 次查询，而本库是单连接 SQLite。测试用 `jest.spyOn` 断言「这三个方法一次都没被调用」，避免将来有人把短路优化掉。
     - **`expiredAt` 为空时时限 fail-closed**：原实现 `if (applyDeadline != null && ...)` 在 `expiredAt` 为空时**跳过时限校验**，于是入口变成永久可申请——把「数据缺失」翻译成了「没有时限」，与 §4.3.5「7 天是硬性上限」冲突（`refund-deadline.ts` 的注释还写着「由调用方落到『未过期』分支」，与代码不符，已一并订正）。现在：入口给 `DEADLINE_UNAVAILABLE`、提交给 `REFUND_DEADLINE_UNAVAILABLE`，两处都拒绝。触发条件只有手工 SQL（`markExpired` 必写 `expiredAt`），属防御性分支。
     - **本批次验证**：`npx tsc --noEmit` 通过；`npx jest` **17 套 / 269 条全绿**；`npm run smoke:expire` **21/21**；`fctl` 的 `node --test tests/` **69/69**；`admin` 的 `tsc -b` + `vite build` 通过。
+
+35. **C 端订单软删除（2026-09-15）**：用户可删掉自己的订单记录，「只有用户自己看不到」——数据不真删，后台照旧可见，管理员不能删。
+    - **接口**：`DELETE /bookings/:bookingId`（`JwtAuthGuard` + 归属校验，无 body）。首次与重复删除**都是 200**，用 `data.alreadyDeleted` 区分。选 DELETE 而不是 `POST /:id/delete`：本控制器的 `POST /:id/xxx` 全是**状态机动作**（cancel/pay/verify/refund/refund-apply），而删除不改任何状态。失败**不 catch**，交给全局过滤器（越权 400 / 订单号不存在 404 / 无 token 401）——删除没有任何稳定错误码要保，包一层只会把 404 压成 400。
+    - **schema**：`bookings.deletedByUserAt`（可空 integer，**毫秒** epoch，由 `timestampTransformer` 与 Date 互转），见第 10 节 DDL。**必须先执行 SQL、再发代码**。
+    - **为什么不用 `@DeleteDateColumn`**：TypeORM 会给所有 `find/count` 自动加 `deletedAt IS NULL`，而 `BookingRepository.getBookingById` 被核销、退款、支付回调、对账、管理端快照共 17 处共用（外加 `wechat-pay.service.ts` 绕开仓库的独立读入口）。自动过滤会**静默掐断资金链路**，且没有任何编译期提示。过滤点因此显式写在用户侧那三处。
+    - **过滤点（用户侧，全部在 `deletedByUserAt IS NULL` 上）**：`getBookings`（列表）、`countBookingsByStatus`（角标计数）、`booking.service.ts` 的 `getBookingById`（详情 + 退款申请入口，判断写在**归属校验之后**，反了会把「这单存在、只是被删了」泄露给非本人）、三个扫描查询（`findExpiredNotNotified` / `findTodayUnverified` / `findExpiredForRefundReminder`——已删订单不再收任何过期/退款提醒）。
+    - **绝不过滤（改错一处就是事故）**：仓库 `getBookingById`、管理端四条链路（列表/导出/看板/`getBookingByIdForAdmin`）、**名额与统计**（`getBookingStatsByDate`、`buildDailyFreeQuotaInfo`、下单时的容量判定）、资金与核销（`initiatePayment`/`initiateRefund`/`verifyBooking`/`getPaymentStatus`）。给名额统计加过滤会造出「删单即可重领当天免费名额」的薅羊毛洞，与既有「取消/退款不退还名额」直接冲突——`booking-delete.spec.ts` 有一条用例专门守着它。
+    - **删除不参与状态机**：`markDeletedByUser(bookingId, openid, now)` 只写 `deletedByUserAt`，不改 status/paymentStatus/refundStatus、不清 reconcile 调度、不做状态前置条件（**任意状态可删**，含 PAYING——钱照常落到一张用户看不见的单上，由对账收敛）。条件里的 `deletedByUserAt IS NULL` 让重复删除只有第一次 `affected=1`，也让重复点击**不会把删除时刻越刷越新**。
+    - **归属校验在 SQL 里**（`WHERE wechatOpenId = :openid`），与 `MessageRepository.markRead` 同款；服务层另外先做一次未过滤的读做归属判定，那是为了让「重复删除」幂等返回成功（用过滤过的读会把第二次删除变成 404）。
+    - **「管理员不能删除」当前天然成立**：admin 控制器没有任何 `@Delete` 订单路由，本次也不新增。治理类后台操作（导出等）读的是不过滤的链路，因此用户删过的单在后台一切照旧——管理端类型是手写 interface，多一个字段不影响渲染，将来想在详情里显示「用户已删除」**后端零改动**。
+    - **小程序**：`fctl/pages/booking/booking.vue` 与 `fctl/pages/booking-detail/booking-detail.vue` 的 `confirmDeletePreview()` 补上真实请求（此前是 `'删除接口暂未接入'` 占位）。列表页删除后 `getList()` 重拉；详情页删除后 `uni.reLaunch` 回列表——详情页每 5 秒轮询一次 `GET /bookings/:id`，留在原页会持续 404。
+    - **验证**：`npx tsc --noEmit` 通过；`npx jest` **25 套 / 349 条全绿**（新增 `booking-delete.spec.ts` 17 条 + `booking-delete-endpoint.spec.ts` 6 条）；`fctl` 的 `node --test tests/` **91/91**。
+
+36. **手动触发接口的过期边界改为「此刻之前」（含当天）**（2026-09-15）
+    - **背景**：cron 的过期判定 `bookingDate < 今天` 意味着「当天全天可核销」，当天的单要等过了北京零点才下沉——这是对的，且不变。但 `POST /admin/tasks/expire-scan` 的定位不同：它是管理员用来**清干净当前状态**的入口，点完之后不该再剩下任何「日子已经过了却还挂在 `confirmed`」的单。管理员实际想要的判据是「此刻之前」，而不是「今天之前」。
+    - **改动**：`markExpired(todayStr, now, options)` 增加 `options.includeToday`——true 用 `bookingDate <= :todayStr`，false（默认）沿用 `<`。`TaskTriggerOptions` / `TriggerTaskDto` 同步加 `includeToday`；`ExpireScanResult` 回传 `includedToday`，接口 message 里写明「（含当天）/（不含当天）」，管理端结果表格新增「过期边界」一行。
+    - **默认值**：service 默认 `false`（**cron 调用点不传，行为一字不变**）；手动接口默认 `true`，用 `dto.includeToday !== false` 实现——只认显式关闭，字段缺失/undefined/null 一律按「含当天」走。理由是接口语义就是「此刻之前」，若默认退回 cron 边界，管理员点一次却清不干净当天的单，而界面文案还写着「含当天」。
+    - **⚠️ 含当天的连带后果（必须在界面上说清）**：
+      1. 当天未核销的订单一律 `expired`，**此后无法核销**（`markVerified` 要求 `status='confirmed'`，会返回「当前状态：expired」）；
+      2. **当天名额被释放**——`getBookingStatsByDate` 只统计 `pending/confirmed`（与下单容量校验同源），刷完之后当天会重新变成「可预约」；
+      3. 这些单的资金出口只剩「申请 → 审核」，与其它过期单一致。
+      **要「把当天封盘」请用预约开关（`isBookingEnabled`），不要用这个接口**——上面第 2 条正是它做不到这件事的原因。
+    - **管理端**：过期扫描卡片加了「包含今天」勾选框（默认勾选，含红色警示文案说明上面三条），二次确认里带上本次边界；不勾选时提示「与定时任务同一判据」。
+    - **没有改通知链路**：当天被刷过期的单会被步骤②按既有规则扫到（受 A 规则静默期约束），文案与截止日照旧。
+    - **验证**：`npx tsc --noEmit` 通过；`npx jest` **25 套 / 357 条全绿**（`booking-expire.spec.ts` 的 `includeToday` 子 describe 4 条 + `admin-tasks-endpoint.spec.ts` 的「过期边界」describe 3 条 + 响应结构 1 条）；`admin` 的 `tsc -b` 通过。
+    - **顺带记录一次实测（回答「日期累积会不会拖慢扫描」）**：10 万行 / 3 年的合成库上，`markExpired` 的实际计划是 `SEARCH bookings USING INDEX idx_bookings_status_date (status=? AND bookingDate<?)`——**索引第一列是 `status`**，所以它定位的是「当前还挂在 confirmed 的行」，而不是按日期扫全部历史；被刷过的行永久离开这个集合，工作集只与近日单量有关、与历史总量无关。首次（469 单待刷）47 ms，排空后再跑 0 ms；即使去掉复合索引只剩单列 `status` 索引，计划仍是 `SEARCH ... USING INDEX IDX_status`（43 ms）。作为对照，**强制**走单列 `IDX_bookingDate`（等价于扫全部 3 年历史）是 265 ms——那才是「累积」会发生的样子。上生产后按 7b 节的规矩用 `EXPLAIN QUERY PLAN` 自检一次，只要不是按 `bookingDate` 单列索引打头就没有累积问题。

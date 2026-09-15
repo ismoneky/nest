@@ -1,4 +1,4 @@
-import { Body, Controller, Get, HttpStatus, Param, Post, Put, Query, Req, Res, UseGuards } from '@nestjs/common';
+import { Body, Controller, Delete, Get, HttpStatus, Param, Post, Put, Query, Req, Res, UseGuards } from '@nestjs/common';
 import { Request, Response } from 'express';
 import { BookingService } from './booking.service';
 import { CreateBookingDto } from './dto/createBooking.dto';
@@ -240,6 +240,41 @@ export class BookingController {
                 ...(errorCode ? { errorCode } : {}),
             });
         }
+    }
+
+    /**
+     * 删除自己的订单（**软删除**：从用户自己的列表里去掉，数据不真删）
+     * DELETE /bookings/:bookingId
+     *
+     * ── 为什么是 DELETE 而不是 `POST /:bookingId/delete` ──────────────────────
+     * 本控制器里的 `POST /:bookingId/xxx` 全部是**状态机动作**（cancel / pay /
+     * verify / refund / refund-apply），而删除不改任何状态，只是「我不再想看它」。
+     * 用 DELETE 表达更准，路由表也能一眼分出「动作」与「资源操作」。
+     * 与 `user_profiles` 那条 `@Delete('profiles/:profileId')` 语义同构
+     * （都是「我自己的东西，从我的列表里去掉」）。
+     *
+     * ── 语义边界 ──────────────────────────────────────────────────────────────
+     * 任意状态都可删（不做状态限制，理由见 `BookingService.deleteBooking`）；
+     * 后台列表/导出/看板、资金链路、名额与统计**一律不受影响**；
+     * 管理员**不能**删除订单——本接口有归属校验，管理端也没有任何删除入口。
+     *
+     * ── 为什么不 catch 异常 ───────────────────────────────────────────────────
+     * 这里没有任何稳定错误码要保（删除不做状态限制、重复删除是成功），
+     * 自己包一层只会把「订单不存在」的 404 压成 400。越权（400）、
+     * 订单号不存在（404）、无 token（401）全部由全局过滤器透传。
+     *
+     * @returns 首次删除与重复删除**都是 200**，用 `alreadyDeleted` 区分
+     */
+    @Delete(':bookingId')
+    @UseGuards(JwtAuthGuard)
+    async deleteBooking(@Param('bookingId') bookingId: string, @Req() req: Request, @Res() res: Response) {
+        const { openid } = req['user'] as { openid: string };
+        const data = await this.bookingService.deleteBooking(bookingId, openid);
+        return res.status(HttpStatus.OK).send({
+            success: true,
+            message: '订单已删除',
+            data,
+        });
     }
 
     /**

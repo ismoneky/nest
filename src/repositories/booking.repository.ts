@@ -1,6 +1,6 @@
 import { Injectable, InternalServerErrorException, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, Not, LessThan, Like } from 'typeorm';
+import { Repository, Not, LessThan, Like, IsNull } from 'typeorm';
 import { Booking, BookingStatus, PaymentStatus, RefundStatus, TravelMode } from '../entities/booking.entity';
 import { BookingAnomaly, AnomalyType, AnomalyStatus } from '../entities/booking-anomaly.entity';
 import { CreateBookingDto } from '../modules/booking/dto/createBooking.dto';
@@ -112,12 +112,18 @@ export class BookingRepository {
     /**
      * 根据条件查询订单列表 (分页)
      * 支持按 wechatOpenId, bookingDate, status 筛选
+     *
+     * **用户侧入口**：恒定排除用户自己删掉的订单（`deletedByUserAt IS NULL`）。
+     * 管理端列表走 `getBookingsForAdmin`，那条不过滤——删除只影响用户视角。
+     *
      * @param query 查询条件 (包含分页参数)
      * @returns 订单实体数组和总数
      */
     async getBookings(query: GetBookingsDto & { wechatOpenId?: string }) {
         try {
-            const where: any = {};
+            // `IsNull()` 不产生绑定参数（SQL 里是 `IS NULL`），且本表的
+            // timestampTransformer 对 null 是直通的，不会在这里炸
+            const where: any = { deletedByUserAt: IsNull() };
 
             // 按微信OpenID筛选
             if (query.wechatOpenId) {
@@ -164,12 +170,17 @@ export class BookingRepository {
 
     /**
      * 统计当前用户各状态下的订单数量
+     *
+     * **用户侧入口**：与 `getBookings` 同一口径，排除用户自己删掉的订单——
+     * 小程序「待使用 / 待支付」角标用的是本方法，只过滤列表不过滤计数，
+     * 就会出现「角标显示 3 条、点进去只有 2 条」。
+     *
      * @param wechatOpenId 用户 openid
      * @param status 可选，指定状态；不传则返回所有状态的数量
      * @returns 订单数量
      */
     async countBookingsByStatus(wechatOpenId: string, status?: BookingStatus): Promise<number> {
-        const where: any = { wechatOpenId };
+        const where: any = { wechatOpenId, deletedByUserAt: IsNull() };
         if (status) {
             where.status = status;
         }
@@ -367,16 +378,33 @@ export class BookingRepository {
      *   `confirmed`（见 `markRefundStarting`），旧实现会把它们错置成 `completed`——
      *   这是现存缺陷（§8 第 4 条），本期一并修掉。
      *
+     * ── 边界：默认「今天之前」，可选「含当天」（2026-09-15）──────────────────
+     * `includeToday=false`（默认）→ `bookingDate < 今天`：当天全天可核销，cron 走这条。
+     * `includeToday=true` → `bookingDate <= 今天`：**连当天的未核销订单一并置为过期**。
+     * 后者只有 `POST /admin/tasks/expire-scan` 会传，语义是「管理员要一个干净的当前状态」。
+     *
+     * ⚠️ 含当天的连带后果（调用方必须知情）：
+     *   ① 当天**已不能核销**——那些订单 status 已不是 confirmed，`markVerified` 会返回 0；
+     *   ② 当天名额**会释放**——`getBookingStatsByDate` 只统计 `pending/confirmed`
+     *      （与下单容量校验同源，见其注释），当天因此重新变成「可预约」；
+     *   ③ 这些订单的资金出口只剩「申请 → 审核」，与其它过期单一致。
+     * 前两条是「清场」这个动作的应有之义，但它们**不是**「把当天封盘」：要封盘得用
+     * 预约开关（`systemConfigService.isBookingEnabled`），不是靠刷过期单。
+     *
      * @param todayStr 今天（Asia/Shanghai）的 `YYYY-MM-DD`，直接用 `beijingDateStr()`
      * @param now 当前时刻（epoch ms），写入 `expiredAt`
+     * @param options.includeToday 是否把当天算进边界，默认 false（cron 行为不变）
      * @returns affected rows
      */
-    async markExpired(todayStr: string, now: number): Promise<number> {
+    async markExpired(todayStr: string, now: number, options: { includeToday?: boolean } = {}): Promise<number> {
+        // 比较符由布尔值决定，日期值始终是绑定参数；两种写法都是纯日期字符串比较，
+        // 时区安全性同上（不要改成构造 Date）
+        const boundary = options.includeToday === true ? 'bookingDate <= :todayStr' : 'bookingDate < :todayStr';
         return serialWrite(this.dataSource, async () => (await this.bookingRepository
             .createQueryBuilder()
             .update(Booking)
             .set({ status: BookingStatus.EXPIRED, expiredAt: new Date(now) })
-            .where('bookingDate < :todayStr', { todayStr })
+            .where(boundary, { todayStr })
             .andWhere('status = :status', { status: BookingStatus.CONFIRMED })
             .andWhere('refundStatus NOT IN (:...refundStatuses)', {
                 refundStatuses: [RefundStatus.REFUNDING, RefundStatus.REFUNDED],
@@ -396,14 +424,27 @@ export class BookingRepository {
      * `createdAt <= now - quietWindowMs` 是 A 规则（见 `message-policy.ts`）。**不满足的订单
      * 不写标记位**，下轮继续被取到，到期后自然补发——不会永久漏发。
      *
-     * 排序 `expiredAt ASC` + LIMIT：积压时按「过期最久」优先补发，
-     * 每轮消化一批而不是一次性倾泻（理由见 `MESSAGE_SCAN_BATCH_LIMIT`）。
+     * `deletedByUserAt IS NULL`：用户主动删掉的订单不再打扰。删除是「我不想再看它」，
+     * 而不是「放弃退款」——但一条指向已隐藏详情的推送对用户只是噪音，
+     * 而它想传达的东西（还能退、截止到哪天）在订单详情页里本来就查不到。
+     *
+     * 排序 `expiredAt ASC`：积压时按「过期最久」优先补发。
+     *
+     * ── 为什么不再有单轮上限（2026-09-15）────────────────────────────────────
+     * 旧实现按 `MESSAGE_SCAN_BATCH_LIMIT`（200）逐轮消化 2A→4 之间累积的历史积压。
+     * 那批积压早已排空；而稳态下「待通知」池 = 「上次扫描以来新过期的订单」=
+     * 每天过期未核销的几十单（`markExpired` 在北京零点后的那一轮一次性写入），
+     * 200 从来不是有效约束，只会让任何积压都只能逐小时排空。
+     * 代价（有意接受）：若某天真出现巨量积压，这一轮会把它们全部 INSERT 出去，
+     * 占用 SQLite 单写者数秒到数十秒（每条一次自动提交，不存在长事务持锁）。
+     * **恢复保护的正确做法**：给本方法加回 `limit` 形参（不要写成写死的常量），
+     * 三个调用点显式传值，常量放回 `message-policy.ts`。不要在方法内部藏魔法数。
      *
      * @param now 当前时刻（epoch ms）
      * @param quietWindowMs 静默期。cron 路径传 `MESSAGE_QUIET_WINDOW_MS`（2h）；
      *                      手动触发可覆盖，0 = 不设静默期（测试用）
      */
-    async findExpiredNotNotified(limit: number, now: number, quietWindowMs: number): Promise<Booking[]> {
+    async findExpiredNotNotified(now: number, quietWindowMs: number): Promise<Booking[]> {
         return await this.bookingRepository
             .createQueryBuilder('booking')
             .where('booking.status = :status', { status: BookingStatus.EXPIRED })
@@ -411,8 +452,8 @@ export class BookingRepository {
             .andWhere('booking.createdAt <= :notifyCutoff', {
                 notifyCutoff: now - quietWindowMs,
             })
+            .andWhere('booking.deletedByUserAt IS NULL')
             .orderBy('booking.expiredAt', 'ASC')
-            .limit(limit)
             .getMany();
     }
 
@@ -428,9 +469,9 @@ export class BookingRepository {
      * 只取 `createdAt <= now - quietWindowMs`（A 规则）：当天很晚下单的用户当晚不推，
      * 次日 22:00 时若订单已过期，由 ② 补推。
      *
-     * @param quietWindowMs 静默期，语义同 `findExpiredNotNotified`
+     * `deletedByUserAt IS NULL`：同 `findExpiredNotNotified`，已删订单不再打扰。
      */
-    async findTodayUnverified(todayStr: string, limit: number, now: number, quietWindowMs: number): Promise<Booking[]> {
+    async findTodayUnverified(todayStr: string, now: number, quietWindowMs: number): Promise<Booking[]> {
         return await this.bookingRepository
             .createQueryBuilder('booking')
             .where('booking.status = :status', { status: BookingStatus.CONFIRMED })
@@ -438,8 +479,8 @@ export class BookingRepository {
             .andWhere('booking.createdAt <= :notifyCutoff', {
                 notifyCutoff: now - quietWindowMs,
             })
+            .andWhere('booking.deletedByUserAt IS NULL')
             .orderBy('booking.createdAt', 'ASC')
-            .limit(limit)
             .getMany();
     }
 
@@ -455,16 +496,18 @@ export class BookingRepository {
      *
      * 窗口天数由调用方给，本方法不读配置：仓库层不持有业务配置，
      * 且「7」这个数字在方案里明确要求与申请时限对齐，抄第二遍必然漂移。
+     *
+     * `deletedByUserAt IS NULL`：用户主动删掉的订单不再打扰（见 `findExpiredNotNotified`）。
      */
-    async findExpiredForRefundReminder(limit: number, now: number, windowMs: number): Promise<Booking[]> {
+    async findExpiredForRefundReminder(now: number, windowMs: number): Promise<Booking[]> {
         return await this.bookingRepository
             .createQueryBuilder('booking')
             .where('booking.status = :status', { status: BookingStatus.EXPIRED })
             .andWhere('booking.expireNotifiedAt IS NULL')
             .andWhere('booking.refundStatus = :refundStatus', { refundStatus: RefundStatus.NONE })
             .andWhere('booking.expiredAt >= :windowStart', { windowStart: now - windowMs })
+            .andWhere('booking.deletedByUserAt IS NULL')
             .orderBy('booking.expiredAt', 'ASC')
-            .limit(limit)
             .getMany();
     }
 
@@ -475,8 +518,8 @@ export class BookingRepository {
      * 取值本身是幂等的（同一个 bookingId 写同一个语义），条件是为了**可观测**——
      * 若将来有人误在循环外调用它，affected 会立刻暴露问题。
      *
-     * ⚠️ 调用时机是「**已发出或早已存在**」（`sendOrderExpired` 返回 true），
-     * 被每日配额挡住时**不能**写：写了就等于放弃补发。
+     * ⚠️ 调用时机是「**已发出或早已存在**」（`sendOrderExpired` 返回 true）。
+     * 单条发送抛异常时不能写：写了就等于放弃补发。
      */
     async markExpireNotified(bookingId: string, now: number): Promise<number> {
         return serialWrite(this.dataSource, async () => (await this.bookingRepository
@@ -808,6 +851,46 @@ export class BookingRepository {
             .where('bookingId = :bookingId', { bookingId })
             .andWhere('status = :status', { status: BookingStatus.PENDING })
             .andWhere('paymentStatus = :paymentStatus', { paymentStatus: PaymentStatus.UNPAID })
+            .execute()).affected ?? 0);
+    }
+
+    /**
+     * markDeletedByUser：用户删除自己的订单（**软删除**，只让用户自己看不到）
+     *
+     * ── 为什么是软删除而不是 DELETE ──────────────────────────────────────────
+     * 用户删的是「自己那条记录」，不是这笔预约：后台列表/导出/看板、资金链路
+     * （支付、退款、对账）、核销、名额与统计一律照旧。真删会让退款无处可退、
+     * 让当天的名额与营收统计凭空少一单。
+     *
+     * ── 为什么不用 `@DeleteDateColumn` ────────────────────────────────────────
+     * TypeORM 会给所有 find/count 自动加 `deletedAt IS NULL`，而 `getBookingById`
+     * 被核销、退款、支付回调、对账、管理端快照共 17 处共用（外加 wechat-pay.service
+     * 绕开本仓库的独立读入口）。自动过滤会**静默掐断资金链路**，且没有任何编译期提示。
+     * 过滤点因此显式写在用户侧那三处，见实体字段的注释。
+     *
+     * ── 为什么带两个额外条件 ──────────────────────────────────────────────────
+     * `wechatOpenId` 是归属校验，写在 SQL 里而不是先查后判（与 MessageRepository.markRead 同款）；
+     * `deletedByUserAt IS NULL` 让重复删除只有第一次 affected=1（幂等 + 可观测，
+     * 也让重复点击**不会把删除时刻越刷越新**，与 markExpireNotified 同款理由）。
+     *
+     * ── 删除不参与任何状态机 ──────────────────────────────────────────────────
+     * 不改 status/paymentStatus/refundStatus、不清 reconcile 调度、不做状态前置条件：
+     * 它只是一个可见性开关，因此不会与支付回调、关单对账、退款收敛中的任何一方竞争。
+     * 唯一可删状态的限制在**产品层**（任意状态可删），不在这一层。
+     *
+     * @param bookingId 订单ID
+     * @param openid 操作者 openid（归属校验，不匹配则 affected=0）
+     * @param now 删除时刻（epoch ms）
+     * @returns affected rows（0 = 已删过 或 不属于该 openid）
+     */
+    async markDeletedByUser(bookingId: string, openid: string, now: number): Promise<number> {
+        return serialWrite(this.dataSource, async () => (await this.bookingRepository
+            .createQueryBuilder()
+            .update(Booking)
+            .set({ deletedByUserAt: new Date(now) })
+            .where('bookingId = :bookingId', { bookingId })
+            .andWhere('wechatOpenId = :openid', { openid })
+            .andWhere('deletedByUserAt IS NULL')
             .execute()).affected ?? 0);
     }
 

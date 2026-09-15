@@ -1,4 +1,4 @@
-import { Injectable, BadRequestException, ForbiddenException, Logger } from '@nestjs/common';
+import { Injectable, BadRequestException, ForbiddenException, Logger, NotFoundException } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
 import { DataSource, EntityManager } from 'typeorm';
 import { randomUUID } from 'crypto';
@@ -37,7 +37,6 @@ import { MessageService } from '../message/message.service';
 import {
     MESSAGE_QUIET_WINDOW_MAX_MS,
     MESSAGE_QUIET_WINDOW_MS,
-    MESSAGE_SCAN_BATCH_LIMIT,
 } from '../message/message-policy';
 import { resolveApplyDeadlineStr } from '../refund/refund-deadline';
 import { MessageType } from '../../entities/message.entity';
@@ -141,8 +140,8 @@ class ReconcileSemaphore {
 /**
  * 北京时间（UTC+8）日期字符串 YYYY-MM-DD。
  *
- * 实现在 `src/common/date-utils.ts`（站内信的「每日上限」也要按北京日切分，
- * 两处必须同源，否则会在凌晨出现「同一时刻两个今天」）。此处**原样再导出**，
+ * 实现在 `src/common/date-utils.ts`（过期扫描、每日免费名额、当日核销提醒
+ * 都要问「今天是哪天」，多处必须同源，否则会在凌晨出现「同一时刻两个今天」）。此处**原样再导出**，
  * 是为了不动既有的 `import { beijingDateStr } from './booking.service'` 调用点——
  * 那些调用点很多，逐个改只会增加一次无收益的 diff。
  */
@@ -215,6 +214,14 @@ export interface ExpireScanResult {
     /** 本次实际生效的静默期（分钟）。cron 恒为 120；手动触发可覆盖，便于回看出当时用了什么 */
     quietWindowMinutes: number;
     /**
+     * 本次是否把**当天**的订单也算进了过期边界（`bookingDate <= 今天`）。
+     *
+     * cron 恒为 false（当天全天可核销）；`POST /admin/tasks/expire-scan` 默认 true
+     * ——管理员点它要的是「此刻之前全部干净」，含当天。
+     * 回传出来是因为它决定了这一轮到底动了哪些单，看漏会误判成「任务没生效」。
+     */
+    includedToday: boolean;
+    /**
      * 失败原因；null = 正常完成。
      *
      * **不在方法里向外抛**：`@Cron` 抛出去会变成 unhandled rejection，
@@ -260,6 +267,17 @@ export interface TaskTriggerOptions {
      * 这条链路时必须用它，否则要干等 2 小时。生产环境慎用（用户刚下完单就会收到提醒）。
      */
     quietWindowMs?: number;
+    /**
+     * 是否把**当天**的订单也置为过期（`bookingDate <= 今天`）。
+     *
+     * 不传 = false = 严格早于今天，**cron 永远是这一条**（当天全天可核销）。
+     * `POST /admin/tasks/expire-scan` 默认传 true：它是管理员用来「清干净当前状态」
+     * 的接口，判据是「此刻之前」，当天那些还没核销的单自然包含在内。
+     *
+     * ⚠️ 含当天意味着那些订单**当天就再也核销不了**，且当天名额会被释放
+     * （`getBookingStatsByDate` 只统计 `pending/confirmed`）。详见 `markExpired` 的注释。
+     */
+    includeToday?: boolean;
 }
 
 /**
@@ -802,11 +820,66 @@ export class BookingService {
     }
 
     /**
+     * 用户删除自己的订单（**软删除**：数据不真删，只是用户自己看不到）
+     *
+     * 与 `cancelBooking` 同款的三段式（归属校验 → 条件更新 → 用 affected 表达结果），
+     * 但**刻意不做任何状态限制**：删除不参与状态机，任何状态的单删掉都不会产生
+     * 「已取消却收到钱」那一类后果（对比 `markCancelledByUser` 只受理 pending+unpaid）。
+     * 用户删的只是自己那条记录——后台照旧可见，资金链路照旧推进。
+     *
+     * 【为什么用**未过滤**的仓库读做归属校验】
+     * 重复删除必须幂等返回成功，而删过的订单仍然必须能读出来才能确认「它存在，且是你的」。
+     * 「用户侧看不到已删除订单」这条规则由 `getBookingById(bookingId, openid)` 负责，
+     * 与本方法无关。
+     *
+     * 【为什么 affected=0 可以当成「已删过」】
+     * 上面的读已经确认「行存在且属于本人」，条件里也带着 openid，因此更新影响 0 行的
+     * 唯一解释就是 `deletedByUserAt` 已非空（并发双击，或上一次删除已经成功）。
+     * 据此返回 alreadyDeleted 而不是报错——重复点击不该看到一条失败提示。
+     *
+     * @param bookingId 订单ID
+     * @param openid 当前登录用户 openid
+     * @returns bookingId 与本次是否属于重复删除
+     */
+    async deleteBooking(bookingId: string, openid: string): Promise<{ bookingId: string; alreadyDeleted: boolean }> {
+        const booking = await this.bookingRepository.getBookingById(bookingId);
+        // 先校验归属，再谈删除：不向非本人泄露订单是否存在、也不泄露它是否已被删除
+        if (booking.wechatOpenId !== openid) {
+            throw new BadRequestException('无权操作该订单');
+        }
+
+        const affected = await this.bookingRepository.markDeletedByUser(bookingId, openid, Date.now());
+
+        // 记录点：用户删除订单（日志失败不影响业务结果）。
+        // 后台排查「用户说订单不见了」时唯一的依据——数据本身还在，
+        // 但用户侧已经看不到，不记一笔就只能靠猜。
+        this.loggingService.write({
+            source: AppLogSource.BACKEND,
+            level: AppLogLevel.INFO,
+            category: AppLogCategory.BOOKING,
+            message: '用户删除订单',
+            route: `/bookings/${bookingId}`,
+            context: {
+                bookingId,
+                status: booking.status,
+                alreadyDeleted: affected === 0,
+            },
+        });
+
+        return { bookingId, alreadyDeleted: affected === 0 };
+    }
+
+    /**
      * 根据订单ID查询订单（用户侧，含归属校验）
      *
      * openid 为必填：旧签名开了 `openid?: string`，传空即静默跳过归属校验，
      * 任何人拿到订单号就能读到姓名/手机号/身份证。改为必填由类型系统兜住。
      * 管理端读订单走 getBookingByIdForAdmin。
+     *
+     * 「用户自己删掉的订单」在此对他不可见（软删除）：订单还在库里、后台照旧可见，
+     * 但用户拿不到——包括详情页与退款申请入口（`POST /bookings/:id/refund-apply`
+     * 也先调本方法）。判断必须放在**归属校验之后**：反了会把「这单存在、
+     * 只是被删了」泄露给非本人（与 `cancelBooking` 的注释同一约束）。
      *
      * @param bookingId 订单ID
      * @param openid 当前登录用户 openid
@@ -816,6 +889,9 @@ export class BookingService {
         const booking = await this.bookingRepository.getBookingById(bookingId);
         if (booking.wechatOpenId !== openid) {
             throw new BadRequestException('无权访问该订单');
+        }
+        if (booking.deletedByUserAt) {
+            throw new NotFoundException('订单不存在');
         }
         return booking;
     }
@@ -1718,6 +1794,14 @@ export class BookingService {
      * 频率说明（§4.2.2）：过期判定是 `bookingDate < 今天`，一天只在跨零点时变化一次，
      * 每小时跑已是超额覆盖，不改频率。
      *
+     * ── 边界（2026-09-15）────────────────────────────────────────────────────
+     * cron 与手动触发共用本方法，但**边界可以不同**，由 `options.includeToday` 决定：
+     *   · cron 不传 → 「严格早于今天」，当天**全天可核销**；
+     *   · `POST /admin/tasks/expire-scan` 默认传 true → 「此刻之前」，**含当天**。
+     * 手动接口的定位是管理员用来清干净当前状态的入口（点完不该再剩下任何「过期了却
+     * 还挂在 confirmed」的单），所以当天那些还没核销的单一并处理。代价与连带后果
+     * （当天不可再核销、当天名额被释放）见 `markExpired` 的注释——**那不是「封盘」**。
+     *
      * 「今天」固定取**北京时间**，不用服务器本地日期：
      * 原实现用 `new Date()` 的服务器本地年月日，服务器若跑 UTC，过期边界会比北京零点
      * 晚最多 8 小时（当天凌晨的订单要多挂 8 小时才下沉）。
@@ -1735,20 +1819,24 @@ export class BookingService {
      *   ② 只发通知，靠 `expireNotifiedAt IS NULL` 标记位补发。
      * 任一步骤失败都不会造成永久漏发——这是 v1「用扫描窗口挑待通知订单」的替代方案。
      *
-     * @param options 只由手动触发接口传入。cron 不传，静默期永远是 A 规则的 2 小时
+     * @param options 只由手动触发接口传入。cron 不传：静默期永远是 A 规则的 2 小时，
+     *                **边界永远是「严格早于今天」**（当天全天可核销）
      */
     @Cron('0 13 * * * *', { timeZone: 'Asia/Shanghai' })
     async runExpireScan(options: TaskTriggerOptions = {}): Promise<ExpireScanResult> {
         const quietWindowMs = this.resolveQuietWindow(options.quietWindowMs);
         const quietWindowMinutes = Math.round(quietWindowMs / 60000);
+        const includedToday = options.includeToday === true;
         if (this.taskRunning.expire) {
-            return { skipped: true, expiredCount: 0, notifiedCount: 0, quietWindowMinutes, error: null };
+            return { skipped: true, expiredCount: 0, notifiedCount: 0, quietWindowMinutes, includedToday, error: null };
         }
         this.taskRunning.expire = true;
         try {
             const now = Date.now();
-            // 步骤①：状态流转
-            const affected = await this.bookingRepository.markExpired(beijingDateStr(), now);
+            // 步骤①：状态流转（含当天与否由 options 决定，cron 恒为「不含」）
+            const affected = await this.bookingRepository.markExpired(beijingDateStr(), now, {
+                includeToday: includedToday,
+            });
             // 步骤②：发通知（按标记位捞，跑几次都安全）
             const notified = await this.notifyExpiredBookings(now, quietWindowMs);
 
@@ -1757,13 +1845,28 @@ export class BookingService {
                 expiredCount: affected,
                 notifiedCount: notified,
                 quietWindowMinutes,
+                includedToday,
             });
-            return { skipped: false, expiredCount: affected, notifiedCount: notified, quietWindowMinutes, error: null };
+            return {
+                skipped: false,
+                expiredCount: affected,
+                notifiedCount: notified,
+                quietWindowMinutes,
+                includedToday,
+                error: null,
+            };
         } catch (error) {
             this.logger.error('过期扫描任务失败', error);
             const message = (error as Error).message;
             this.logTask('expire', AppLogLevel.ERROR, '失败', { task: 'expire', error: message });
-            return { skipped: false, expiredCount: 0, notifiedCount: 0, quietWindowMinutes, error: message };
+            return {
+                skipped: false,
+                expiredCount: 0,
+                notifiedCount: 0,
+                quietWindowMinutes,
+                includedToday,
+                error: message,
+            };
         } finally {
             this.taskRunning.expire = false;
         }
@@ -1830,21 +1933,19 @@ export class BookingService {
             // ① 当天未核销 → 提醒核销
             const todayPending = await this.bookingRepository.findTodayUnverified(
                 beijingDateStr(),
-                MESSAGE_SCAN_BATCH_LIMIT,
                 now,
                 quietWindowMs,
             );
             let reminded = 0;
             for (const booking of todayPending) {
-                // 只计真正发出去的：被每日配额挡下的也在这批里，
+                // 只计真正发出去的：`notifyQuietly` 内部 catch 掉单条异常并返回 false，
                 // 算进去会让日志和手动触发看到的数字变成「尝试数」而不是「发出数」
-                if (await this.notifyQuietly(MessageType.ORDER_EXPIRE_REMINDER, booking, now)) reminded++;
+                if (await this.notifyQuietly(MessageType.ORDER_EXPIRE_REMINDER, booking)) reminded++;
             }
 
             // ② 近 N 天已过期未通知 → 提醒可退款（兜底 + 唤回）
             const deadlineDays = this.systemConfigService.getRefundApplyDeadlineDays();
             const expiredPending = await this.bookingRepository.findExpiredForRefundReminder(
-                MESSAGE_SCAN_BATCH_LIMIT,
                 now,
                 deadlineDays * 24 * 60 * 60 * 1000,
             );
@@ -1897,11 +1998,7 @@ export class BookingService {
      * @returns 已发出（或早已存在）的条数
      */
     private async notifyExpiredBookings(now: number, quietWindowMs: number): Promise<number> {
-        const pending = await this.bookingRepository.findExpiredNotNotified(
-            MESSAGE_SCAN_BATCH_LIMIT,
-            now,
-            quietWindowMs,
-        );
+        const pending = await this.bookingRepository.findExpiredNotNotified(now, quietWindowMs);
         let notified = 0;
         for (const booking of pending) {
             if (await this.notifyExpiredBooking(booking, now)) notified++;
@@ -1914,9 +2011,7 @@ export class BookingService {
      *
      * **只有 `sent=true` 才写 `expireNotifiedAt`**（含「早已存在」——那说明
      * 上一轮发过而标记位没写上，两条路径共用同一个 dedupeKey，写标记位是正确收尾）。
-     * 被每日配额挡下时 `sent=false`，**不写**：下轮继续扫到，明日额度重置后自然补发。
-     * 若不写，`ORDER_EXPIRED` 会在同一用户身上一轮一轮地丢——这是「防打扰」与
-     * 「不漏发」之间的正确一侧。
+     * 抛异常走下面的 catch、不写标记位：下轮继续扫到，不会漏发。
      *
      * 申请截止日走 `resolveApplyDeadlineStr`（与退款入口**同一个公式**）：
      * 站内信里写的日期必须和接口判定的一致，否则用户会按信里的日期卡点来申请却被拒。
@@ -1930,7 +2025,6 @@ export class BookingService {
             const sent = await this.messageService.sendOrderExpired(
                 { bookingId: booking.bookingId, wechatOpenId: booking.wechatOpenId },
                 applyDeadline,
-                new Date(now),
             );
             if (sent) {
                 await this.bookingRepository.markExpireNotified(booking.bookingId, now);
@@ -1950,19 +2044,17 @@ export class BookingService {
     /**
      * T2 ① 的发送（提醒核销）
      *
-     * 不写标记位（理由见 `runDailyReminderScan`），因此也不需要处理配额——
-     * 被挡下就挡下了，次日该订单若仍未核销会转成 T1/T2 ② 的「已过期可退款」，
-     * 不存在永久漏发。
+     * 不写标记位（理由见 `runDailyReminderScan`）：这张订单当天只会被扫到一次
+     * （`bookingDate = 今天` 在次日即不成立），发不出去也没有「补发」这回事——
+     * 但订单次日若已过期，会转成 T1/T2 ② 的「已过期可退款」，不存在永久漏发。
      */
-    private async notifyQuietly(msgType: MessageType, booking: Booking, now: number): Promise<boolean> {
+    private async notifyQuietly(msgType: MessageType, booking: Booking): Promise<boolean> {
         try {
-            const result = await this.messageService.send(
-                msgType,
-                { userId: booking.wechatOpenId, bookingId: booking.bookingId },
-                new Date(now),
-            );
-            // sent=false 只有一种情况：撞上该用户的每日系统消息上限（§4.4 防打扰）。
-            // 如实返回，调用方的计数才是「发出数」而不是「尝试数」
+            const result = await this.messageService.send(msgType, {
+                userId: booking.wechatOpenId,
+                bookingId: booking.bookingId,
+            });
+            // 单条抛异常时返回 false，调用方的计数才是「发出数」而不是「尝试数」
             return result.sent;
         } catch (error) {
             this.logger.error(

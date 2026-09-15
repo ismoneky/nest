@@ -213,6 +213,24 @@ export class Booking {
     @Column({ type: 'varchar', nullable: true })
     verifiedBy: string;
 
+    /**
+     * 用户在小程序端删除该订单的时刻（**软删除**，NULL = 未删除）
+     *
+     * 只影响**用户侧可见性**：用户列表（`getBookings`）、角标计数
+     * （`countBookingsByStatus`）、详情与退款申请入口（`getBookingById` 用户侧那条）
+     * 以及三个扫描类站内信的取单查询会过滤它。
+     *
+     * 后台列表/导出/看板、资金链路（支付、退款、对账）、核销、
+     * 名额与统计**一律不过滤**——与本仓「取消/退款不退还名额」是同一口径：
+     * 用户藏起来的只是自己那条记录，不是放弃这笔预约。
+     *
+     * ⚠️ **不要改成 `@DeleteDateColumn`**：TypeORM 会给所有 find/count 自动加
+     * `deletedAt IS NULL`，而 `BookingRepository.getBookingById` 被核销、退款、
+     * 支付回调、对账、管理端快照共 17 处共用，自动过滤会静默掐断资金链路。
+     */
+    @Column({ type: 'integer', nullable: true, transformer: timestampTransformer })
+    deletedByUserAt: Date;
+
     /** 支付超时时间 */
     @Column({ type: 'integer', nullable: true, transformer: timestampTransformer })
     paymentExpiredAt: Date;

@@ -4,7 +4,7 @@ import { Repository } from 'typeorm';
 import { Message, MessageType, MessageSenderType, OaSendStatus } from '../../entities/message.entity';
 import { MessageRepository } from '../../repositories/message.repository';
 import { MessageService } from './message.service';
-import { beijingDateStr, beijingDayStartMs } from '../../common/date-utils';
+import { beijingDateStr } from '../../common/date-utils';
 
 /**
  * 阶段 4「站内信」的核心不变式测试。
@@ -15,8 +15,9 @@ import { beijingDateStr, beijingDayStartMs } from '../../common/date-utils';
  *      报错了就等于给用户重复推送；
  *   2. **退款类消息按申请单号去重，不是订单号**：这是 v2 修正 v1 的严重缺陷
  *      ——同一订单第 2、3 次申请必须各收到一条审核结果（回归测试见下方 describe）；
- *   3. **每日上限按北京日切分**：服务器跑 UTC 时不能在北京时间凌晨重置额度；
- *   4. **`ADMIN_NOTICE` 不受上限约束**：那是人对人的沟通；
+ *   3. **没有任何每日条数上限**（2026-09-15 起）：同一用户连发 6 条系统消息全部落库，
+ *      消息只会被 `dedupeKey` 拦住；
+ *   4. **`ADMIN_NOTICE` 与系统消息互不影响**：手动消息不去重，可无限多条；
  *   5. **归属隔离**：标记已读带 `userId` 条件，标记别人的消息是 affected=0 而不是越权；
  *   6. **OA 默认关闭**：不配任何环境变量时消息只落站内信，`oaSendStatus=SKIPPED`；
  *   7. **T3 治理**：30 天未读转已读（`readAt` 是治理时刻而非 cutoff）、90 天删除。
@@ -143,16 +144,16 @@ describe('阶段 4 站内信', () => {
         it('同一订单的两次申请各收到一条审核结果', async () => {
             const bookingId = 'TL-MSG-1';
 
-            const first = await service.send(
-                MessageType.REFUND_APPROVED,
-                { userId: USER, bookingId, bizNo: 'RA-1' },
-                NOW,
-            );
-            const second = await service.send(
-                MessageType.REFUND_APPROVED,
-                { userId: USER, bookingId, bizNo: 'RA-2' },
-                NOW,
-            );
+            const first = await service.send(MessageType.REFUND_APPROVED, {
+                userId: USER,
+                bookingId,
+                bizNo: 'RA-1',
+            });
+            const second = await service.send(MessageType.REFUND_APPROVED, {
+                userId: USER,
+                bookingId,
+                bizNo: 'RA-2',
+            });
 
             expect(first.duplicated).toBe(false);
             expect(second.duplicated).toBe(false);
@@ -165,12 +166,8 @@ describe('阶段 4 站内信', () => {
 
         it('同一次申请重复投递（回调重放）仍然只发一条', async () => {
             const ctx = { userId: USER, bookingId: 'TL-MSG-2', bizNo: 'RA-9' };
-            await service.send(MessageType.REFUND_SUCCESS, { ...ctx, refundAmount: 12345 }, NOW);
-            const again = await service.send(
-                MessageType.REFUND_SUCCESS,
-                { ...ctx, refundAmount: 12345 },
-                NOW,
-            );
+            await service.send(MessageType.REFUND_SUCCESS, { ...ctx, refundAmount: 12345 });
+            const again = await service.send(MessageType.REFUND_SUCCESS, { ...ctx, refundAmount: 12345 });
 
             expect(again.duplicated).toBe(true);
             expect(await rawRepo.count()).toBe(1);
@@ -178,8 +175,8 @@ describe('阶段 4 站内信', () => {
 
         it('订单类消息按订单号去重：同一订单不会重复提醒过期', async () => {
             const ctx = { userId: USER, bookingId: 'TL-MSG-3' };
-            await service.send(MessageType.ORDER_EXPIRED, ctx, NOW);
-            const again = await service.send(MessageType.ORDER_EXPIRED, ctx, NOW);
+            await service.send(MessageType.ORDER_EXPIRED, ctx);
+            const again = await service.send(MessageType.ORDER_EXPIRED, ctx);
 
             expect(again.duplicated).toBe(true);
             expect(await rawRepo.count()).toBe(1);
@@ -187,69 +184,50 @@ describe('阶段 4 站内信', () => {
     });
 
     // ═════════════════════════════════════════════════════════════════════════
-    describe('每日上限（按北京日切分）', () => {
-        it('第 6 条系统消息被挡下，且不落库', async () => {
-            for (let i = 0; i < 5; i++) {
-                const r = await service.send(
-                    MessageType.ORDER_EXPIRED,
-                    { userId: USER, bookingId: `TL-CAP-${i}` },
-                    NOW,
-                );
+    /**
+     * 2026-09-15：原 §4.4「每用户每日 5 条系统消息」配额已整体删除（理由见
+     * `MessageService.send` 的说明）。本 describe 锁的是「配额确实不在了」——
+     * 旧实现在下面第一条用例的第 6 次发送会返回 `sent=false` 且不落库。
+     *
+     * 不能只放 5 条以内：那样新旧实现都能通过，用例锁不住任何东西。
+     */
+    describe('无每日条数上限（2026-09-15 起）', () => {
+        it('同一用户连发 6 条系统消息全部落库', async () => {
+            for (let i = 0; i < 6; i++) {
+                const r = await service.send(MessageType.ORDER_EXPIRED, {
+                    userId: USER,
+                    bookingId: `TL-CAP-${i}`,
+                });
                 expect(r.sent).toBe(true);
+                // 不同订单 → 不同 dedupeKey，一条都不该被判成重复
+                expect(r.duplicated).toBe(false);
             }
 
-            const blocked = await service.send(
-                MessageType.ORDER_EXPIRED,
-                { userId: USER, bookingId: 'TL-CAP-5' },
-                NOW,
-            );
-
-            expect(blocked.sent).toBe(false);
-            expect(blocked.reason).toBe('DAILY_LIMIT');
-            // 超限**不写库**：调用方据此不写「已通知」标记位，留给下一轮补发
-            expect(await rawRepo.count()).toBe(5);
+            expect(await rawRepo.count()).toBe(6);
         });
 
-        it('额度按北京日切分：UTC 前一天下午发的消息仍算「今天」', async () => {
-            // 2026-09-12T17:00Z = 北京 2026-09-13 01:00 —— 与 NOW 同一个北京日。
-            // 按 UTC 日切分的实现会把它算成「昨天」，于是额度被错误地重置。
-            const beijingEarlyMorning = new Date('2026-09-12T17:00:00.000Z');
-            for (let i = 0; i < 5; i++) {
-                await seedRaw({ createdAt: beijingEarlyMorning, dedupeKey: `cap:${i}` });
-            }
+        it('同一用户名下多张过期单会在同一批里各收一条（不再被配额推迟到次日）', async () => {
+            // 这是删除配额的**产品动机**：每条消息都对应一张真实的过期订单，
+            // 被挡下只会让「退款申请截止日」的提醒迟到
+            await seedRaw({ dedupeKey: 'unrelated' });
 
-            const blocked = await service.send(
-                MessageType.ORDER_EXPIRED,
-                { userId: USER, bookingId: 'TL-CAP-X' },
-                NOW,
+            const a = await service.sendOrderExpired(
+                { bookingId: 'TL-MULTI-1', wechatOpenId: USER },
+                '2026-09-20',
+            );
+            const b = await service.sendOrderExpired(
+                { bookingId: 'TL-MULTI-2', wechatOpenId: USER },
+                '2026-09-20',
             );
 
-            expect(blocked.reason).toBe('DAILY_LIMIT');
+            expect(a).toBe(true);
+            expect(b).toBe(true);
+            expect(await rawRepo.count()).toBe(3);
         });
 
-        it('额度按北京日切分：属于前一北京日的消息不计入', async () => {
-            // 2026-09-12T15:00Z = 北京 2026-09-12 23:00 —— 上一个北京日
-            const previousBeijingDay = new Date('2026-09-12T15:00:00.000Z');
-            for (let i = 0; i < 5; i++) {
-                await seedRaw({ createdAt: previousBeijingDay, dedupeKey: `prev:${i}` });
-            }
-
-            const ok = await service.send(
-                MessageType.ORDER_EXPIRED,
-                { userId: USER, bookingId: 'TL-CAP-Y' },
-                NOW,
-            );
-
-            expect(ok.sent).toBe(true);
-        });
-
-        it('ADMIN_NOTICE 不受上限约束、也不占用配额', async () => {
-            for (let i = 0; i < 5; i++) {
-                await service.send(
-                    MessageType.ORDER_EXPIRED,
-                    { userId: USER, bookingId: `TL-ADM-${i}` },
-                    NOW,
-                );
+        it('管理员手动消息照常落地，且可以同一个人连发多条', async () => {
+            for (let i = 0; i < 6; i++) {
+                await service.send(MessageType.ORDER_EXPIRED, { userId: USER, bookingId: `TL-ADM-${i}` });
             }
 
             const notice = await service.sendAdminNotice({
@@ -258,12 +236,18 @@ describe('阶段 4 站内信', () => {
                 content: '正文',
                 adminId: 1,
             });
+            const second = await service.sendAdminNotice({
+                openid: USER,
+                title: '公告 2',
+                content: '正文 2',
+                adminId: 1,
+            });
 
             expect(notice).not.toBeNull();
             expect(notice?.senderType).toBe(MessageSenderType.ADMIN);
-            // 上限没被这条撑破：系统消息仍然是 5 条
-            const sysCount = await repo.countTodaySystemMessages(USER, NOW);
-            expect(sysCount).toBe(5);
+            // 手动消息的 dedupeKey 为 NULL：不去重，同一个人可以收到任意多条（§6）
+            expect(second?.id).not.toBe(notice?.id);
+            expect(await rawRepo.count()).toBe(8);
         });
     });
 
@@ -328,11 +312,10 @@ describe('阶段 4 站内信', () => {
     // ═════════════════════════════════════════════════════════════════════════
     describe('OA 通道默认关闭', () => {
         it('未配置 OA_ENABLED 时消息只落站内信，状态为 SKIPPED', async () => {
-            const result = await service.send(
-                MessageType.ORDER_EXPIRED,
-                { userId: USER, bookingId: 'TL-OA-1' },
-                NOW,
-            );
+            const result = await service.send(MessageType.ORDER_EXPIRED, {
+                userId: USER,
+                bookingId: 'TL-OA-1',
+            });
 
             expect(result.message?.oaSendStatus).toBe(OaSendStatus.SKIPPED);
             expect(result.message?.oaAttempts).toBe(0);
@@ -375,9 +358,6 @@ describe('阶段 4 站内信', () => {
             expect(beijingDateStr(new Date('2026-09-13T16:00:00.000Z'))).toBe('2026-09-14');
         });
 
-        it('beijingDayStartMs 给出北京当天 00:00 的真实时刻', () => {
-            const start = beijingDayStartMs(NOW);
-            expect(start).toBe(Date.parse('2026-09-13T16:00:00.000Z') - 24 * 60 * 60 * 1000);
-        });
+        // 原 `beijingDayStartMs` 的用例已随该函数删除（它唯一的使用方是每日配额统计）
     });
 });

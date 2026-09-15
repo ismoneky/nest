@@ -9,31 +9,24 @@ import { Message, MessageType, MessageSenderType, OaSendStatus } from '../../ent
 import { renderMessage } from './message-templates';
 
 /**
- * 单用户每日系统消息上限（§4.4「防打扰」）
- *
- * `ADMIN_NOTICE` 不计入：那是人对人的沟通，被系统配额挡住会出现
- * 「管理员想解释却发不出去」的荒谬情形。
- *
- * 默认 5，可用 `MESSAGE_DAILY_LIMIT` 覆盖。**超限不是错误**——发送方拿到的
- * `{ sent: false, reason: 'DAILY_LIMIT' }` 与「已去重」是同一种处理：
- * 不写「已通知」标记位，留给下一轮补发。
- */
-const DEFAULT_DAILY_LIMIT = 5;
-
-/**
  * 发送结果
  *
  * 刻意**不用抛异常**表达失败：调用方几乎全是定时任务与回调，
- * 它们绝不能因为「用户今天消息收满了」而整批中断。
+ * 它们绝不能因为「某一条发不出去」而整批中断。
  * 唯一会抛的是数据库真故障——那种情况下让任务失败、下轮重跑才是对的。
  */
 export interface SendResult {
-    /** 消息在库里（本次插入 或 之前已存在）；false 表示本轮没发出去 */
+    /**
+     * 消息在库里（本次插入 或 之前已存在）
+     *
+     * **取消每日配额后恒为 true**——`send()` 现在只有「成功落库」与「抛异常」
+     * 两种结果。保留该字段是因为调用方拿它当「可以写已通知标记位」的判据
+     * （见 `sendOrderExpired`）；若将来接入服务号通道后出现
+     * 「落库成功但渠道受阻」这类分级结果，这里就是分支点。
+     */
     sent: boolean;
     /** 已存在同 dedupeKey 的消息（任务重跑、回调重放的正常路径） */
     duplicated: boolean;
-    /** 未发送的原因，仅 sent=false 时有值 */
-    reason?: 'DAILY_LIMIT';
     message: Message | null;
 }
 
@@ -67,35 +60,36 @@ export class MessageService {
     // ─────────────────────────────────────────────────────────────────────────
 
     /**
-     * 发送一条系统消息（模板渲染 + 去重 + 每日配额）
+     * 发送一条系统消息（模板渲染 + 去重 + 落库）
      *
      * 顺序与理由：
-     *   1. **先查重**——命中就直接返回。这一步是必要的，因为配额统计是「今天已经有几条」，
-     *      若先去重再统计，任务重跑时会把同一条消息重复计数，把配额提前吃满；
-     *   2. **再查配额**——超限返回 `DAILY_LIMIT`，调用方不写标记位，下轮补发；
-     *   3. **最后插入**——靠唯一索引兜住第 1 步到第 3 步之间的并发窗口。
+     *   1. **先查重**——命中就直接返回，不重复插入。它挡掉绝大多数重复
+     *      （任务重跑、回调重放），唯一索引只兜第 1 步到第 2 步之间的并发窗口；
+     *   2. **再插入**。
+     *
+     * ── 已移除：每用户每日系统消息上限（2026-09-15）──────────────────────────
+     * 原 §4.4「防打扰」的 5 条/日配额已整体删除（`MESSAGE_DAILY_LIMIT` 环境变量
+     * 同时失效，仓库从未配置过它）。理由：
+     *   ① 扫描类消息每条都对应一张真实存在的过期订单，被配额挡下只会把通知
+     *      推迟到次日，而「已过期可退款」的正文里写着**退款申请截止日**——
+     *      「少打扰」于是变成了「迟到的时限提醒」，比打扰严重；
+     *   ② 真正的防打扰由 A 规则（下单 2 小时内不推）与 `dedupeKey` 承担，
+     *      配额是第三道，而且是唯一会**丢时效**的一道；
+     *   ③ 用户量级下它几乎从不触发，却让「这轮到底发了几条」变得难以预测。
+     * 代价（有意接受）：名下当天有多张过期单的用户会在同一轮里收到多条。
+     *
+     * 顺带删掉了签名上的 `now`：它当初只为配额统计的「北京日」服务，
+     * 落库时间由 `createOnce` 自己取（`createdAt` 走插入时刻，与调用方传入的时刻无关）。
      */
     async send(
         msgType: MessageType,
         ctx: Parameters<typeof renderMessage>[1],
-        now: Date = new Date(),
     ): Promise<SendResult> {
         const rendered = renderMessage(msgType, ctx);
 
         if (rendered.dedupeKey) {
             const existing = await this.messageRepository.findByDedupeKey(rendered.dedupeKey);
             if (existing) return { sent: true, duplicated: true, message: existing };
-        }
-
-        const limit = this.getDailyLimit();
-        if (limit > 0) {
-            const todayCount = await this.messageRepository.countTodaySystemMessages(ctx.userId, now);
-            if (todayCount >= limit) {
-                this.logger.warn(
-                    `站内信每日上限已达（${todayCount}/${limit}），跳过 ${msgType}（用户 ${ctx.userId}）`,
-                );
-                return { sent: false, duplicated: false, reason: 'DAILY_LIMIT', message: null };
-            }
         }
 
         const { message, created } = await this.messageRepository.createOnce({
@@ -124,25 +118,20 @@ export class MessageService {
      * 发送「订单已过期，可申请退款」——T1 步骤②/T2 ② 的共用出口
      *
      * 单独包一层是因为这条消息的**调用方要拿它决定是否写标记位**
-     * （`expireNotifiedAt`）：只有真正发出去了才写，被配额挡住就不写，下轮补发。
-     * 让调用方去读 `SendResult.reason` 判断太隐晦，这里直接给出布尔语义。
+     * （`expireNotifiedAt`）：只有真正发出去了才写，否则下轮继续重扫。
+     * 让调用方去读 `SendResult` 判断太隐晦，这里直接给出布尔语义。
      *
      * @returns true = 已发出或早已存在（两种情况都该写标记位，否则会反复重扫）
      */
     async sendOrderExpired(
         booking: { bookingId: string; wechatOpenId: string },
         applyDeadline: string | null,
-        now: Date = new Date(),
     ): Promise<boolean> {
-        const result = await this.send(
-            MessageType.ORDER_EXPIRED,
-            {
-                userId: booking.wechatOpenId,
-                bookingId: booking.bookingId,
-                applyDeadline: applyDeadline ?? undefined,
-            },
-            now,
-        );
+        const result = await this.send(MessageType.ORDER_EXPIRED, {
+            userId: booking.wechatOpenId,
+            bookingId: booking.bookingId,
+            applyDeadline: applyDeadline ?? undefined,
+        });
         return result.sent;
     }
 
@@ -176,20 +165,15 @@ export class MessageService {
     async notifyRefundSettled(
         apply: { applyNo: string; bookingId: string; wechatOpenId: string; refundAmount: number },
         success: boolean,
-        now: Date = new Date(),
     ): Promise<void> {
         if (!success) return;
         try {
-            await this.send(
-                MessageType.REFUND_SUCCESS,
-                {
-                    userId: apply.wechatOpenId,
-                    bookingId: apply.bookingId,
-                    bizNo: apply.applyNo,
-                    refundAmount: apply.refundAmount,
-                },
-                now,
-            );
+            await this.send(MessageType.REFUND_SUCCESS, {
+                userId: apply.wechatOpenId,
+                bookingId: apply.bookingId,
+                bizNo: apply.applyNo,
+                refundAmount: apply.refundAmount,
+            });
         } catch (error) {
             this.logger.error(
                 `退款到账通知发送失败（不影响资金）: applyNo=${apply.applyNo}`,
@@ -206,7 +190,8 @@ export class MessageService {
      * 管理员手动发送（§6 `/admin/messages/send`）
      *
      * `dedupeKey` 为 null → 走唯一索引「多个 NULL 互不冲突」的特性，
-     * 同一个人可以收到任意多条手动消息；也**不计入每日系统消息上限**。
+     * 同一个人可以收到任意多条手动消息。与系统消息的唯一区别就在这里：
+     * 系统消息按 `dedupeKey` 去重（`{类型}:{业务号}`），手动消息不去重。
      */
     async sendAdminNotice(params: {
         openid: string;
@@ -325,15 +310,6 @@ export class MessageService {
     // ─────────────────────────────────────────────────────────────────────────
     // 私有
     // ─────────────────────────────────────────────────────────────────────────
-
-    private getDailyLimit(): number {
-        const raw = process.env.MESSAGE_DAILY_LIMIT;
-        if (raw == null || raw.trim() === '') return DEFAULT_DAILY_LIMIT;
-        const n = Number(raw);
-        // 非数字/负数一律回落到默认值：配置写错不该让整条通知链路停摆。
-        // 显式配 0 表示「不限」，这是一个有意义的取值，故不当作非法值处理。
-        return Number.isInteger(n) && n >= 0 ? n : DEFAULT_DAILY_LIMIT;
-    }
 
     /** OA 未启用时落库的初始状态（启用时应为 PENDING，留给服务号分支改） */
     private oaStatusWhenDisabled(): number {

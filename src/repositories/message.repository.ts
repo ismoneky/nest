@@ -3,7 +3,6 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { Message, MessageType } from '../entities/message.entity';
 import { serialWrite } from '../common/transaction-runner';
-import { beijingDayStartMs } from '../common/date-utils';
 
 /**
  * 用户端消息列表查询
@@ -142,12 +141,14 @@ export class MessageRepository {
     /**
      * 按去重键取一条（发送前的预检）
      *
-     * 与 `createOnce` 的 `orIgnore` 是两道互补的闸门，不是重复劳动：
+     * 与 `createOnce` 的唯一索引是两道互补的闸门，不是重复劳动：
      *   · 这里挡掉**绝大多数**重复（任务重跑、回调重放），代价是一次索引命中；
      *   · 唯一索引挡掉「预检到插入之间」的并发窗口。
      * 只有预检是不够的（并发下两条都会查到「没有」），只有唯一索引也是不够的——
-     * 那样每次都要走一遍插入失败，而且**配额计数会先被算错**
-     * （见 `MessageService.send` 里对顺序的说明）。
+     * 那样每次重复都要走一遍「插入失败再回查」。
+     *
+     * 取消每日配额后，这两道闸门是 `ORDER_EXPIRED` / `ORDER_EXPIRE_REMINDER`
+     * 唯一的重复拦截层，去重键的写法（`message-templates.ts`）不能动。
      */
     async findByDedupeKey(dedupeKey: string): Promise<Message | null> {
         return await this.messageRepository.findOne({ where: { dedupeKey } });
@@ -184,22 +185,6 @@ export class MessageRepository {
     /** 未读数（`(userId, isRead, id)` 索引直接覆盖，§4.4「本期不引入冗余计数器」） */
     async countUnread(userId: string): Promise<number> {
         return await this.messageRepository.count({ where: { userId, isRead: 0 } });
-    }
-
-    /**
-     * 今日已发送的**系统**消息条数（每日防打扰上限用，§4.4）
-     *
-     * `ADMIN_NOTICE` 不计入：管理员手动发送是人对人的沟通，
-     * 被系统配额挡住会出现「管理员想解释却发不出去」。
-     * 按**北京日**切分（`beijingDayStartMs`），否则服务器跑 UTC 时会在每天 08:00 重置额度。
-     */
-    async countTodaySystemMessages(userId: string, now: Date = new Date()): Promise<number> {
-        return await this.messageRepository
-            .createQueryBuilder('msg')
-            .where('msg.userId = :userId', { userId })
-            .andWhere('msg.msgType != :notice', { notice: MessageType.ADMIN_NOTICE })
-            .andWhere('msg.createdAt >= :dayStart', { dayStart: beijingDayStartMs(now) })
-            .getCount();
     }
 
     // ─────────────────────────────────────────────────────────────────────────

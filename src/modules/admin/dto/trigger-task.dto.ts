@@ -1,4 +1,4 @@
-import { IsInt, IsOptional, Max, Min } from 'class-validator';
+import { IsBoolean, IsInt, IsOptional, Max, Min } from 'class-validator';
 import { Type } from 'class-transformer';
 import { MESSAGE_QUIET_WINDOW_MAX_MS, MESSAGE_QUIET_WINDOW_MS } from '../../message/message-policy';
 
@@ -32,4 +32,21 @@ export class TriggerTaskDto {
         message: `静默期最长 ${MAX_QUIET_WINDOW_MINUTES} 分钟（默认 ${DEFAULT_QUIET_WINDOW_MINUTES}）`,
     })
     quietWindowMinutes?: number;
+
+    /**
+     * 过期边界是否**含当天**（`bookingDate <= 今天`）。
+     *
+     * **不传 = true**。「不传」与「传 true」等价，只有显式传 `false` 才能退回
+     * 「严格早于今天」——这个接口的定位是管理员清干净当前状态，
+     * 判据本就是「此刻之前」；把默认值设成 false 会让默认行为与接口语义不符。
+     *
+     * ⚠️ 含当天意味着**当天未核销的订单会当场作废**（核销接口对它们返回
+     * 「当前状态：expired」），且当天名额随之释放（统计只认 pending/confirmed）。
+     * 要「封盘当天」请用预约开关，不要用这个接口。
+     *
+     * ⚠️ 只对 `expire-scan` 有意义；`daily-reminder` 忽略它（那个任务不做过期流转）。
+     */
+    @IsOptional()
+    @IsBoolean()
+    includeToday?: boolean;
 }

@@ -10,7 +10,7 @@ import { BookingService } from '../booking/booking.service';
  * 手动触发定时任务的两个端点（`POST /admin/tasks/*`）
  *
  * ── 这个文件补的是什么 ────────────────────────────────────────────────────
- * 任务**逻辑**由 `booking-notify.spec.ts` 覆盖（22 个用例）——那两个端点调的就是
+ * 任务**逻辑**由 `booking-notify.spec.ts` 覆盖（23 个用例）——那两个端点调的就是
  * `runExpireScan` / `runDailyReminderScan`，与 `@Cron` 是同一个方法。
  *
  * 但「接口本身是通的」没有任何东西证明过：路由注册、守卫、DTO 校验、
@@ -39,6 +39,7 @@ describe('POST /admin/tasks/*（手动触发端点）', () => {
         expiredCount: 0,
         notifiedCount: 0,
         quietWindowMinutes: 120,
+        includedToday: true,
         error: null,
         ...over,
     });
@@ -126,7 +127,7 @@ describe('POST /admin/tasks/*（手动触发端点）', () => {
                 .set('x-admin-token', adminToken)
                 .expect(200);
 
-            expect(runExpireScan).toHaveBeenCalledWith({ quietWindowMs: undefined });
+            expect(runExpireScan).toHaveBeenCalledWith({ quietWindowMs: undefined, includeToday: true });
         });
 
         it('传 0 → 换算成 0 毫秒（不设静默期），不能变成 falsy 被丢掉', async () => {
@@ -137,7 +138,7 @@ describe('POST /admin/tasks/*（手动触发端点）', () => {
                 .expect(200);
 
             // 0 是合法值：写 `dto.x || undefined` 这类代码会把它吞掉，这条就是防那个
-            expect(runExpireScan).toHaveBeenCalledWith({ quietWindowMs: 0 });
+            expect(runExpireScan).toHaveBeenCalledWith({ quietWindowMs: 0, includeToday: true });
         });
 
         it('传 90 → 换算成 5400000 毫秒', async () => {
@@ -162,9 +163,49 @@ describe('POST /admin/tasks/*（手动触发端点）', () => {
         });
     });
 
+    /**
+     * 过期边界：本接口默认**含当天**（判据「此刻之前」），cron 永远不含。
+     *
+     * 这三条一起构成一个不变式：只有「显式传 false」才会退回 cron 的边界。
+     * 若哪天有人把默认改成 false，第一条会立刻变红——那意味着管理员点一次按钮
+     * 却清不干净当天的单，而界面文案还写着「含当天」。
+     */
+    describe('过期边界（includeToday）', () => {
+        it('不传 → 默认 true（含当天）', async () => {
+            await request(app.getHttpServer())
+                .post('/admin/tasks/expire-scan')
+                .set('x-admin-token', adminToken)
+                .expect(200);
+
+            expect(runExpireScan).toHaveBeenCalledWith(expect.objectContaining({ includeToday: true }));
+        });
+
+        it('显式传 false → 退回「严格早于今天」', async () => {
+            await request(app.getHttpServer())
+                .post('/admin/tasks/expire-scan')
+                .set('x-admin-token', adminToken)
+                .send({ includeToday: false })
+                .expect(200);
+
+            expect(runExpireScan).toHaveBeenCalledWith(expect.objectContaining({ includeToday: false }));
+        });
+
+        it('传 true → true（与不传等价，且被 DTO 接受）', async () => {
+            await request(app.getHttpServer())
+                .post('/admin/tasks/expire-scan')
+                .set('x-admin-token', adminToken)
+                .send({ includeToday: true })
+                .expect(200);
+
+            expect(runExpireScan).toHaveBeenCalledWith(expect.objectContaining({ includeToday: true }));
+        });
+    });
+
     describe('响应结构', () => {
-        it('成功：message 里带上本次生效的静默期，data 原样透出统计', async () => {
-            runExpireScan.mockResolvedValueOnce(okExpire({ expiredCount: 2, notifiedCount: 2, quietWindowMinutes: 0 }));
+        it('成功：message 里带上本次生效的静默期与边界，data 原样透出统计', async () => {
+            runExpireScan.mockResolvedValueOnce(
+                okExpire({ expiredCount: 2, notifiedCount: 2, quietWindowMinutes: 0, includedToday: true }),
+            );
 
             const res = await request(app.getHttpServer())
                 .post('/admin/tasks/expire-scan')
@@ -173,15 +214,29 @@ describe('POST /admin/tasks/*（手动触发端点）', () => {
                 .expect(200);
 
             expect(res.body.success).toBe(true);
-            // 手动触发最容易看错的就是"到底用了多少静默期"，所以它必须出现在人能直接读的 message 里
+            // 手动触发最容易看错的就是"到底用了多少静默期""到底动没动当天的单"，
+            // 两者都必须出现在人能直接读的 message 里
             expect(res.body.message).toContain('静默期 0 分钟');
+            expect(res.body.message).toContain('（含当天）');
             expect(res.body.data).toMatchObject({
                 expiredCount: 2,
                 notifiedCount: 2,
                 quietWindowMinutes: 0,
+                includedToday: true,
                 skipped: false,
                 error: null,
             });
+        });
+
+        it('不含当天时 message 明说「不含当天」', async () => {
+            runExpireScan.mockResolvedValueOnce(okExpire({ includedToday: false }));
+
+            const res = await request(app.getHttpServer())
+                .post('/admin/tasks/expire-scan')
+                .set('x-admin-token', adminToken)
+                .expect(200);
+
+            expect(res.body.message).toContain('（不含当天）');
         });
 
         it('重入锁命中：skipped=true，message 说清"没执行"而不是报 0', async () => {

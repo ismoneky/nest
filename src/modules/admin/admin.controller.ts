@@ -219,11 +219,22 @@ export class AdminController {
      * ── 为什么有这个接口 ───────────────────────────────────────────────────
      * 扫描任务原本只能靠 cron 等到点（T1 每小时 :13、T2 每天 22:00），
      * 测试环境里没法「立刻跑一次，看它到底扫到了什么」。这里只是把同一个方法调一次，
-     * 不改动任何扫描逻辑，也不绕过静默期与去重。
+     * 不绕过静默期与去重。
      *
-     * ⚠️ **有真实副作用**：把 `bookingDate < 今天` 且未核销的订单置为 expired，
-     * 并给这些订单的用户发站内信。单轮上限 `MESSAGE_SCAN_BATCH_LIMIT`（200）条，
-     * 积压多时要连续调用几轮才能消化完。
+     * ── 与 cron 唯一的差别：边界含当天（2026-09-15）────────────────────────
+     * cron 的判据是「严格早于今天」——当天全天可核销，所以当天的单要等过了北京零点
+     * 才下沉。本接口是管理员用来**清干净当前状态**的入口（点完不该再剩下任何
+     * 「日子已经过了却还挂在 confirmed」的单），判据取「此刻之前」，**默认把当天算进去**。
+     * 传 `includeToday: false` 可退回 cron 的边界。
+     *
+     * ⚠️ 含当天意味着**当天未核销的订单会当场作废**：它们 status 变成 expired，
+     * 核销接口从此对它们返回「当前状态：expired」，用户只能走「申请 → 审核」退款。
+     * 同时当天名额会**释放**（统计只认 `pending/confirmed`），也就是刷完之后当天又能被预约。
+     * 要「把当天封盘」请用预约开关，不要用这个接口。
+     *
+     * ⚠️ **有真实副作用**：给这些订单的用户发站内信，**没有单轮条数上限**——本轮扫到的
+     * 待发通知一次发完（稳态下这个池子就是近日过期未核销的几十单；若某轮 `notifiedCount`
+     * 是四位数，说明积压异常大，见 `BookingRepository.findExpiredNotNotified` 的说明）。
      *
      * 可传 `quietWindowMinutes` 覆盖本次的静默期（默认 2 小时，0 = 不设），见 `TriggerTaskDto`。
      */
@@ -232,13 +243,19 @@ export class AdminController {
     async triggerExpireScan(@Body() dto: TriggerTaskDto, @Res() res: Response) {
         const data = await this.bookingService.runExpireScan({
             quietWindowMs: toQuietWindowMs(dto),
+            // 默认含当天：本接口的判据是「此刻之前」，不是「今天之前」。
+            // 写 `!== false` 而不是 `?? true`：只认**显式关闭**——undefined / null / 字段缺失
+            // 一律按默认（含当天）走。否则「前端漏传一个字段」就会把边界悄悄退回 cron 的语义，
+            // 而界面上还写着「含当天」，操作者看到 0 单会以为是任务没生效
+            includeToday: dto.includeToday !== false,
         });
         if (data.error) throw new InternalServerErrorException(data.error);
         return res.status(HttpStatus.OK).send({
             success: true,
             message: data.skipped
                 ? '上一轮尚未结束，本次未执行'
-                : `扫描完成：转入过期 ${data.expiredCount} 单，发出通知 ${data.notifiedCount} 条（静默期 ${data.quietWindowMinutes} 分钟）`,
+                : `扫描完成：转入过期 ${data.expiredCount} 单${data.includedToday ? '（含当天）' : '（不含当天）'}，`
+                  + `发出通知 ${data.notifiedCount} 条（静默期 ${data.quietWindowMinutes} 分钟）`,
             data,
         });
     }

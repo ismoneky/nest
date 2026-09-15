@@ -162,6 +162,49 @@ describe('T1 过期扫描与核销互斥', () => {
             // 第二轮的 affected 不应包含它
             expect(second).toBeLessThan(first);
         });
+
+        /**
+         * 含当天是**手动触发接口**用的边界（管理员清干净当前状态，判据「此刻之前」），
+         * cron 永远走严格早于今天。两条分别锁住，防止有人把默认值改掉——
+         * 那会让每天零点后的第一轮扫描就把当天的订单全部作废。
+         */
+        describe('includeToday（手动触发专用边界）', () => {
+            it('含当天：今天当天的 confirmed 也被置为 expired', async () => {
+                const b = await seed(TODAY);
+                const now = Date.now();
+
+                const affected = await repo.markExpired(TODAY, now, { includeToday: true });
+
+                expect(affected).toBeGreaterThanOrEqual(1);
+                const after = await bookingRepo.findOne({ where: { bookingId: b.bookingId } });
+                expect(after!.status).toBe(BookingStatus.EXPIRED);
+                expect(after!.expiredAt!.getTime()).toBe(now);
+            });
+
+            it('含当天：明天的订单仍然不受影响（边界是「此刻之前」，不是「全部」）', async () => {
+                const tomorrow = await seed('2026-09-14');
+
+                await repo.markExpired(TODAY, Date.now(), { includeToday: true });
+
+                expect(await statusOf(tomorrow.bookingId)).toBe(BookingStatus.CONFIRMED);
+            });
+
+            it('不含当天（显式 false）：与默认一致，当天订单不动', async () => {
+                const b = await seed(TODAY);
+
+                await repo.markExpired(TODAY, Date.now(), { includeToday: false });
+
+                expect(await statusOf(b.bookingId)).toBe(BookingStatus.CONFIRMED);
+            });
+
+            it('含当天同样排除退款中/已退款（排除条件与边界正交）', async () => {
+                const refunding = await seed(TODAY, { refundStatus: RefundStatus.REFUNDING });
+
+                await repo.markExpired(TODAY, Date.now(), { includeToday: true });
+
+                expect(await statusOf(refunding.bookingId)).toBe(BookingStatus.CONFIRMED);
+            });
+        });
     });
 
     describe('markExpired 排除条件', () => {

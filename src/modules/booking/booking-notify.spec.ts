@@ -14,7 +14,7 @@ import { Message, MessageType, OaSendStatus } from '../../entities/message.entit
 import { BookingRepository } from '../../repositories/booking.repository';
 import { MessageRepository } from '../../repositories/message.repository';
 import { MessageService } from '../message/message.service';
-import { MESSAGE_QUIET_WINDOW_MS, MESSAGE_SCAN_BATCH_LIMIT } from '../message/message-policy';
+import { MESSAGE_QUIET_WINDOW_MS } from '../message/message-policy';
 import { BookingService } from './booking.service';
 import { beijingDateStr } from '../../common/date-utils';
 
@@ -31,7 +31,8 @@ import { beijingDateStr } from '../../common/date-utils';
  * ── 锁定的核心不变式 ──────────────────────────────────────────────────────
  *   1. **A 规则（≥2h）不满足时不写 `expireNotifiedAt`**——否则用户永远收不到，
  *      而库里显示"已通知"。这是标记位方案唯一可能失效的方式，也是本文件最重要的一条；
- *   2. **被每日配额挡下时不写标记位**——同理，次日额度重置后必须还能补发；
+ *   2. **没有再分批（2026-09-15 起）**：单轮 200 条上限与每用户每日 5 条配额都已删除，
+ *      一轮扫描把待发通知一次发完；
  *   3. **去重命中（T2 ② 已经发过）时仍写标记位**——否则那条订单每小时被重扫一次，
  *      永远消化不掉，积压队列的队头会被它一个人堵死；
  *   4. **`ORDER_EXPIRED` 的两条路径（T1 ② / T2 ②）共用 dedupeKey**——用户不会收到两条；
@@ -207,16 +208,17 @@ describe('阶段 4 扫描类通知（T1 ② / T2）', () => {
             expect(await notifiedAtOf(booking.bookingId)).not.toBeNull();
         });
 
-        it('每日配额挡住时**不写标记位**，次日额度重置后补发', async () => {
-            // 先用满当天 5 条额度（上限由 MESSAGE_DAILY_LIMIT 决定，默认 5）
+        it('用户当天已有别的系统消息时，本轮通知照发（配额已移除）', async () => {
+            // 旧实现里这 5 条会吃满「每用户每日 5 条」配额，令下面的过期通知发不出去、
+            // 标记位也不写（只能等次日）。2026-09-15 起配额整体删除。
             for (let i = 0; i < 5; i++) {
                 await messageRepo.save(
                     messageRepo.create({
                         userId: USER,
                         msgType: MessageType.ORDER_EXPIRE_REMINDER,
-                        title: '占额度',
-                        content: '占额度',
-                        dedupeKey: `quota:${i}`,
+                        title: '其它系统消息',
+                        content: '其它系统消息',
+                        dedupeKey: `other:${i}`,
                         senderType: 'SYSTEM',
                         oaSendStatus: OaSendStatus.SKIPPED,
                         oaAttempts: 0,
@@ -231,8 +233,8 @@ describe('阶段 4 扫描类通知（T1 ② / T2）', () => {
 
             await service.runExpireScan();
 
-            expect(await messagesOf()).toHaveLength(5); // 只有占额度的那 5 条
-            expect(await notifiedAtOf(booking.bookingId)).toBeNull(); // ← 关键：没写标记位
+            expect(await messagesOf()).toHaveLength(6); // 5 条已有的 + 本轮这条
+            expect(await notifiedAtOf(booking.bookingId)).not.toBeNull();
         });
 
         it('去重命中（同 key 已存在）时**仍然写标记位**，否则队头会被永久堵死', async () => {
@@ -274,32 +276,46 @@ describe('阶段 4 扫描类通知（T1 ② / T2）', () => {
     // 候选查询（不走 cron，直接锁谓词与排序/批量）
     // ─────────────────────────────────────────────────────────────────────────
 
-    describe('findExpiredNotNotified（谓词、排序、批量）', () => {
+    describe('findExpiredNotNotified（谓词、排序、无上限）', () => {
         it('按 expiredAt 升序取，积压时先补发过期最久的', async () => {
             const older = await seedBooking({ status: BookingStatus.EXPIRED, expiredAt: ago(3 * DAY) });
             const newer = await seedBooking({ status: BookingStatus.EXPIRED, expiredAt: ago(1 * DAY) });
 
-            const rows = await bookingRepository.findExpiredNotNotified(10, Date.now(), MESSAGE_QUIET_WINDOW_MS);
+            const rows = await bookingRepository.findExpiredNotNotified(Date.now(), MESSAGE_QUIET_WINDOW_MS);
 
             expect(rows.map((r) => r.bookingId)).toEqual([older.bookingId, newer.bookingId]);
         });
 
-        it('limit 生效：单轮不会把所有积压一次性发出去', async () => {
-            for (let i = 0; i < 3; i++) {
+        /**
+         * 取 **205** 条而不是 3 条是刻意的：旧的 `MESSAGE_SCAN_BATCH_LIMIT` 是 200，
+         * 只放 3 条的话新旧实现都能通过，这条用例就锁不住「上限已移除」。
+         */
+        it('不再有单轮上限：205 条积压一次全部取回', async () => {
+            for (let i = 0; i < 205; i++) {
                 await seedBooking({ status: BookingStatus.EXPIRED, expiredAt: ago((i + 1) * DAY) });
             }
 
-            const rows = await bookingRepository.findExpiredNotNotified(2, Date.now(), MESSAGE_QUIET_WINDOW_MS);
+            const rows = await bookingRepository.findExpiredNotNotified(Date.now(), MESSAGE_QUIET_WINDOW_MS);
 
-            expect(rows).toHaveLength(2);
-            expect(MESSAGE_SCAN_BATCH_LIMIT).toBeGreaterThan(2); // 批量上限是独立的常量
+            expect(rows).toHaveLength(205);
+        });
+
+        it('用户删掉的订单不再被取到（删除即不再打扰）', async () => {
+            const booking = await seedBooking({ status: BookingStatus.EXPIRED, expiredAt: ago(1 * DAY) });
+            await bookingRepo.update({ bookingId: booking.bookingId }, { deletedByUserAt: new Date() });
+
+            expect(
+                await bookingRepository.findExpiredNotNotified(Date.now(), MESSAGE_QUIET_WINDOW_MS),
+            ).toHaveLength(0);
+            // 只删了可见性，订单本身还在库里、标记位也没被写过
+            expect(await notifiedAtOf(booking.bookingId)).toBeNull();
         });
 
         it('已写过标记位的不再被取到', async () => {
             const booking = await seedBooking({ status: BookingStatus.EXPIRED, expiredAt: ago(1 * DAY) });
             await bookingRepository.markExpireNotified(booking.bookingId, Date.now());
 
-            expect(await bookingRepository.findExpiredNotNotified(10, Date.now(), MESSAGE_QUIET_WINDOW_MS)).toHaveLength(0);
+            expect(await bookingRepository.findExpiredNotNotified(Date.now(), MESSAGE_QUIET_WINDOW_MS)).toHaveLength(0);
         });
 
         it('markExpireNotified 带 IS NULL 条件：重复调用只有第一次 affected=1', async () => {

@@ -36,16 +36,3 @@ export const MESSAGE_QUIET_WINDOW_MS = 2 * 60 * 60 * 1000;
  * 下界是 0（合法值 = 不设静默期），由调用方钳制。
  */
 export const MESSAGE_QUIET_WINDOW_MAX_MS = 24 * 60 * 60 * 1000;
-
-/**
- * 单轮扫描的发消息上限（§7b）
- *
- * 【为什么必须有上限】T1 步骤②/T2 是「扫历史积压」的形态：2A 上线时库里可能
- * 已经堆着几百条未通知的过期单，不加限制会在同一分钟把它们全部发出去
- * （相当于对全部历史用户同时轰炸，且会瞬间写满 SQLite 的单写者预算）。
- * 按 `expiredAt ASC` 每轮取一批，积压会**逐轮消化**而不是一次性倾泻。
- *
- * 【为什么是 200】§7b 的 `EXPLAIN QUERY PLAN` 就是按 `LIMIT 200` 验证的；
- * 单条消息一次 INSERT，200 条约占几十毫秒，远小于 1 小时的扫描间隔。
- */
-export const MESSAGE_SCAN_BATCH_LIMIT = 200;
