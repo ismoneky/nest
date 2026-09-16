@@ -1,6 +1,6 @@
 import { ArrayMinSize, IsArray, IsDateString, IsEnum, IsNotEmpty, IsOptional, IsString, Matches, ValidateNested } from 'class-validator';
-import { Type } from 'class-transformer';
-import { PassengerDto } from './createBooking.dto';
+import { Transform, Type } from 'class-transformer';
+import { inheritLeadPassengerPhone, PassengerDto } from './createBooking.dto';
 import { TravelMode, VehicleType } from '../../../entities/booking.entity';
 
 /** 车牌号正则（与 createBooking.dto 一致） */
@@ -13,6 +13,7 @@ const LICENSE_PLATE_PATTERN = /^[京津沪渝冀豫云辽黑湘皖鲁新苏浙�
  */
 export class PreviewBookingDto {
     /** 出行人员列表（与下单保持一致） */
+    @Transform(({ value }) => inheritLeadPassengerPhone(value))
     @IsArray()
     @ArrayMinSize(1, { message: '至少填写一名出行人员' })
     @ValidateNested({ each: true })

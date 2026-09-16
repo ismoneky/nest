@@ -54,6 +54,50 @@ describe('PassengerDto 结构校验（preview 与 create 共用）', () => {
         expect(validateSync(instance)).toHaveLength(0);
     });
 
+    it.each([undefined, null, '', '   '])(
+        'preview 与 create 中同行人手机号为 %p 时继承首位联系人手机号',
+        (phone) => {
+            const passengers = [
+                { name: '张三', phone: '13800000001', idCard: ADULT_CARD },
+                { name: '李四', phone, idCard: ADULT_CARD },
+            ];
+
+            const create = plainToInstance(CreateBookingDto, { ...BOOKING_BASE, passengers });
+            const preview = plainToInstance(PreviewBookingDto, { bookingDate: BOOKING_DATE, passengers });
+
+            expect(create.passengers[1].phone).toBe('13800000001');
+            expect(preview.passengers[1].phone).toBe('13800000001');
+            expect(validateSync(create)).toHaveLength(0);
+            expect(validateSync(preview)).toHaveLength(0);
+        },
+    );
+
+    it('同行人已传手机号时不覆盖', () => {
+        const instance = plainToInstance(CreateBookingDto, {
+            ...BOOKING_BASE,
+            passengers: [
+                { name: '张三', phone: '13800000001', idCard: ADULT_CARD },
+                { name: '李四', phone: '13900000002', idCard: ADULT_CARD },
+            ],
+        });
+
+        expect(instance.passengers[1].phone).toBe('13900000002');
+        expect(validateSync(instance)).toHaveLength(0);
+    });
+
+    it('首位联系人缺失手机号时仍拒绝请求', () => {
+        const instance = plainToInstance(CreateBookingDto, {
+            ...BOOKING_BASE,
+            passengers: [
+                { name: '张三', phone: '', idCard: ADULT_CARD },
+                { name: '李四', phone: '', idCard: ADULT_CARD },
+            ],
+        });
+
+        const errors = validateSync(instance);
+        expect(JSON.stringify(errors)).toContain('手机号不能为空');
+    });
+
     it('字符串 true 不被当作 idCardUnavailable（隐式转换防护）', () => {
         const instance = plainToInstance(CreateBookingDto, {
             ...BOOKING_BASE,

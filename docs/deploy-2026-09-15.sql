@@ -66,7 +66,7 @@ ALTER TABLE bookings ADD COLUMN verifiedBy varchar;
 ALTER TABLE bookings ADD COLUMN deletedByUserAt integer;
 
 -- 一次性写法：
--- sqlite3 data/test.db "ALTER TABLE bookings ADD COLUMN expiredAt integer; ALTER TABLE bookings ADD COLUMN expireNotifiedAt integer; ALTER TABLE bookings ADD COLUMN verifiedAt integer; ALTER TABLE bookings ADD COLUMN verifiedBy varchar; ALTER TABLE bookings ADD COLUMN deletedByUserAt integer;"
+-- sqlite3 data/prod.db "ALTER TABLE bookings ADD COLUMN expiredAt integer; ALTER TABLE bookings ADD COLUMN expireNotifiedAt integer; ALTER TABLE bookings ADD COLUMN verifiedAt integer; ALTER TABLE bookings ADD COLUMN verifiedBy varchar; ALTER TABLE bookings ADD COLUMN deletedByUserAt integer;"
 
 -- 字段含义：
 --   expiredAt         被 T1 翻转为 expired 的时刻。**退款申请 7 天时限的计算基准**
@@ -114,8 +114,10 @@ CREATE INDEX IF NOT EXISTS IDX_refund_applies_status_created ON refund_applies (
 CREATE INDEX IF NOT EXISTS IDX_refund_applies_user ON refund_applies (wechatOpenId, createdAt);
 CREATE INDEX IF NOT EXISTS IDX_refund_applies_out_refund_no ON refund_applies (outRefundNo);
 
+
 -- 不做外键：本库整体无外键，申请单与订单的关联由应用层保证。
 -- 本表是新增表，不动 bookings 一行数据。
+-- sqlite3 -bail data/prod.db "CREATE TABLE IF NOT EXISTS refund_applies (id integer PRIMARY KEY AUTOINCREMENT NOT NULL, applyNo varchar NOT NULL, bookingId varchar NOT NULL, wechatOpenId varchar NOT NULL, applyCount integer NOT NULL, reason varchar(500) NOT NULL, status varchar NOT NULL DEFAULT 'pending', refundAmount integer NOT NULL, outRefundNo varchar, auditAdminId integer, auditAdminName varchar, auditAt integer, auditRemark varchar, rejectReason varchar(500), createdAt integer NOT NULL DEFAULT (strftime('%s','now') * 1000), updatedAt integer NOT NULL DEFAULT (strftime('%s','now') * 1000)); CREATE UNIQUE INDEX IF NOT EXISTS IDX_refund_applies_applyNo ON refund_applies (applyNo); CREATE UNIQUE INDEX IF NOT EXISTS IDX_refund_applies_booking_count ON refund_applies (bookingId, applyCount); CREATE INDEX IF NOT EXISTS IDX_refund_applies_status_created ON refund_applies (status, createdAt); CREATE INDEX IF NOT EXISTS IDX_refund_applies_user ON refund_applies (wechatOpenId, createdAt); CREATE INDEX IF NOT EXISTS IDX_refund_applies_out_refund_no ON refund_applies (outRefundNo);"
 -- (bookingId, applyCount) 的唯一索引是**并发重复提交的最终兜底**，不要省。
 
 
@@ -214,3 +216,4 @@ CREATE INDEX IF NOT EXISTS IDX_messages_oa_retry ON messages (oaSendStatus, oaAt
 -- ALTER TABLE bookings DROP COLUMN expiredAt;
 --
 -- 各段详细影响见 implementation-todo.md 第 7c / 8b / 9b / 10b 节。
+-- sqlite3 -bail data/prod.db "CREATE TABLE IF NOT EXISTS messages (id integer PRIMARY KEY AUTOINCREMENT NOT NULL, userId varchar NOT NULL, msgType varchar NOT NULL, title varchar NOT NULL, content varchar(500) NOT NULL, bizType varchar, bizId varchar, jumpPath varchar, senderType varchar NOT NULL DEFAULT 'SYSTEM', adminId integer, dedupeKey varchar, oaSendStatus integer NOT NULL DEFAULT 3, oaAttempts integer NOT NULL DEFAULT 0, oaLastError varchar, isRead integer NOT NULL DEFAULT 0, readAt integer, createdAt integer NOT NULL DEFAULT (strftime('%s','now') * 1000), updatedAt integer NOT NULL DEFAULT (strftime('%s','now') * 1000)); CREATE UNIQUE INDEX IF NOT EXISTS IDX_messages_dedupe ON messages (dedupeKey); CREATE INDEX IF NOT EXISTS IDX_messages_user_read ON messages (userId, isRead, id); CREATE INDEX IF NOT EXISTS IDX_messages_user_type ON messages (userId, msgType, createdAt); CREATE INDEX IF NOT EXISTS IDX_messages_oa_retry ON messages (oaSendStatus, oaAttempts);"

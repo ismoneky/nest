@@ -3,6 +3,29 @@ import { Transform, Type } from 'class-transformer';
 import { TimeSlot, TravelMode, VehicleType } from '../../../entities/booking.entity';
 import { PassengerType } from '../passenger-pricing';
 
+/**
+ * 同行人手机号可不传：缺失时统一沿用首位联系人手机号。
+ * 只补空值，不覆盖同行人显式传入的手机号；首位仍由 PassengerDto 严格校验。
+ */
+export function inheritLeadPassengerPhone(passengers: unknown): unknown {
+    if (!Array.isArray(passengers) || passengers.length === 0) return passengers;
+
+    const lead = passengers[0];
+    const leadPhone = lead && typeof lead === 'object' ? (lead as { phone?: unknown }).phone : undefined;
+    if (typeof leadPhone !== 'string' || leadPhone.trim() === '') return passengers;
+
+    return passengers.map((passenger, index) => {
+        if (index === 0 || !passenger || typeof passenger !== 'object') return passenger;
+        const phone = (passenger as { phone?: unknown }).phone;
+        const phoneMissing = phone == null || (typeof phone === 'string' && phone.trim() === '');
+        if (!phoneMissing) return passenger;
+
+        // @Type(() => PassengerDto) 会先把数组项转成类实例；克隆时保留原型，
+        // 否则展开成普通对象后 ValidateNested 会把它判为 unknownValue。
+        return Object.assign(Object.create(Object.getPrototypeOf(passenger)), passenger, { phone: leadPhone });
+    });
+}
+
 export class PassengerDto {
     @IsString()
     @IsNotEmpty({ message: '姓名不能为空' })
@@ -39,6 +62,7 @@ export class PassengerDto {
  */
 export class CreateBookingDto {
     /** 出行人员列表，数量须与 personCount 一致 */
+    @Transform(({ value }) => inheritLeadPassengerPhone(value))
     @IsArray()
     @ArrayMinSize(1, { message: '至少填写一名出行人员' })
     @ValidateNested({ each: true })
