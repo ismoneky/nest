@@ -2363,15 +2363,40 @@ export class BookingService {
      * @param bookingId 订单ID
      * @param openid 操作者 openid（核销员，写入 verifiedBy 留痕）
      */
+    private verificationFailureReason(booking: Booking | null): string | null {
+        if (!booking) return '订单不存在，请确认二维码或订单号是否正确';
+        if (booking.refundStatus === RefundStatus.REFUNDED || booking.paymentStatus === PaymentStatus.REFUNDED || booking.status === BookingStatus.REFUNDED) {
+            return '订单已退款，核验码已失效，无法入场';
+        }
+        if (booking.refundStatus === RefundStatus.REFUNDING || booking.paymentStatus === PaymentStatus.REFUNDING) {
+            return '订单退款中，核验码已失效，无法入场';
+        }
+        const reasons: Partial<Record<BookingStatus, string>> = {
+            [BookingStatus.COMPLETED]: '订单已核销，请勿重复放行',
+            [BookingStatus.EXPIRED]: '订单已过期，无法入场',
+            [BookingStatus.CANCELLED]: '订单已取消，核验码已失效，无法入场',
+            [BookingStatus.PENDING]: '订单未支付，无法核验入场',
+        };
+        return booking.status === BookingStatus.CONFIRMED ? null : reasons[booking.status] || '订单当前状态不可核验，请查询订单详情';
+    }
+
     async verifyBooking(bookingId: string, openid: string) {
         const admin = await this.adminApplicationRepository.findApprovedByOpenid(openid);
         if (!admin) {
             throw new ForbiddenException('无核验权限');
         }
 
-        const booking = await this.bookingRepository.getBookingById(bookingId);
-
-        if (booking.status !== BookingStatus.CONFIRMED) {
+        let booking: Booking;
+        try {
+            booking = await this.bookingRepository.getBookingById(bookingId);
+        } catch (error) {
+            if (error instanceof NotFoundException) {
+                throw new NotFoundException('订单不存在，请确认二维码或订单号是否正确');
+            }
+            throw error;
+        }
+        const failureReason = this.verificationFailureReason(booking);
+        if (failureReason) {
             // 记录点：核验失败（日志失败不影响业务结果）
             this.loggingService.write({
                 source: AppLogSource.BACKEND,
@@ -2379,9 +2404,9 @@ export class BookingService {
                 category: AppLogCategory.BOOKING,
                 message: '预约核验失败',
                 route: `/bookings/${bookingId}/verify`,
-                context: { bookingId, currentStatus: booking.status },
+                context: { bookingId, currentStatus: booking?.status, refundStatus: booking?.refundStatus },
             });
-            throw new BadRequestException(`订单状态不可核验，当前状态：${booking.status}`);
+            throw new BadRequestException(failureReason);
         }
 
         const affected = await this.bookingRepository.markVerified(bookingId, openid, Date.now());
@@ -2394,9 +2419,9 @@ export class BookingService {
                 category: AppLogCategory.BOOKING,
                 message: '预约核验失败',
                 route: `/bookings/${bookingId}/verify`,
-                context: { bookingId, currentStatus: fresh.status, reason: 'conditional-update-missed' },
+                context: { bookingId, currentStatus: fresh?.status, refundStatus: fresh?.refundStatus, reason: 'conditional-update-missed' },
             });
-            throw new BadRequestException(`订单状态不可核验，当前状态：${fresh.status}`);
+            throw new BadRequestException(this.verificationFailureReason(fresh) || '订单状态已变化，未能完成核验，请重新查询后再试');
         }
 
         // 记录点：核验成功（含核销员，便于核销故障统计与追责）

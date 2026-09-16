@@ -240,6 +240,58 @@ describe('T1 过期扫描与核销互斥', () => {
     });
 
     describe('markVerified 留痕与互斥', () => {
+        it.each([
+            [BookingStatus.CONFIRMED, RefundStatus.REFUNDING, '退款中'],
+            [BookingStatus.REFUNDED, RefundStatus.REFUNDED, '已退款'],
+            [BookingStatus.COMPLETED, RefundStatus.NONE, '已核销'],
+            [BookingStatus.EXPIRED, RefundStatus.NONE, '已过期'],
+            [BookingStatus.CANCELLED, RefundStatus.NONE, '已取消'],
+            [BookingStatus.PENDING, RefundStatus.NONE, '未支付'],
+        ])('核销拒绝返回明确中文原因：%s/%s', async (status, refundStatus, reason) => {
+            const b = await seed(TODAY, { status: status as BookingStatus, refundStatus: refundStatus as RefundStatus });
+            const verifier = new BookingService(repo, null as any, null as any,
+                { findApprovedByOpenid: async () => ({}) } as any,
+                null as any, null as any, null as any,
+                { write: async () => {} } as any, null as any, null as any);
+            await expect(verifier.verifyBooking(b.bookingId, 'openid-staff')).rejects.toThrow(reason);
+        });
+
+        it.each([RefundStatus.REFUNDING, RefundStatus.REFUNDED])('退款状态 %s 不可核销，即使 status 仍是 confirmed', async (refundStatus) => {
+            const b = await seed(TODAY, { refundStatus });
+            expect(await repo.markVerified(b.bookingId, 'openid-staff', Date.now())).toBe(0);
+            expect(await statusOf(b.bookingId)).toBe(BookingStatus.CONFIRMED);
+        });
+
+        it('退款先落库，后续核销必须失败', async () => {
+            const b = await seed(TODAY);
+            expect(await repo.markRefundStarting(b.bookingId, 'RF-TEST', Date.now())).toBe(1);
+            expect(await repo.markVerified(b.bookingId, 'openid-staff', Date.now())).toBe(0);
+        });
+
+        it('核销先落库，后续退款必须失败', async () => {
+            const b = await seed(TODAY);
+            expect(await repo.markVerified(b.bookingId, 'openid-staff', Date.now())).toBe(1);
+            expect(await repo.markRefundStarting(b.bookingId, 'RF-VERIFIED', Date.now())).toBe(0);
+        });
+
+        it.each([true, false])('并发退款和核销只允许一个成功（refundFirst=%s）', async (refundFirst) => {
+            const b = await seed(TODAY);
+            const refund = () => repo.markRefundStarting(b.bookingId, 'RF-RACE', Date.now());
+            const verify = () => repo.markVerified(b.bookingId, 'openid-staff', Date.now());
+            const results = await Promise.all(refundFirst ? [refund(), verify()] : [verify(), refund()]);
+            expect(results.reduce((sum, affected) => sum + affected, 0)).toBe(1);
+            const after = await bookingRepo.findOne({ where: { bookingId: b.bookingId } });
+            expect(after!.status === BookingStatus.COMPLETED && after!.refundStatus === RefundStatus.REFUNDING).toBe(false);
+        });
+
+        it('不存在的订单返回明确中文提示', async () => {
+            const verifier = new BookingService(repo, null as any, null as any,
+                { findApprovedByOpenid: async () => ({}) } as any,
+                null as any, null as any, null as any,
+                { write: async () => {} } as any, null as any, null as any);
+            await expect(verifier.verifyBooking('TL-MISSING', 'openid-staff')).rejects.toThrow('订单不存在');
+        });
+
         it('核销写入 verifiedAt / verifiedBy', async () => {
             const b = await seed(TODAY);
             const now = Date.now();

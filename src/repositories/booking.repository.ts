@@ -539,8 +539,8 @@ export class BookingRepository {
      * 若核销在 T1 之后落地，会把已过期的订单又写回 `completed`——
      * 等价于一次**绕过审核的补核销**，而 Q2 明确不允许补核销（§4.1.1）。
      *
-     * 只要求 `status='confirmed'`，与改动前 `verifyBooking` 的前置校验等价，
-     * 不引入新的限制条件（如 paymentStatus / refundStatus），避免改变既有可核销范围。
+     * 要求 confirmed 且未处于退款中/已退款。与 markRefundStarting 在同一个
+     * 条件 UPDATE 临界区互斥，避免退款已发起但仍被放行。
      *
      * @param bookingId 订单ID
      * @param verifierOpenid 核销人 openid（留痕；改动前日志 context 里不含核销人）
@@ -558,6 +558,12 @@ export class BookingRepository {
             })
             .where('bookingId = :bookingId', { bookingId })
             .andWhere('status = :status', { status: BookingStatus.CONFIRMED })
+            .andWhere('refundStatus IN (:...verifiableRefundStatuses)', {
+                verifiableRefundStatuses: [RefundStatus.NONE, RefundStatus.FAILED],
+            })
+            .andWhere('paymentStatus NOT IN (:...blockedPaymentStatuses)', {
+                blockedPaymentStatuses: [PaymentStatus.REFUNDING, PaymentStatus.REFUNDED],
+            })
             .execute()).affected ?? 0);
     }
 
