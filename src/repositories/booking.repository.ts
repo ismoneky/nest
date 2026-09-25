@@ -17,6 +17,25 @@ import { MESSAGE_QUIET_WINDOW_MS } from '../modules/message/message-policy';
 export type ReconcileKind = 'payment' | 'refund' | 'close';
 
 /**
+ * 占用当日名额的订单状态（容量口径的唯一事实来源，`getBookingStatsByDate` 专用）。
+ *
+ * 三态各有理由：
+ *  - `pending`   已下单未支付，额度先占住，避免并发下超卖
+ *  - `confirmed` 已支付未到场
+ *  - `completed` **已核销**（2026-09-13 起语义收窄，唯一写入方是 `markVerified`）——
+ *                车真的开进去了，必然占名额。漏掉它的后果是「越核销、名额越多」，
+ *                而且因为 `createBooking` 的容量校验同源，会直接导致超卖。
+ *
+ * 其余状态一律释放名额：`cancelled` / `expired` / `refunded` 都是「这单不来了」，
+ * 对应 `markExpired` 注释里写明的「当天名额会释放」语义。
+ */
+export const ACTIVE_CAPACITY_STATUSES: BookingStatus[] = [
+    BookingStatus.PENDING,
+    BookingStatus.CONFIRMED,
+    BookingStatus.COMPLETED,
+];
+
+/**
  * 预约订单数据访问层
  *
  * 转换协议原则：Repository 只提供带期望状态条件的原子更新（返回 affected rows），
@@ -188,9 +207,15 @@ export class BookingRepository {
     }
 
     /**
-     * 统计指定日期的预约人数 (按时间段分组)
+     * 统计指定日期的预约单量 / 人数 (按时间段分组)
+     *
+     * 两个口径同时返回，调用方按需取：
+     *  - `bookingCount` = `COUNT(*)`，**单量**，容量上限走这个（后台标签是「最大预约单量」）
+     *  - `totalPeople`  = `SUM(personCount)`，人数，仅用于展示类统计
+     * 只统计 `ACTIVE_CAPACITY_STATUSES` 里的状态，口径说明见该常量。
+     *
      * @param bookingDate 预约日期 (YYYY-MM-DD)
-     * @returns 各时间段的预约人数统计
+     * @returns 各时间段的单量与人数统计
      */
     async getBookingStatsByDate(bookingDate: string) {
         try {
@@ -208,7 +233,7 @@ export class BookingRepository {
                 .where('booking.bookingDate >= :date', { date: dateStr })
                 .andWhere('booking.bookingDate <= :nextDate', { nextDate: dateStr })
                 .andWhere('booking.timeSlot = :timeSlot', { timeSlot: 'morning' })
-                .andWhere('booking.status IN (:...activeStatuses)', { activeStatuses: ['pending', 'confirmed'] })
+                .andWhere('booking.status IN (:...activeStatuses)', { activeStatuses: ACTIVE_CAPACITY_STATUSES })
                 .getRawOne();
 
             // 查询下午的统计
@@ -219,7 +244,7 @@ export class BookingRepository {
                 .where('booking.bookingDate >= :date', { date: dateStr })
                 .andWhere('booking.bookingDate <= :nextDate', { nextDate: dateStr })
                 .andWhere('booking.timeSlot = :timeSlot', { timeSlot: 'afternoon' })
-                .andWhere('booking.status IN (:...activeStatuses)', { activeStatuses: ['pending', 'confirmed'] })
+                .andWhere('booking.status IN (:...activeStatuses)', { activeStatuses: ACTIVE_CAPACITY_STATUSES })
                 .getRawOne();
 
             return {

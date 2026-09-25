@@ -68,12 +68,13 @@ describe('getTodayQuotaOverview（今日名额概览）', () => {
         morningMaxPeople: number;
         afternoonMaxPeople: number;
         quotaDisplayThresholdPercent?: number;
+        quotaAlertThresholdPercent?: number;
     };
 
     let seq = 0;
-    const seed = async (overrides: Partial<Booking> = {}) => {
+    const rowOf = (overrides: Partial<Booking> = {}) => {
         seq += 1;
-        await bookingRepo.insert({
+        return {
             bookingId: `TQ${String(seq).padStart(8, '0')}`,
             wechatOpenId: 'user-default',
             passengers: '[]',
@@ -90,7 +91,22 @@ describe('getTodayQuotaOverview（今日名额概览）', () => {
             createdAt: new Date(),
             updatedAt: new Date(),
             ...overrides,
-        } as any);
+        } as any;
+    };
+
+    const seed = async (overrides: Partial<Booking> = {}) => {
+        await bookingRepo.insert(rowOf(overrides));
+    };
+
+    /**
+     * 批量造 N 张单。
+     *
+     * ⚠️ 容量口径是【单量】（COUNT(*)），不是人数（SUM(personCount)）。所以想制造
+     * 「已约 90」必须真的插 90 行 —— 往一张单里塞 personCount: 90 在按单口径下只算 1 单，
+     * 那是改口径之前的写法，已经不能用了。
+     */
+    const seedMany = async (n: number, overrides: Partial<Booking> = {}) => {
+        await bookingRepo.insert(Array.from({ length: n }, () => rowOf(overrides)));
     };
 
     const setConfig = async (over: { freeQuotaEnabled?: boolean; freeQuotaLimit?: number } = {}) => {
@@ -191,23 +207,52 @@ describe('getTodayQuotaOverview（今日名额概览）', () => {
             expect(data.date).toBe(TODAY);
         });
 
-        it('1b. 展示阈值配置为 100% → 今日有剩余时始终下发精确数字', async () => {
+        it('1b. 展示阈值 100% + 紧张线 30% → 余量宽裕时是 ample，不是 limited', async () => {
+            // 运营要的是「总是显示余量」，不是「总是紧张」。这两个语义曾经捆在
+            // 同一个阈值上，导致剩 100/100 也被渲染成红色「仅剩 100 个名额」
             timeSlotLimit = {
                 morningMaxPeople: 100,
                 afternoonMaxPeople: 0,
                 quotaDisplayThresholdPercent: 100,
+                quotaAlertThresholdPercent: 30,
             };
 
             const data = await service.getTodayQuotaOverview();
 
-            expect(data.capacity).toEqual({ level: 'limited', remaining: 100 });
+            // 剩 100，紧张线是 30 —— 不紧张，但按展示阈值仍要给数字
+            expect(data.capacity).toEqual({ level: 'ample', remaining: 100 });
+        });
+
+        it('1c. 展示阈值 100% + 紧张线 30% → 余量跌破紧张线时才转 limited', async () => {
+            timeSlotLimit = {
+                morningMaxPeople: 100,
+                afternoonMaxPeople: 0,
+                quotaDisplayThresholdPercent: 100,
+                quotaAlertThresholdPercent: 30,
+            };
+            await seedMany(90); // 剩 10，而 10 <= 100 * 0.3
+
+            const data = await service.getTodayQuotaOverview();
+
+            expect(data.capacity).toEqual({ level: 'limited', remaining: 10 });
+        });
+
+        it('1d. 默认两档均为 30% → 与改动前行为一致（ample 不出现）', async () => {
+            timeSlotLimit = { morningMaxPeople: 100, afternoonMaxPeople: 0 };
+            await seedMany(90);
+
+            // 旧配置缺省下，展示阈值 = 紧张线 = 30%，展示区间整体属于紧张，
+            // 因此 ample 永远不会出现 —— 这就是「向后兼容」的具体含义
+            const data = await service.getTodayQuotaOverview();
+
+            expect(data.capacity).toEqual({ level: 'limited', remaining: 10 });
         });
 
         it('2. morning 60 + afternoon 30 → 剩余 10（两桶必须相加）', async () => {
             // 最容易漏的一条：上下午概念已废弃，新单都是 morning，
             // 但历史数据里 afternoon 桶仍有记录，漏加会高估剩余、并在下单时被后端打回
-            await seed({ timeSlot: TimeSlot.MORNING, personCount: 60 });
-            await seed({ timeSlot: TimeSlot.AFTERNOON, personCount: 30 });
+            await seedMany(60, { timeSlot: TimeSlot.MORNING });
+            await seedMany(30, { timeSlot: TimeSlot.AFTERNOON });
 
             const data = await service.getTodayQuotaOverview();
 
@@ -216,31 +261,59 @@ describe('getTodayQuotaOverview（今日名额概览）', () => {
         });
 
         it('3. 超卖 → 剩余钳到 0 而非负数，且为「已满」', async () => {
-            await seed({ personCount: 120 });
+            await seedMany(120);
 
             const data = await service.getTodayQuotaOverview();
 
             expect(data.capacity).toEqual({ level: 'full' });
         });
 
-        it('4. cancelled / refunded 不计入已约人数', async () => {
-            await seed({ personCount: 90 });
-            await seed({ personCount: 50, status: BookingStatus.CANCELLED });
-            await seed({ personCount: 50, status: BookingStatus.REFUNDED, refundStatus: RefundStatus.REFUNDED });
+        it('4. cancelled / refunded 不计入已约单量', async () => {
+            await seedMany(90);
+            await seedMany(50, { status: BookingStatus.CANCELLED });
+            await seedMany(50, { status: BookingStatus.REFUNDED, refundStatus: RefundStatus.REFUNDED });
 
             const data = await service.getTodayQuotaOverview();
 
             expect(data.capacity.remaining).toBe(10);
         });
 
+        it('4b. completed（已核销）必须计入 —— 漏掉它会「越核销名额越多」', async () => {
+            // completed 严格等于「已核销」（2026-09-13 起唯一写入方是 markVerified）。
+            // 车真的开进去了却不占名额，是反向的：核销得越多、显示的名额越多，
+            // 而且下单容量校验同源，会直接导致超卖
+            await seedMany(90, { status: BookingStatus.COMPLETED });
+            await seedMany(50, { status: BookingStatus.CANCELLED });
+
+            const data = await service.getTodayQuotaOverview();
+
+            expect(data.capacity.remaining).toBe(10); // 只有 cancelled 那 50 张释放
+        });
+
         it('5. 昨日 / 明日订单不计入（锁住 SQLite 纯日期字符串比较）', async () => {
-            await seed({ personCount: 90 });
-            await seed({ bookingDate: YESTERDAY as any, personCount: 50 });
-            await seed({ bookingDate: TOMORROW as any, personCount: 50 });
+            await seedMany(90);
+            await seedMany(50, { bookingDate: YESTERDAY as any });
+            await seedMany(50, { bookingDate: TOMORROW as any });
 
             const data = await service.getTodayQuotaOverview();
 
             expect(data.capacity.remaining).toBe(10);
+        });
+
+        it('5b. 容量按【单】不按【人】：一张单塞 5 个人也只占 1 个额度', async () => {
+            timeSlotLimit = {
+                morningMaxPeople: 100,
+                afternoonMaxPeople: 0,
+                quotaDisplayThresholdPercent: 100,
+                quotaAlertThresholdPercent: 30,
+            };
+            await seed({ personCount: 5 });
+            await seed({ personCount: 5 });
+
+            const data = await service.getTodayQuotaOverview();
+
+            // 若是按人口径，这里会是 90；口径改了之后必须锁死这个数字
+            expect(data.capacity).toEqual({ level: 'ample', remaining: 98 });
         });
     });
 
@@ -258,7 +331,7 @@ describe('getTodayQuotaOverview（今日名额概览）', () => {
 
         it('6. freeQuotaEnabled=false → enabled=false，容量行不受影响', async () => {
             await setConfig({ freeQuotaEnabled: false });
-            await seed({ personCount: 90 });
+            await seedMany(90);
 
             const data = await service.getTodayQuotaOverview();
 

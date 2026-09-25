@@ -28,6 +28,13 @@ export class TimeSlotLimitDto {
     @Min(0)
     @Max(100)
     quotaDisplayThresholdPercent?: number;
+
+    /** 名额开始视为紧张（红色「仅剩」）的百分比；可选以兼容旧管理端 */
+    @IsOptional()
+    @IsInt()
+    @Min(0)
+    @Max(100)
+    quotaAlertThresholdPercent?: number;
 }
 
 /**

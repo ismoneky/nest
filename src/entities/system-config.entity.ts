@@ -16,8 +16,16 @@ export interface TimeSlotLimit {
     morningMaxPeople: number;
     /** 下午最大预约人数 */
     afternoonMaxPeople: number;
-    /** 剩余人数低于或等于该百分比时，下发精确剩余名额；旧配置缺省为 30 */
+    /** 剩余单量低于或等于该百分比时，下发精确剩余名额；旧配置缺省为 30 */
     quotaDisplayThresholdPercent?: number;
+    /**
+     * 剩余单量低于或等于该百分比时视为「紧张」，小程序用红色「仅剩」措辞；
+     * 旧配置缺省为 30。
+     *
+     * 与 quotaDisplayThresholdPercent 是两件事：前者管「要不要给数字」，
+     * 本项管「给了数字要不要报警」。本值大于前者时前者失效（整个展示区间都算紧张）。
+     */
+    quotaAlertThresholdPercent?: number;
 }
 
 /**

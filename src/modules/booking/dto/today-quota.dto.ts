@@ -8,12 +8,13 @@
  * 「已约人数」默认不出网。而「剩余名额」全天轮询的首尾差值就等于当天的
  * 已约人数，根本不需要知道总量。故本接口默认采取「充足时不下发任何数字」：
  * 观察者拿不到基线，减法失效。
- * 后台可显式将展示阈值调到 100%，此时代表运营选择全程公开精确余量。
+ * 后台可显式将展示阈值调到 100%，此时代表运营选择全程公开精确余量 —— 该阈值下
+ * 档位恒定落在 'ample'（不紧张）或 'limited'（紧张），两者都下发 remaining。
  *
  * 因此：
- *  - capacity 里【禁止新增】total / maxPeople / currentPeople / bookedPeople / bookingCount
- *    —— 「已约人数 = 总限额 − 剩余」，返回总限额等于把已约人数直接送出去
- *  - level='plenty' 时【禁止】带上 remaining —— 这是刻意不给，不是疏漏
+ *  - capacity 里【禁止新增】total / maxOrders / currentOrders / bookedPeople / bookingCount
+ *    —— 「已约单量 = 总限额 − 剩余」，返回总限额等于把已约单量直接送出去
+ *  - level='plenty' 与 'full' 时【禁止】带上 remaining —— 这是刻意不给，不是疏漏
  *  - freeQuota 不返回 used —— 它可由 limit − remaining 推出，返回没有收益
  *  - freeQuota.remaining 精确下发是安全的：免费人数必须与「已约人数」配对才能算出
  *    付费人数，而已约人数已不可得
@@ -22,9 +23,17 @@ export interface TodayQuotaOverview {
     /** 服务端认定的「今天」（北京时间 YYYY-MM-DD），供前端跨天检测与「今天」判定 */
     date: string;
     capacity: {
-        level: 'plenty' | 'limited' | 'full';
         /**
-         * 仅 level='limited' 时存在；'plenty' 时刻意不下发
+         * 四档，含义与前端呈现一一对应（判定见 BookingService.buildCapacityLevel）：
+         *  - 'plenty'  充裕到无需报数 —— 不下发 remaining，前端整行不渲染
+         *  - 'ample'   宽裕，可报数   —— 前端中性色「今日剩余 N 个名额」
+         *  - 'limited' 紧张           —— 前端红色「今日仅剩 N 个名额」
+         *  - 'full'    已满           —— 前端红色「今日名额已满」
+         * 'plenty' 必须保留：旧版小程序仍在线上跑，去掉会让它们的档位判断落空。
+         */
+        level: 'plenty' | 'ample' | 'limited' | 'full';
+        /**
+         * 仅 level='limited' / 'ample' 时存在；'plenty' 与 'full' 刻意不下发
          * @see 本文件顶部「安全边界」
          */
         remaining?: number;

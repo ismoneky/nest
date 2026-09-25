@@ -47,7 +47,7 @@ import { MessageType } from '../../entities/message.entity';
 const PAYMENT_PREPARATION_DEADLINE_MS = 22 * 1000;
 
 /**
- * 今日名额「紧张」阈值默认值。后台未保存该配置的历史数据沿用 30%。
+ * 今日名额「是否下发精确数字」的阈值默认值。后台未保存该配置的历史数据沿用 30%。
  *
  * 【为什么需要这个阈值】单价是公开的，故 已约人数 × 单价 ≈ 每日营收。而
  * 「剩余 = 总量 − 已约」，若一直下发精确剩余，任何人从当天 00:00 开始轮询、
@@ -56,6 +56,18 @@ const PAYMENT_PREPARATION_DEADLINE_MS = 22 * 1000;
  * 运营可在后台调整为 0–100；设为 100 表示明确接受该取舍，全程展示精确余量。
  */
 const DEFAULT_QUOTA_DISPLAY_THRESHOLD_PERCENT = 30;
+
+/**
+ * 今日名额「紧张」的阈值默认值，未保存该配置的历史数据沿用 30%。
+ *
+ * 【与展示阈值是两件事，刻意分开】展示阈值管「要不要给数字」，本阈值管
+ * 「给了数字要不要报警」。运营把展示阈值调到 100% 是为了「总是显示余量」，
+ * 不代表「总是紧张」—— 两者捆在一起时，剩 3800/4000 也会被渲染成红色「仅剩」。
+ *
+ * 判据排在展示阈值之内：剩余先落进展示区间，再按本阈值分 `limited` / `ample`。
+ * 因此若本值 > 展示阈值，`ample` 永不出现（整个展示区间都算紧张），这是运营的选择。
+ */
+const DEFAULT_QUOTA_ALERT_THRESHOLD_PERCENT = 30;
 
 /**
  * 今日名额概览的进程内缓存时长（5 秒）。
@@ -374,17 +386,19 @@ export class BookingService {
         // 车型人数上限（与 preview 共用同一校验，接口被直接调用时不可绕过）
         validatePassengerLimit(createBookingDto.passengers, createBookingDto.travelMode, createBookingDto.vehicleType);
 
-        // 检查预约人数是否超过限制
+        // 检查预约单量是否超过限制
         const timeSlotLimit = await this.systemConfigService.getTimeSlotLimit();
-        // 已废弃上下午概念，morningMaxPeople 即全天总限额
-        const maxPeople = timeSlotLimit.morningMaxPeople;
+        // 已废弃上下午概念，morningMaxPeople 即全天总限额（单位是【单】，不是人）
+        const maxOrders = timeSlotLimit.morningMaxPeople;
 
-        // 获取当前日期的已预约人数
+        // 获取当前日期的已预约单量。口径与「今日名额」接口完全同源（同一仓储方法），
+        // 用 bookingCount 而非 totalPeople —— 后台的标签是「最大预约单量」，
+        // 一张单 5 个人也只占 1 个额度
         const currentStats = await this.bookingRepository.getBookingStatsByDate(createBookingDto.bookingDate);
-        const currentPeople = currentStats.morning.totalPeople + currentStats.afternoon.totalPeople;
+        const currentOrders = currentStats.morning.bookingCount + currentStats.afternoon.bookingCount;
 
-        // 检查加上新预约的人数后是否超过限制
-        if (currentPeople + createBookingDto.personCount > maxPeople) {
+        // 检查加上本次这 1 单后是否超过限制
+        if (currentOrders + 1 > maxOrders) {
             // 记录点：容量不足（日志失败不影响业务结果）
             this.loggingService.write({
                 source: AppLogSource.BACKEND,
@@ -392,9 +406,9 @@ export class BookingService {
                 category: AppLogCategory.BOOKING,
                 message: '预约创建失败：容量不足',
                 route: '/bookings',
-                context: { bookingDate: createBookingDto.bookingDate, personCount: createBookingDto.personCount, currentPeople, maxPeople },
+                context: { bookingDate: createBookingDto.bookingDate, currentOrders, maxOrders },
             });
-            throw new BadRequestException(`该日期预约人数已达上限，当前剩余名额：${Math.max(0, maxPeople - currentPeople)}`);
+            throw new BadRequestException(`该日期预约单量已达上限，当前剩余名额：${Math.max(0, maxOrders - currentOrders)}`);
         }
 
         // 事务内：原子地判断免费资格并创建订单，避免并发下免费名额超卖
@@ -1008,15 +1022,19 @@ export class BookingService {
         }
 
         // 容量：与 createBooking 的容量校验完全同一口径。
-        // morningMaxPeople 即全天总限额（上下午概念已废弃），但历史数据里 afternoon 桶仍有
-        // 记录，必须两桶相加，否则会低估已约人数、高估剩余名额
+        // morningMaxPeople 即全天总单量限额（上下午概念已废弃），但历史数据里 afternoon 桶
+        // 仍有记录，必须两桶相加，否则会低估已约单量、高估剩余名额。
+        // 用 bookingCount（单量）而非 totalPeople（人数）—— 与下单容量校验同源，
+        // 且后台标签就是「最大预约单量」
         const timeSlotLimit = await this.systemConfigService.getTimeSlotLimit();
-        const maxPeople = timeSlotLimit.morningMaxPeople;
+        const maxOrders = timeSlotLimit.morningMaxPeople;
         const quotaDisplayThresholdPercent = timeSlotLimit.quotaDisplayThresholdPercent
             ?? DEFAULT_QUOTA_DISPLAY_THRESHOLD_PERCENT;
+        const quotaAlertThresholdPercent = timeSlotLimit.quotaAlertThresholdPercent
+            ?? DEFAULT_QUOTA_ALERT_THRESHOLD_PERCENT;
         const stats = await this.bookingRepository.getBookingStatsByDate(today);
-        const currentPeople = stats.morning.totalPeople + stats.afternoon.totalPeople;
-        const remaining = Math.max(0, maxPeople - currentPeople);
+        const currentOrders = stats.morning.bookingCount + stats.afternoon.bookingCount;
+        const remaining = Math.max(0, maxOrders - currentOrders);
 
         // 免费名额：与 preview / 下单共用同一私有方法（不传 openid，省掉一次用户维度查询）
         const paymentConfig = await this.systemConfigService.getPaymentConfig();
@@ -1024,15 +1042,12 @@ export class BookingService {
 
         const overview: TodayQuotaOverview = {
             date: today,
-            // 【禁止新增字段】total / maxPeople / currentPeople / bookedPeople / bookingCount：
-            // 「已约人数 = 总限额 − 剩余」，返回总限额等于把已约人数直接送出去。
-            // level='plenty' 时刻意不带 remaining —— 若一直下发精确剩余，任何人从当天 00:00
-            // 开始轮询、取首尾差值就等于当天的已约人数（见展示阈值配置说明）
-            capacity: remaining <= 0
-                ? { level: 'full' }
-                : remaining <= maxPeople * (quotaDisplayThresholdPercent / 100)
-                    ? { level: 'limited', remaining }
-                    : { level: 'plenty' },
+            // 【禁止新增字段】total / maxOrders / currentOrders / bookedPeople / bookingCount：
+            // 「已约单量 = 总限额 − 剩余」，返回总限额等于把已约单量直接送出去。
+            // 只有 limited / ample 带 remaining；full 到顶无需数字，plenty 刻意不带 ——
+            // 若一直下发精确剩余，任何人从当天 00:00 开始轮询、取首尾差值就等于当天的
+            // 已约单量（见展示阈值配置说明）
+            capacity: this.buildCapacityLevel(remaining, maxOrders, quotaDisplayThresholdPercent, quotaAlertThresholdPercent),
             freeQuota: {
                 enabled: freeQuota.enabled,
                 limit: freeQuota.limit,
@@ -1046,6 +1061,39 @@ export class BookingService {
             expireAt: Date.now() + TODAY_QUOTA_CACHE_MS,
         };
         return overview;
+    }
+
+    /**
+     * 名额档位判定（今日名额接口的唯一事实来源）
+     *
+     * 四档语义，小程序按档位决定文案与配色：
+     *  - `full`    已满，不带数字，红「今日名额已满」
+     *  - `limited` 紧张，带数字，红「今日仅剩 N 个名额」
+     *  - `ample`   宽裕，带数字，中性「今日剩余 N 个名额」
+     *  - `plenty`  充裕到无需报数，不带数字，整行不渲染
+     *
+     * 判定顺序不可调换：`limited` 必须先于 `ample`，否则紧张区间会被宽裕档吃掉。
+     * 两个阈值各自的含义见文件顶部的常量注释。
+     */
+    private buildCapacityLevel(
+        remaining: number,
+        maxOrders: number,
+        displayThresholdPercent: number,
+        alertThresholdPercent: number,
+    ): TodayQuotaOverview['capacity'] {
+        // 配置损坏时的退化路径：`timeSlotLimitJson` 里缺 morningMaxPeople 时
+        // maxOrders 是 undefined，remaining 随之变 NaN，而 NaN 与任何值比较都是 false，
+        // 会一路穿过下面两个判断落进 `ample`，把 NaN 当数字下发给小程序
+        // （渲染成「今日剩余 NaN 个名额」）。这里显式退回 `plenty` —— 宁可不说，
+        // 也不能说一个假数字。与改动前「缺配置 → plenty」的退化行为一致。
+        if (!Number.isFinite(maxOrders) || !Number.isFinite(remaining)) return { level: 'plenty' };
+        if (remaining <= 0) return { level: 'full' };
+        // 未进入展示区间：不给数字，观察者拿不到基线
+        if (remaining > maxOrders * (displayThresholdPercent / 100)) return { level: 'plenty' };
+        // 已进入展示区间，再按紧张线分档
+        return remaining <= maxOrders * (alertThresholdPercent / 100)
+            ? { level: 'limited', remaining }
+            : { level: 'ample', remaining };
     }
 
     /**

@@ -58,11 +58,15 @@ const ADULT_CARD = makeIdCard('19900101');
 const adult = (over: any = {}) => ({ name: '张三', phone: '13800000001', idCard: ADULT_CARD, ...over });
 
 /** admin/src/pages/system-config/index.tsx:106-123 的 payload，字段与嵌套形状逐字照抄 */
-const adminPayload = (morningMaxPeople: number, quotaDisplayThresholdPercent = 30) => ({
+const adminPayload = (
+    morningMaxPeople: number,
+    quotaDisplayThresholdPercent = 30,
+    quotaAlertThresholdPercent = 30,
+) => ({
     bookingEnabled: true,
     bookingDisabledMessage: '当前时间段暂不开放预约，请稍后再试',
     banners: [],
-    timeSlotLimit: { morningMaxPeople, afternoonMaxPeople: 0, quotaDisplayThresholdPercent },
+    timeSlotLimit: { morningMaxPeople, afternoonMaxPeople: 0, quotaDisplayThresholdPercent, quotaAlertThresholdPercent },
     paymentConfig: { paymentAmount: 0, freeQuotaEnabled: false, freeQuotaLimit: 100 },
     noticeConfig: { enabled: true, content: 'x' },
 });
@@ -77,9 +81,9 @@ describe('后台「今日最大预约单量」全链路', () => {
     let customBookingRepo: BookingRepository;
 
     let seq = 0;
-    const seedBooking = async (over: Partial<Booking> = {}) => {
+    const bookingRowOf = (over: Partial<Booking> = {}) => {
         seq += 1;
-        await bookingRepo.insert({
+        return {
             bookingId: `SC${String(seq).padStart(8, '0')}`,
             wechatOpenId: 'user-default',
             passengers: '[]',
@@ -94,15 +98,32 @@ describe('后台「今日最大预约单量」全链路', () => {
             createdAt: new Date(),
             updatedAt: new Date(),
             ...over,
-        } as any);
+        } as any;
+    };
+
+    const seedBooking = async (over: Partial<Booking> = {}) => {
+        await bookingRepo.insert(bookingRowOf(over));
+    };
+
+    /**
+     * 批量造 N 张单。
+     * ⚠️ 容量口径是【单量】（COUNT(*)）而不是人数 —— 想占掉 5 个额度必须真的插 5 行，
+     * 单张 `personCount: 5` 在按单口径下只算 1 单。
+     */
+    const seedBookings = async (n: number, over: Partial<Booking> = {}) => {
+        await bookingRepo.insert(Array.from({ length: n }, () => bookingRowOf(over)));
     };
 
     /** 模拟 admin 点保存：真实管道 + 真实控制器 */
-    const saveViaAdmin = async (morningMaxPeople: number, quotaDisplayThresholdPercent = 30) => {
-        const dto = await realPipe.transform(adminPayload(morningMaxPeople, quotaDisplayThresholdPercent), {
-            type: 'body',
-            metatype: UpdateSystemConfigDto,
-        });
+    const saveViaAdmin = async (
+        morningMaxPeople: number,
+        quotaDisplayThresholdPercent = 30,
+        quotaAlertThresholdPercent = 30,
+    ) => {
+        const dto = await realPipe.transform(
+            adminPayload(morningMaxPeople, quotaDisplayThresholdPercent, quotaAlertThresholdPercent),
+            { type: 'body', metatype: UpdateSystemConfigDto },
+        );
         const res: any = { status: jest.fn().mockReturnThis(), send: jest.fn().mockReturnThis() };
         await controller.updateConfig(dto, res);
         return res;
@@ -154,6 +175,9 @@ describe('后台「今日最大预约单量」全链路', () => {
     beforeEach(async () => {
         await bookingRepo.clear();
         await configRepo.clear();
+        // 「今日名额」有 5 秒进程内缓存，键只认日期、不认配置。跨用例不清会让上一条用例的
+        // 结果被下一条读到（表现为断言里的数字来自上一个用例，极难定位）
+        (bookingService as any).todayQuotaCache = null;
     });
 
     // ============ 第 1+2+3 环：写入 → 落库 → 读回 ============
@@ -176,6 +200,37 @@ describe('后台「今日最大预约单量」全链路', () => {
 
         expect(JSON.parse(await rawColumn()).quotaDisplayThresholdPercent).toBe(100);
         expect((await configService.getTimeSlotLimit()).quotaDisplayThresholdPercent).toBe(100);
+    });
+
+    it('A3. admin 保存紧张阈值 → 与展示阈值各自独立落库，不会被对方覆盖', async () => {
+        await configService.getConfig();
+
+        // 运营真正要的组合：总是显示余量（100%），但只在剩不到两成时才报警
+        await saveViaAdmin(37, 100, 20);
+
+        const raw = JSON.parse(await rawColumn());
+        expect(raw.quotaDisplayThresholdPercent).toBe(100);
+        expect(raw.quotaAlertThresholdPercent).toBe(20);
+
+        const readBack = await configService.getTimeSlotLimit();
+        expect(readBack.quotaDisplayThresholdPercent).toBe(100);
+        expect(readBack.quotaAlertThresholdPercent).toBe(20);
+    });
+
+    it('A4. 该组合端到端生效：余量充裕 → ample，跌破紧张线 → limited', async () => {
+        await configService.getConfig();
+        await saveViaAdmin(100, 100, 20);
+
+        // 剩 100/100 → 宽裕
+        const early = await bookingService.getTodayQuotaOverview();
+        expect(early.capacity).toEqual({ level: 'ample', remaining: 100 });
+
+        // 再占掉 85 单，剩 15 → 15 <= 100 * 0.2
+        (bookingService as any).todayQuotaCache = null;
+        await seedBookings(85);
+
+        const late = await bookingService.getTodayQuotaOverview();
+        expect(late.capacity).toEqual({ level: 'limited', remaining: 15 });
     });
 
     it('B. 反复保存取最后一次（不是「第一次生效、后续被默认值盖掉」）', async () => {
@@ -204,6 +259,12 @@ describe('后台「今日最大预约单量」全链路', () => {
         ).rejects.toBeInstanceOf(BadRequestException);
     });
 
+    it.each([-1, 101])('D3. 紧张阈值 %s%% 越界时被 DTO 拒绝', async (threshold) => {
+        await expect(
+            realPipe.transform(adminPayload(10, 30, threshold), { type: 'body', metatype: UpdateSystemConfigDto }),
+        ).rejects.toBeInstanceOf(BadRequestException);
+    });
+
     it.each([-1, 101])('D2. 展示阈值 %s%% 越界时被 DTO 拒绝', async (threshold) => {
         await expect(
             realPipe.transform(adminPayload(10, threshold), { type: 'body', metatype: UpdateSystemConfigDto }),
@@ -212,10 +273,10 @@ describe('后台「今日最大预约单量」全链路', () => {
 
     // ============ 第 4 环：真正的拦截点 ============
 
-    it('E. 限额 5、已有 5 人 → createBooking 必须抛「已达上限」', async () => {
+    it('E. 限额 5、已有 5 单 → createBooking 必须抛「已达上限」', async () => {
         await configService.getConfig();
         await saveViaAdmin(5);
-        await seedBooking({ personCount: 5 });
+        await seedBookings(5);
 
         await expect(
             bookingService.createBooking({
@@ -229,10 +290,10 @@ describe('后台「今日最大预约单量」全链路', () => {
         ).rejects.toThrow(/已达上限/);
     });
 
-    it('F. 限额 5、已有 4 人 → 放行（不能误伤）', async () => {
+    it('F. 限额 5、已有 4 单 → 放行（不能误伤）', async () => {
         await configService.getConfig();
         await saveViaAdmin(5);
-        await seedBooking({ personCount: 4 });
+        await seedBookings(4);
 
         // 放行后的路径会进事务并调用微信支付，这里只断言「没被容量判定拦下」
         const err = await bookingService
@@ -276,7 +337,7 @@ describe('后台「今日最大预约单量」全链路', () => {
     it('I. fctl 原样 payload 经真实管道 + 真实控制器 → 仍被拦下', async () => {
         await configService.getConfig();
         await saveViaAdmin(5);
-        await seedBooking({ personCount: 5 });
+        await seedBookings(5);
 
         // fctl/pages/booking-form/booking-form.vue:1275-1288 的 submitData 逐字照抄
         const fctlBody = {
@@ -356,16 +417,19 @@ describe('后台「今日最大预约单量」全链路', () => {
 
         const stats = await customBookingRepo.getBookingStatsByDate(today);
 
-        // 这行有 9 人，但统计看不见它 —— 字符串比较下 "2026-09-12T..." > "2026-09-12"，<= 不成立。
-        // 后果：currentPeople 恒偏小 → 限额迟迟不触发，且**不报任何错**。
+        // 这行统计看不见它 —— 字符串比较下 "2026-09-12T..." > "2026-09-12"，<= 不成立。
+        // 两个口径一起漏（容量走的是 bookingCount，不是 totalPeople，务必两条都断言）。
+        // 后果：currentOrders 恒偏小 → 限额迟迟不触发，且**不报任何错**。
+        expect(stats.morning.bookingCount).toBe(0);
         expect(stats.morning.totalPeople).toBe(0);
 
-        // 对照：同样的 9 人，日期是纯字符串时统计得到
+        // 对照：同样的行，日期是纯字符串时统计得到
         await seedBooking({ personCount: 9 });
+        expect((await customBookingRepo.getBookingStatsByDate(today)).morning.bookingCount).toBe(1);
         expect((await customBookingRepo.getBookingStatsByDate(today)).morning.totalPeople).toBe(9);
     });
 
-    it('L. 【生产排查用】上面的脏数据会让限额失效（限额 5 + 脏行 9 人 → 仍放行）', async () => {
+    it('L. 【生产排查用】上面的脏数据会让限额失效（限额 5 + 脏行 → 仍放行）', async () => {
         await configService.getConfig();
         await saveViaAdmin(5);
 
@@ -389,7 +453,7 @@ describe('后台「今日最大预约单量」全链路', () => {
             .then(() => null)
             .catch((e: Error) => e);
 
-        // 库里其实已有 9 人（限额 5），但因日期格式不匹配，判定算作 0 人 → 放行。
+        // 库里其实已有这一单（限额 5），但因日期格式不匹配，判定算作 0 单 → 放行。
         // 这就是「后台设置了限额却从来没拦住」在代码逻辑上唯一的可复现成因。
         expect(err === null || !/已达上限/.test(err.message)).toBe(true);
     });
@@ -420,12 +484,12 @@ describe('后台「今日最大预约单量」全链路', () => {
             .then(() => null)
             .catch((e: Error) => e);
 
-        // maxPeople === undefined ⇒ `currentPeople + personCount > undefined` ≡ false，
+        // maxOrders === undefined ⇒ `currentOrders + 1 > undefined` ≡ false，
         // 判定与 `> NaN` 等价，恒不成立 ⇒ 限额彻底失效，且日志里连一条 WARN 都不会有。
         expect(err === null || !/已达上限/.test(err.message)).toBe(true);
     });
 
-    it('N. 同一故障对「今日名额」接口同样成立（remaining 变 NaN → 永远显示充足）', async () => {
+    it('N. 同一故障对「今日名额」接口同样成立（配置缺失 → 退回 plenty，不下发 NaN）', async () => {
         await configRepo.save(
             configRepo.create({ configId: 'system_config', timeSlotLimitJson: '{"afternoonMaxPeople":0}' }),
         );
@@ -435,6 +499,10 @@ describe('后台「今日最大预约单量」全链路', () => {
 
         // 与下单口径一致地「一起坏」：页面显示充足，下单也确实不拦 —— 不会出现承诺违约，
         // 但整个限额能力静默归零，运营侧只会看到「设置了没用」。
+        //
+        // 这里必须锁死是 `plenty` 而不是 `ample`：maxOrders 为 undefined 时 remaining 是 NaN，
+        // 而 NaN 与任何值比较都是 false，会穿过两个阈值判断落进 `ample` 并把 NaN 下发出去。
+        // 那会让小程序渲染出「今日剩余 NaN 个名额」，比静默更糟。
         expect(overview.capacity).toEqual({ level: 'plenty' });
     });
 
