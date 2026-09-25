@@ -1,5 +1,5 @@
 import { Type } from 'class-transformer';
-import { IsArray, IsBoolean, IsInt, IsObject, IsOptional, IsString, IsUrl, Min, ValidateNested } from 'class-validator';
+import { IsArray, IsBoolean, IsInt, IsObject, IsOptional, IsString, IsUrl, Max, Min, ValidateNested } from 'class-validator';
 
 /**
  * 轮播图配置项 DTO
@@ -21,6 +21,13 @@ export class TimeSlotLimitDto {
     @IsInt()
     @Min(0)
     afternoonMaxPeople: number;
+
+    /** 精确剩余名额开始展示的百分比；可选以兼容旧管理端 */
+    @IsOptional()
+    @IsInt()
+    @Min(0)
+    @Max(100)
+    quotaDisplayThresholdPercent?: number;
 }
 
 /**

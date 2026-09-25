@@ -64,7 +64,11 @@ describe('getTodayQuotaOverview（今日名额概览）', () => {
     /** getPaymentConfig 需委托真实仓储，否则测试内对配置表的写入对接口不生效 */
     let configRepoRef: Repository<SystemConfig> | null = null;
     /** 每个用例可改的限额，用于把 remaining 推入 / 推出「紧张」区间 */
-    let timeSlotLimit: { morningMaxPeople: number; afternoonMaxPeople: number };
+    let timeSlotLimit: {
+        morningMaxPeople: number;
+        afternoonMaxPeople: number;
+        quotaDisplayThresholdPercent?: number;
+    };
 
     let seq = 0;
     const seed = async (overrides: Partial<Booking> = {}) => {
@@ -185,6 +189,18 @@ describe('getTodayQuotaOverview（今日名额概览）', () => {
             expect(data.capacity.level).toBe('plenty');
             expect(data.capacity).toEqual({ level: 'plenty' });
             expect(data.date).toBe(TODAY);
+        });
+
+        it('1b. 展示阈值配置为 100% → 今日有剩余时始终下发精确数字', async () => {
+            timeSlotLimit = {
+                morningMaxPeople: 100,
+                afternoonMaxPeople: 0,
+                quotaDisplayThresholdPercent: 100,
+            };
+
+            const data = await service.getTodayQuotaOverview();
+
+            expect(data.capacity).toEqual({ level: 'limited', remaining: 100 });
         });
 
         it('2. morning 60 + afternoon 30 → 剩余 10（两桶必须相加）', async () => {

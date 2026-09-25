@@ -58,11 +58,11 @@ const ADULT_CARD = makeIdCard('19900101');
 const adult = (over: any = {}) => ({ name: '张三', phone: '13800000001', idCard: ADULT_CARD, ...over });
 
 /** admin/src/pages/system-config/index.tsx:106-123 的 payload，字段与嵌套形状逐字照抄 */
-const adminPayload = (morningMaxPeople: number) => ({
+const adminPayload = (morningMaxPeople: number, quotaDisplayThresholdPercent = 30) => ({
     bookingEnabled: true,
     bookingDisabledMessage: '当前时间段暂不开放预约，请稍后再试',
     banners: [],
-    timeSlotLimit: { morningMaxPeople, afternoonMaxPeople: 0 },
+    timeSlotLimit: { morningMaxPeople, afternoonMaxPeople: 0, quotaDisplayThresholdPercent },
     paymentConfig: { paymentAmount: 0, freeQuotaEnabled: false, freeQuotaLimit: 100 },
     noticeConfig: { enabled: true, content: 'x' },
 });
@@ -98,8 +98,8 @@ describe('后台「今日最大预约单量」全链路', () => {
     };
 
     /** 模拟 admin 点保存：真实管道 + 真实控制器 */
-    const saveViaAdmin = async (morningMaxPeople: number) => {
-        const dto = await realPipe.transform(adminPayload(morningMaxPeople), {
+    const saveViaAdmin = async (morningMaxPeople: number, quotaDisplayThresholdPercent = 30) => {
+        const dto = await realPipe.transform(adminPayload(morningMaxPeople, quotaDisplayThresholdPercent), {
             type: 'body',
             metatype: UpdateSystemConfigDto,
         });
@@ -169,6 +169,15 @@ describe('后台「今日最大预约单量」全链路', () => {
         expect((await configService.getTimeSlotLimit()).morningMaxPeople).toBe(37);
     });
 
+    it('A2. admin 保存展示阈值 100% → 原始 JSON 与业务读回都保留 100', async () => {
+        await configService.getConfig();
+
+        await saveViaAdmin(37, 100);
+
+        expect(JSON.parse(await rawColumn()).quotaDisplayThresholdPercent).toBe(100);
+        expect((await configService.getTimeSlotLimit()).quotaDisplayThresholdPercent).toBe(100);
+    });
+
     it('B. 反复保存取最后一次（不是「第一次生效、后续被默认值盖掉」）', async () => {
         await configService.getConfig();
 
@@ -192,6 +201,12 @@ describe('后台「今日最大预约单量」全链路', () => {
     it('D. morningMaxPeople=0 会被 DTO 拒绝（@Min(1)），不会静默写成 0', async () => {
         await expect(
             realPipe.transform(adminPayload(0), { type: 'body', metatype: UpdateSystemConfigDto }),
+        ).rejects.toBeInstanceOf(BadRequestException);
+    });
+
+    it.each([-1, 101])('D2. 展示阈值 %s%% 越界时被 DTO 拒绝', async (threshold) => {
+        await expect(
+            realPipe.transform(adminPayload(10, threshold), { type: 'body', metatype: UpdateSystemConfigDto }),
         ).rejects.toBeInstanceOf(BadRequestException);
     });
 

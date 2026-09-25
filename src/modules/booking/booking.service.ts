@@ -47,16 +47,15 @@ import { MessageType } from '../../entities/message.entity';
 const PAYMENT_PREPARATION_DEADLINE_MS = 22 * 1000;
 
 /**
- * 今日名额「紧张」阈值：剩余 <= 总限额 × 本比例 时，接口才下发精确剩余数字。
+ * 今日名额「紧张」阈值默认值。后台未保存该配置的历史数据沿用 30%。
  *
  * 【为什么需要这个阈值】单价是公开的，故 已约人数 × 单价 ≈ 每日营收。而
  * 「剩余 = 总量 − 已约」，若一直下发精确剩余，任何人从当天 00:00 开始轮询、
  * 取首尾差值就等于当天的已约人数 —— 根本不需要知道总量。
  * 只在剩余偏低时才给数字，观察者拿不到当日基线，减法失效。
- *
- * 日后如需调整口径，可提升为后台配置项。
+ * 运营可在后台调整为 0–100；设为 100 表示明确接受该取舍，全程展示精确余量。
  */
-const QUOTA_TIGHT_RATIO = 0.3;
+const DEFAULT_QUOTA_DISPLAY_THRESHOLD_PERCENT = 30;
 
 /**
  * 今日名额概览的进程内缓存时长（5 秒）。
@@ -1013,6 +1012,8 @@ export class BookingService {
         // 记录，必须两桶相加，否则会低估已约人数、高估剩余名额
         const timeSlotLimit = await this.systemConfigService.getTimeSlotLimit();
         const maxPeople = timeSlotLimit.morningMaxPeople;
+        const quotaDisplayThresholdPercent = timeSlotLimit.quotaDisplayThresholdPercent
+            ?? DEFAULT_QUOTA_DISPLAY_THRESHOLD_PERCENT;
         const stats = await this.bookingRepository.getBookingStatsByDate(today);
         const currentPeople = stats.morning.totalPeople + stats.afternoon.totalPeople;
         const remaining = Math.max(0, maxPeople - currentPeople);
@@ -1026,10 +1027,10 @@ export class BookingService {
             // 【禁止新增字段】total / maxPeople / currentPeople / bookedPeople / bookingCount：
             // 「已约人数 = 总限额 − 剩余」，返回总限额等于把已约人数直接送出去。
             // level='plenty' 时刻意不带 remaining —— 若一直下发精确剩余，任何人从当天 00:00
-            // 开始轮询、取首尾差值就等于当天的已约人数（见 QUOTA_TIGHT_RATIO 注释）
+            // 开始轮询、取首尾差值就等于当天的已约人数（见展示阈值配置说明）
             capacity: remaining <= 0
                 ? { level: 'full' }
-                : remaining <= maxPeople * QUOTA_TIGHT_RATIO
+                : remaining <= maxPeople * (quotaDisplayThresholdPercent / 100)
                     ? { level: 'limited', remaining }
                     : { level: 'plenty' },
             freeQuota: {

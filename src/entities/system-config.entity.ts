@@ -16,6 +16,8 @@ export interface TimeSlotLimit {
     morningMaxPeople: number;
     /** 下午最大预约人数 */
     afternoonMaxPeople: number;
+    /** 剩余人数低于或等于该百分比时，下发精确剩余名额；旧配置缺省为 30 */
+    quotaDisplayThresholdPercent?: number;
 }
 
 /**
