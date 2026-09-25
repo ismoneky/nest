@@ -43,19 +43,22 @@ export enum MessageBizType {
 /**
  * 服务号（OA）模板消息发送状态
  *
- * 主流程 `OA_ENABLED=false`（默认）时恒为 `SKIPPED`——**站内信是记录层，服务号是触达层**，
- * 这一列的存在只是为了让服务号分支（独立分支 `feat/oa-template-message`）接进来时
- * 不必再改一次表结构（§4.6「主流程的保证」）。
+ * `OA_ENABLED=false`（默认）时新消息为 SKIPPED。启用时消息和渠道快照
+ * 一次落库，由 OaDeliveryService 独立消费，不影响业务调用链。
  */
 export enum OaSendStatus {
     /** 未处理（OA_ENABLED=true 时下轮重试会取到） */
     PENDING = 0,
-    /** 已送达 */
+    /** 微信接口已受理；无回调时不能证明送达或已读 */
     SENT = 1,
     /** 发送失败（`oaAttempts` 达上限后不再重试） */
     FAILED = 2,
     /** 已跳过（OA 未启用 / 用户未关注服务号） */
     SKIPPED = 3,
+    /** 已领取，正在投递 */
+    SENDING = 4,
+    /** 微信可能已受理，默认不自动重发 */
+    UNKNOWN = 5,
 }
 
 /**
@@ -80,6 +83,7 @@ export enum OaSendStatus {
 @Index('IDX_messages_user_read', ['userId', 'isRead', 'id'])
 @Index('IDX_messages_user_type', ['userId', 'msgType', 'createdAt'])
 @Index('IDX_messages_oa_retry', ['oaSendStatus', 'oaAttempts'])
+@Index('IDX_messages_oa_due', ['oaSendStatus', 'oaNextAttemptAt', 'id'])
 export class Message {
     @PrimaryGeneratedColumn()
     id: number;
@@ -146,6 +150,24 @@ export class Message {
 
     @Column({ type: 'varchar', nullable: true })
     oaLastError: string | null;
+
+    @Column({ type: 'text', nullable: true })
+    oaPayloadJson: string | null;
+
+    @Column({ type: 'integer', nullable: true })
+    oaNextAttemptAt: number | null;
+
+    @Column({ type: 'integer', nullable: true })
+    oaExpiresAt: number | null;
+
+    @Column({ type: 'varchar', nullable: true })
+    oaMsgId: string | null;
+
+    @Column({ type: 'varchar', nullable: true })
+    oaSkipReason: string | null;
+
+    @Column({ type: 'integer', nullable: true })
+    oaClaimedAt: number | null;
 
     /** 已读标记（SQLite 无 boolean，0/1） */
     @Column({ type: 'integer', default: 0 })

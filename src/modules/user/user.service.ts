@@ -5,7 +5,7 @@ import { UserRepository } from '../../repositories/user.repository';
 export class UserService {
     constructor(private readonly userRepository: UserRepository) {}
 
-    async findOrCreateUser(params: { wechatOpenId: string }) {
+    async findOrCreateUser(params: { wechatOpenId: string; wechatUnionId?: string }) {
         return await this.userRepository.findOrCreateUser(params);
     }
 }

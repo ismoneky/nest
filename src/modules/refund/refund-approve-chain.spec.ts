@@ -1,3 +1,4 @@
+import { WechatOaConfig } from '../wechat-oa/wechat-oa.config';
 import { Test } from '@nestjs/testing';
 import { TypeOrmModule, getRepositoryToken } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
@@ -71,6 +72,7 @@ describe('审核通过 → 退款发起（链路级）', () => {
                 RefundApplyRepository,
                 MessageRepository,
                 MessageService,
+                WechatOaConfig,
                 { provide: SystemConfigService, useValue: systemConfigStub },
             ],
         }).compile();

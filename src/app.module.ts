@@ -28,6 +28,8 @@ import { Member } from './entities/member.entity';
 import { BookingAnomaly } from './entities/booking-anomaly.entity';
 import { RefundApply } from './entities/refund-apply.entity';
 import { Message } from './entities/message.entity';
+import { WechatOaFan } from './entities/wechat-oa-fan.entity';
+import { WechatOaSyncRun } from './entities/wechat-oa-sync-run.entity';
 import { AppLog } from './entities/app-log.entity';
 import { LoggingModule } from './modules/logging/logging.module';
 import { HttpExceptionFilter } from './filters/http-exception.filter';
@@ -44,7 +46,7 @@ import { APP_FILTER } from '@nestjs/core';
             logging: process.env.DATABASE_LOGGING === 'true',
             // 没有 autoLoadEntities：实体必须在这里显式列出，漏了不会报错，
             // 只会在运行到那条查询时说「表不存在」
-            entities: [User, UserProfile, Admin, Booking, Announcement, SystemConfig, AdminApplication, Feedback, Member, BookingAnomaly, RefundApply, Message],
+            entities: [User, UserProfile, Admin, Booking, Announcement, SystemConfig, AdminApplication, Feedback, Member, BookingAnomaly, RefundApply, Message, WechatOaFan, WechatOaSyncRun],
             // busyTimeout：写锁冲突时等待 5 秒而非立即报错。
             // sqlite3 驱动只识别顶层 enableWAL/busyTimeout，extra.pragma 写法不生效
             // （此前 busy_timeout 实际为 0，2026-08-16 12:31 事务报错后修正，

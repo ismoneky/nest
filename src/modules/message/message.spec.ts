@@ -1,3 +1,4 @@
+import { WechatOaConfig } from '../wechat-oa/wechat-oa.config';
 import { Test } from '@nestjs/testing';
 import { TypeOrmModule, getRepositoryToken } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
@@ -46,7 +47,7 @@ describe('阶段 4 站内信', () => {
                 }),
                 TypeOrmModule.forFeature([Message]),
             ],
-            providers: [MessageRepository, MessageService],
+            providers: [MessageRepository, MessageService, WechatOaConfig],
         }).compile();
 
         service = moduleRef.get(MessageService);

@@ -7,7 +7,7 @@
  * - 超出键/数组/字符串限制时截断并置 truncated=true
  * - 最终 contextJson 最多 8 KiB（超限时逐轮截短最长字符串，仍超则只保留截断标记）
  * - 过滤字段名：authorization / token / password / secret / key（含常见变体）/
- *   idCard / phone / openid / wechatOpenId
+ *   idCard / phone / openid / wechatOpenId / unionid
  */
 
 const MAX_DEPTH = 5;
@@ -20,7 +20,7 @@ const MAX_CONTEXT_BYTES = 8 * 1024;
  * 敏感键名判定：小写键名包含敏感词，或匹配 key 的常见变体
  * （key 用变体正则避免误伤 keyword / bookingKey 等普通键）
  */
-const SENSITIVE_KEY_PATTERNS = ['authorization', 'token', 'password', 'secret', 'idcard', 'phone', 'openid', 'wechatopenid'];
+const SENSITIVE_KEY_PATTERNS = ['authorization', 'token', 'password', 'secret', 'idcard', 'phone', 'openid', 'wechatopenid', 'unionid'];
 const KEY_VARIANT_REGEX = /^(key|(api|app|private|public|merchant|secret|access|pay)[_-]?key)$/;
 
 function isSensitiveKey(key: string): boolean {

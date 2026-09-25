@@ -1,3 +1,4 @@
+import { WechatOaConfig } from '../wechat-oa/wechat-oa.config';
 import { Test } from '@nestjs/testing';
 import { TypeOrmModule, getRepositoryToken } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
@@ -84,7 +85,7 @@ describe('阶段 4 扫描类通知（T1 ② / T2）', () => {
                 }),
                 TypeOrmModule.forFeature([Booking, BookingAnomaly, Message]),
             ],
-            providers: [BookingRepository, MessageRepository, MessageService],
+            providers: [BookingRepository, MessageRepository, MessageService, WechatOaConfig],
         }).compile();
 
         bookingRepository = moduleRef.get(BookingRepository);

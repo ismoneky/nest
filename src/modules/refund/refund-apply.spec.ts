@@ -1,3 +1,4 @@
+import { WechatOaConfig } from '../wechat-oa/wechat-oa.config';
 import { Test } from '@nestjs/testing';
 import { TypeOrmModule, getRepositoryToken } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
@@ -72,6 +73,7 @@ describe('阶段 3 退款申请与审核', () => {
                 // 正是要测的东西（见文件末尾的「退款流程的站内信」）。
                 MessageRepository,
                 MessageService,
+                WechatOaConfig,
                 { provide: SystemConfigService, useValue: systemConfigStub },
             ],
         }).compile();

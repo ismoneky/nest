@@ -5,12 +5,15 @@ import { MessageRepository } from '../../repositories/message.repository';
 import { MessageService } from './message.service';
 import { MessageController } from './message.controller';
 import { UserModule } from '../user/user.module';
+import { WechatOaModule } from '../wechat-oa/wechat-oa.module';
+import { OaDeliveryRepository } from '../../repositories/oa-delivery.repository';
+import { OaDeliveryService } from './oa-delivery.service';
 
 /**
  * 站内信模块（阶段 4）
  *
  * ── 叶子模块：不 import 任何业务模块 ──────────────────────────────────────
- * 与 `RefundModule` 同款设计。本模块只认 `Message` 一张表，
+ * 与 `RefundModule` 同款设计。本模块负责 `Message` 表，OA 身份/HTTP 由 WechatOaModule 提供；
  * 发消息需要的一切业务数据（订单号、申请单号、金额、驳回理由……）
  * 都由**调用方**读好后作为参数传进来。
  *
@@ -40,9 +43,9 @@ import { UserModule } from '../user/user.module';
  * 让 AdminModule 与 MemberModule 双双起不来（见 implementation-todo.md 实现说明）。
  */
 @Module({
-    imports: [TypeOrmModule.forFeature([Message]), UserModule],
+    imports: [TypeOrmModule.forFeature([Message]), UserModule, WechatOaModule],
     controllers: [MessageController],
-    providers: [MessageService, MessageRepository],
+    providers: [MessageService, MessageRepository, OaDeliveryRepository, OaDeliveryService],
     exports: [MessageService],
 })
 export class MessageModule {}

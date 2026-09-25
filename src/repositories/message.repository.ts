@@ -76,6 +76,10 @@ export class MessageRepository {
         senderType?: string;
         adminId?: number | null;
         oaSendStatus?: number;
+        oaPayloadJson?: string | null;
+        oaNextAttemptAt?: number | null;
+        oaExpiresAt?: number | null;
+        oaSkipReason?: string | null;
     }): Promise<{ message: Message | null; created: boolean }> {
         const now = new Date();
         try {
@@ -99,6 +103,10 @@ export class MessageRepository {
                         senderType: data.senderType,
                         adminId: data.adminId ?? null,
                         oaSendStatus: data.oaSendStatus,
+                        oaPayloadJson: data.oaPayloadJson ?? null,
+                        oaNextAttemptAt: data.oaNextAttemptAt ?? null,
+                        oaExpiresAt: data.oaExpiresAt ?? null,
+                        oaSkipReason: data.oaSkipReason ?? null,
                         oaAttempts: 0,
                         isRead: 0,
                         createdAt: now,

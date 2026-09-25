@@ -1,0 +1,49 @@
+{
+  "version": 1,
+  "templates": {
+    "ORDER_EXPIRE_REMINDER": {
+      "templateId": "REPLACE_WITH_ORDER_REMINDER_TEMPLATE_ID",
+      "fields": {
+        "REPLACE_ORDER_KEY": { "source": "bookingId", "maxLength": 32 },
+        "REPLACE_STATUS_KEY": { "source": "status", "maxLength": 20 },
+        "REPLACE_TIME_KEY": { "source": "eventTime", "maxLength": 19 }
+      }
+    },
+    "ORDER_EXPIRED": {
+      "templateId": "REPLACE_WITH_ORDER_EXPIRED_TEMPLATE_ID",
+      "fields": {
+        "REPLACE_ORDER_KEY": { "source": "bookingId", "maxLength": 32 },
+        "REPLACE_STATUS_KEY": { "source": "status", "maxLength": 20 }
+      }
+    },
+    "REFUND_ACCEPTED": {
+      "templateId": "REPLACE_WITH_REFUND_ACCEPTED_TEMPLATE_ID",
+      "fields": {
+        "REPLACE_APPLY_KEY": { "source": "bizNo", "maxLength": 32 },
+        "REPLACE_STATUS_KEY": { "source": "status", "maxLength": 20 }
+      }
+    },
+    "REFUND_APPROVED": {
+      "templateId": "REPLACE_WITH_REFUND_APPROVED_TEMPLATE_ID",
+      "fields": {
+        "REPLACE_APPLY_KEY": { "source": "bizNo", "maxLength": 32 },
+        "REPLACE_STATUS_KEY": { "source": "status", "maxLength": 20 }
+      }
+    },
+    "REFUND_REJECTED": {
+      "templateId": "REPLACE_WITH_REFUND_REJECTED_TEMPLATE_ID",
+      "fields": {
+        "REPLACE_APPLY_KEY": { "source": "bizNo", "maxLength": 32 },
+        "REPLACE_REASON_KEY": { "source": "rejectReason", "maxLength": 20 }
+      }
+    },
+    "REFUND_SUCCESS": {
+      "templateId": "REPLACE_WITH_REFUND_SUCCESS_TEMPLATE_ID",
+      "fields": {
+        "REPLACE_APPLY_KEY": { "source": "bizNo", "maxLength": 32 },
+        "REPLACE_AMOUNT_KEY": { "source": "refundAmount", "maxLength": 20 },
+        "REPLACE_TIME_KEY": { "source": "eventTime", "maxLength": 19 }
+      }
+    }
+  }
+}

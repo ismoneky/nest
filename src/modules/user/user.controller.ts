@@ -39,18 +39,21 @@ export class UserController {
         const url = `https://api.weixin.qq.com/sns/jscode2session?appid=${appid}&secret=${secret}&js_code=${code}&grant_type=authorization_code`;
 
         let openid: string;
+        let unionid: string | undefined;
         try {
             const response = await firstValueFrom(this.httpService.get(url));
-            const { openid: wxOpenid, errcode, errmsg } = response.data;
+            const { openid: wxOpenid, unionid: wxUnionid, errcode, errmsg } = response.data;
             if (errcode) {
                 return res.status(HttpStatus.BAD_REQUEST).send({ success: false, message: errmsg, errcode });
             }
             openid = wxOpenid;
+            if (typeof openid !== 'string' || !openid) throw new Error('Invalid WeChat login response');
+            unionid = typeof wxUnionid === 'string' ? wxUnionid : undefined;
         } catch (error) {
             return res.status(HttpStatus.INTERNAL_SERVER_ERROR).send({ success: false, message: '微信登录失败' });
         }
 
-        const user = await this.userService.findOrCreateUser({ wechatOpenId: openid });
+        const user = await this.userService.findOrCreateUser({ wechatOpenId: openid, wechatUnionId: unionid });
         const token = this.jwtService.sign({ openid: user.wechatOpenId, userId: user.userId });
         const approvedApp = await this.adminApplicationRepository.findApprovedByOpenid(openid);
 

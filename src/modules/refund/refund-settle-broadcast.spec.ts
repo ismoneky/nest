@@ -1,3 +1,4 @@
+import { WechatOaConfig } from '../wechat-oa/wechat-oa.config';
 import { Test } from '@nestjs/testing';
 import { TypeOrmModule, getRepositoryToken } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
@@ -74,6 +75,7 @@ describe('退款到账通知的三条镜像路径', () => {
                 RefundApplyRepository,
                 MessageRepository,
                 MessageService,
+                WechatOaConfig,
                 RefundApplyService,
                 { provide: SystemConfigService, useValue: { getRefundApplyDeadlineDays: () => 7 } },
             ],

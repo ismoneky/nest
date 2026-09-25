@@ -5,8 +5,10 @@ import {
     MESSAGE_AUTO_READ_MS,
     MESSAGE_RETENTION_MS,
 } from '../../repositories/message.repository';
-import { Message, MessageType, MessageSenderType, OaSendStatus } from '../../entities/message.entity';
+import { Message, MessageType, MessageSenderType } from '../../entities/message.entity';
 import { renderMessage } from './message-templates';
+import { WechatOaConfig } from '../wechat-oa/wechat-oa.config';
+import { prepareOaMessage, skippedOa } from './oa-message-policy';
 
 /**
  * 发送结果
@@ -30,22 +32,7 @@ export interface SendResult {
     message: Message | null;
 }
 
-/**
- * 站内信服务（方案 §3.4 的通知架构）
- *
- * ── 渠道解耦：站内信是记录层，服务号是触达层 ──────────────────────────────
- * `send()` 只负责**落库**（100% 成功或明确告知为什么没落），
- * 服务号模板消息是它的第 3、4 步，由 `OA_ENABLED` 控制：
- *   · `OA_ENABLED=false`（默认）→ 第 3、4 步整体跳过，`oaSendStatus` 记 SKIPPED；
- *   · 服务号分支（独立分支 `feat/oa-template-message`）落地时只需实现
- *     `trySendOa()`，**不需要动本类的其余部分，也不需要动任何调用方**。
- * 这就是「上线主流程不需要任何微信侧前置条件」的实现方式（§4.6）。
- *
- * ── 本模块不依赖任何业务模块 ──────────────────────────────────────────────
- * 与 `RefundModule` 同款：`MessageModule` 只依赖 `TypeOrmModule.forFeature([Message])`，
- * 业务实体一律由调用方读好后传进来。这样 Booking / Refund / WechatPay / Admin / Feedback
- * 五个模块都能安全 import 它，不会与任何一个成环。
- */
+/** 站内信与 OA 发送快照同时落库；微信 HTTP 由 OaDeliveryService 独立消费。 */
 @Injectable()
 export class MessageService {
     private readonly logger = new Logger(MessageService.name);
@@ -53,7 +40,7 @@ export class MessageService {
     /** 治理任务的重入保护（与 BookingService 的 taskRunning 同款，本类只有一个任务故用裸布尔） */
     private governanceRunning = false;
 
-    constructor(private readonly messageRepository: MessageRepository) {}
+    constructor(private readonly messageRepository: MessageRepository, private readonly oaConfig: WechatOaConfig) {}
 
     // ─────────────────────────────────────────────────────────────────────────
     // 系统消息
@@ -102,7 +89,7 @@ export class MessageService {
             bizId: rendered.bizId,
             jumpPath: rendered.jumpPath,
             senderType: MessageSenderType.SYSTEM,
-            oaSendStatus: this.oaStatusWhenDisabled(),
+            ...prepareOaMessage(msgType, ctx, this.oaConfig, Date.now()),
         });
 
         // 走到 `!created` 只有一种可能：预检之后、插入之前有另一个调用方插了同一个
@@ -110,7 +97,6 @@ export class MessageService {
         // 那正是去重要防的事。站内信那条已经在库里了，对用户而言没有任何损失。
         if (!created) return { sent: true, duplicated: true, message };
 
-        if (message) await this.trySendOa(message);
         return { sent: true, duplicated: false, message };
     }
 
@@ -213,7 +199,7 @@ export class MessageService {
             jumpPath: params.jumpPath ?? null,
             senderType: MessageSenderType.ADMIN,
             adminId: params.adminId,
-            oaSendStatus: this.oaStatusWhenDisabled(),
+            ...skippedOa('UNSUPPORTED_TYPE'),
         });
         return message;
     }
@@ -307,33 +293,4 @@ export class MessageService {
         return await this.messageRepository.deleteOlderThan(cutoff);
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // 私有
-    // ─────────────────────────────────────────────────────────────────────────
-
-    /** OA 未启用时落库的初始状态（启用时应为 PENDING，留给服务号分支改） */
-    private oaStatusWhenDisabled(): number {
-        return this.isOaEnabled() ? OaSendStatus.PENDING : OaSendStatus.SKIPPED;
-    }
-
-    private isOaEnabled(): boolean {
-        return process.env.OA_ENABLED === 'true';
-    }
-
-    /**
-     * 服务号模板消息（**独立分支 `feat/oa-template-message`，本阶段不实现**）
-     *
-     * 这里刻意保留一个空的、带明确边界的方法，而不是把调用点散在 send() 里：
-     * 分支落地时只需要实现这个方法体 + `user_wx_oa` 表，
-     * 主流程的代码一行都不用动（`OA_ENABLED=false` 时它根本不会被调用到有副作用的分支）。
-     *
-     * 失败处理的原则（§4.6）：**发失败不影响站内信**——站内信此时已经落库了。
-     */
-    private async trySendOa(message: Message): Promise<void> {
-        if (!this.isOaEnabled()) return;
-        // 未实现：服务号属独立分支，主流程不上线它。
-        // 明确记一条日志而不是静默 return —— 若线上误开了 OA_ENABLED，
-        // 这里必须留下痕迹，而不是让「消息发出去了但用户没收到推送」无从查起。
-        this.logger.warn(`OA_ENABLED=true 但服务号通道尚未实现，消息 ${message.id} 仅落站内信`);
-    }
 }

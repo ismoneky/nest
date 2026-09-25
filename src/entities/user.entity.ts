@@ -2,6 +2,7 @@ import { Entity, Column, PrimaryGeneratedColumn, Index, BeforeInsert, BeforeUpda
 import { timestampTransformer } from './timestamp.transformer';
 
 @Entity('users')
+@Index('IDX_users_unionid', ['wechatUnionId'], { unique: true })
 export class User {
     @PrimaryGeneratedColumn()
     id: number;
@@ -13,6 +14,13 @@ export class User {
     @Column({ unique: true })
     @Index()
     wechatOpenId: string;
+
+    @Column({ type: 'varchar', nullable: true })
+    wechatUnionId: string | null;
+
+    /** 冲突只冻结服务号关联，不影响小程序登录。 */
+    @Column({ type: 'integer', default: 0 })
+    wechatIdentityConflict: number;
 
     @Column({ nullable: true })
     wechatNickname?: string;

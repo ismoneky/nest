@@ -5,9 +5,8 @@ node_modules
 certs/
 
 # 环境变量（含敏感信息）
-.env
-.env.development
-.env.production
+.env*
+!.env.example
 
 # Build output
 dist

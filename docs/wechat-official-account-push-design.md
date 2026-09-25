@@ -1,6 +1,8 @@
 # 小程序依托微信服务号推送消息方案（定时同步，无服务号回调）
 
-日期：2026-09-17。代码基线：`nest` 当前工作区，HEAD `a6c2044`；同时检查了 `fctl` 小程序和 `admin` 管理端。本文是待实施方案，本次未修改业务代码、数据库或微信后台配置。
+设计日期：2026-09-17。原始代码阅读基线：`nest` HEAD `a6c2044`；同时检查了 `fctl` 小程序和 `admin` 管理端。第 2 节保留实施前的代码行为，便于追溯设计依据。
+
+实施更新（2026-09-21）：按用户要求完成后端占位配置版，粉丝同步固定为每两小时第 43 分钟；凭据和模板均未填写真实值，默认关闭同步与发送。配置、增量 SQL、管理员接口和启用步骤见[运行说明](/Users/lufy/Desktop/ff/nest/docs/wechat-oa-runbook.md)。本次未部署或操作微信后台，真实账号联调仍待完成。
 
 ## 1. 结论与首版范围
 
@@ -12,7 +14,7 @@
 
 这里的可行性是设计判断，尚未完成真实服务号联调。微信服务端官方文档正文在本次检索中无法访问，不能把当前接口权限、限额和规则写成已核实事实。下文明确区分代码证据、接口基线与实施前核对项；官方入口及检索情况见[研究记录](/Users/lufy/Desktop/ff/nest/docs/wechat-official-account-api-research.md)。
 
-## 2. 现有代码与可以复用的位置
+## 2. 原始代码基线与可以复用的位置
 
 | 位置 | 已有行为 | 本次方案的影响 |
 | --- | --- | --- |
@@ -177,7 +179,7 @@ flowchart LR
 
 建议新增 `WechatOaModule`，内部负责 `WechatOaClient / WechatOaTokenService / WechatOaFanSyncService` 及粉丝、同步批次 Repository；不导入 Booking/Refund/Feedback/Message 等业务模块。`MessageModule` 单向导入 OA 模块，自己的发送 worker 读消息台账并调用 OA client。UserModule 只保存登录 UnionID，避免反向依赖 OA 模块造成循环。
 
-配置：复用 `OA_ENABLED`，新增 `OA_APPID / OA_SECRET` 与每个启用消息类型的模板配置；小程序 AppID 继续使用 `WX_APPID`。启动时校验已启用项的模板配置，缺失项明确跳过并告警，不能静默积压。
+配置：`OA_ENABLED` 控制新消息入队与投递，`OA_SYNC_ENABLED` 单独控制同步，以便先完成身份同步再开启发送；两者默认关闭。`OA_WORKER_ENABLED` 指定单个调度实例。新增 `OA_APPID / OA_SECRET / OA_TEMPLATES_FILE`；小程序 AppID 继续使用 `WX_APPID`。启动时校验模板配置，缺失项明确跳过并告警，管理员状态接口提供逐模板配置诊断。
 
 服务号 token 与小程序 token、微信支付证书是不同凭据。按获取响应中的 `expires_in` 缓存并提前刷新，同一时刻只允许一个刷新操作。实施时核对普通 token 与 `stable_token` 的当前适用规则，再统一选择；本方案不硬编码“固定两小时有效”或“每天固定额度”。其他系统使用同一服务号时先协调 token 来源。
 
@@ -213,4 +215,4 @@ flowchart LR
 - OA 通道关闭和微信接口故障不影响站内信、退款状态及支付回调响应；新增同步写入与现有 SQLite 写入兼容。
 - 服务号卡片实际跳到已发布首页，完成当前登录并能查看站内信；后台台账显示“受理”，不声称用户已收到。
 
-本次仅完成代码阅读和方案整理，以上联调、测试与 SQL 均为后续实施项，尚未执行。
+占位实现、自动化测试和增量 SQL 已补齐，验证记录见[实现计划](/Users/lufy/Desktop/ff/nest/docs/superpowers/plans/2026-09-21-wechat-oa-implementation.md)。SQL 仅在内存测试库验证，尚未应用到生产；真实微信账号联调按运行说明执行。
