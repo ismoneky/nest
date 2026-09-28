@@ -25,6 +25,7 @@ import {
 } from '../refund/dto/audit-refund-apply.dto';
 import { SendMessageDto } from './dto/send-message.dto';
 import { TriggerTaskDto } from './dto/trigger-task.dto';
+import { AdminCompletedRefundDto } from './dto/admin-completed-refund.dto';
 
 @Controller('admin')
 export class AdminController {
@@ -81,6 +82,30 @@ export class AdminController {
                 total: result.total,
                 totalPages: result.totalPages,
             },
+        });
+    }
+
+    /**
+     * 管理员对待使用或已完成的已支付订单发起退款。
+     * POST /admin/bookings/:bookingId/refund
+     */
+    @Post('bookings/:bookingId/refund')
+    @UseGuards(AdminAuthGuard)
+    async refundBookingAsAdmin(
+        @Param('bookingId') bookingId: string,
+        @Body() dto: AdminCompletedRefundDto,
+        @Req() req: Request,
+        @Res() res: Response,
+    ) {
+        const data = await this.adminService.refundBookingAsAdmin(
+            bookingId,
+            dto.secondaryPassword,
+            extractOperator(req),
+        );
+        return res.status(HttpStatus.OK).send({
+            success: true,
+            message: '退款申请已提交',
+            data,
         });
     }
 

@@ -1,6 +1,12 @@
-import { Injectable, UnauthorizedException } from '@nestjs/common';
+import {
+    ForbiddenException,
+    Injectable,
+    ServiceUnavailableException,
+    UnauthorizedException,
+} from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import * as ExcelJS from 'exceljs';
+import * as bcrypt from 'bcrypt';
 import { AdminRepository } from '../../repositories/admin.repository';
 import { BookingService } from '../booking/booking.service';
 import { LoginDto } from './dto/login.dto';
@@ -133,6 +139,47 @@ export class AdminService {
         return await this.refundApplyService.getAuditDetail(applyNo, (bookingId) =>
             this.bookingService.getBookingByIdForAdmin(bookingId),
         );
+    }
+
+    /**
+     * 管理员直接退待使用或已完成订单：登录态之外，再校验独立的退款二级密码。
+     * 明文密码只参与本次 bcrypt.compare，不进入日志、数据库或返回值。
+     */
+    async refundBookingAsAdmin(
+        bookingId: string,
+        secondaryPassword: string,
+        operator: AdminOperator,
+    ) {
+        const passwordHash = process.env.ADMIN_REFUND_PASSWORD_HASH?.trim();
+        if (!passwordHash) {
+            throw new ServiceUnavailableException('退款二级密码未配置');
+        }
+        if (!/^\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}$/.test(passwordHash)) {
+            throw new ServiceUnavailableException('退款二级密码配置无效');
+        }
+        const passwordMatches = await bcrypt.compare(
+            secondaryPassword,
+            passwordHash,
+        );
+        if (!passwordMatches) {
+            throw new ForbiddenException('退款二级密码错误');
+        }
+
+        const refundResult = await this.bookingService.initiateRefundAsAdmin(bookingId);
+        this.loggingService.write({
+            source: AppLogSource.BACKEND,
+            level: AppLogLevel.INFO,
+            category: AppLogCategory.PAYMENT,
+            message: '管理员对已支付订单发起退款',
+            route: `/admin/bookings/${bookingId}/refund`,
+            context: {
+                bookingId,
+                operator: operator.adminName,
+                operatorId: operator.adminId,
+                operatorUnknown: operator.adminId === null,
+            },
+        });
+        return refundResult;
     }
 
     /**

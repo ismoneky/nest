@@ -976,7 +976,12 @@ export class BookingRepository {
      * `markRefundSucceeded/Failed` 的 WHERE 只判 `refundStatus` 与 `outRefundNo`、不判 `status`，
      * 因此 `expired → refunded` 天然成立，退款终态不需要任何改动。
      */
-    async markRefundStarting(bookingId: string, outRefundNo: string, nextAt: number): Promise<number> {
+    async markRefundStarting(
+        bookingId: string,
+        outRefundNo: string,
+        nextAt: number,
+        allowedStatuses: BookingStatus[] = [BookingStatus.CONFIRMED, BookingStatus.EXPIRED],
+    ): Promise<number> {
         return serialWrite(this.dataSource, async () => (await this.bookingRepository
             .createQueryBuilder()
             .update(Booking)
@@ -990,7 +995,7 @@ export class BookingRepository {
             })
             .where('bookingId = :bookingId', { bookingId })
             .andWhere('status IN (:...statuses)', {
-                statuses: [BookingStatus.CONFIRMED, BookingStatus.EXPIRED],
+                statuses: allowedStatuses,
             })
             .andWhere('paymentStatus = :ps', { ps: PaymentStatus.PAID })
             .andWhere('refundStatus IN (:...refundStatuses)', {

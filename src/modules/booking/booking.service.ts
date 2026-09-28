@@ -1447,6 +1447,90 @@ export class BookingService {
     // ─────────────────────────────────────────────────────────────────────────
 
     /**
+     * 管理员对待使用或已完成的已支付订单发起退款。
+     *
+     * 这是独立于用户自助退款和过期订单审核的入口，最终落库仍复用
+     * markRefundStarting 的条件更新，与其它退款入口原子互斥。
+     */
+    async initiateRefundAsAdmin(bookingId: string) {
+        const booking = await this.bookingRepository.getBookingById(bookingId);
+        if (!booking) {
+            throw new BadRequestException('订单不存在');
+        }
+        if (![BookingStatus.CONFIRMED, BookingStatus.COMPLETED].includes(booking.status)) {
+            throw new BadRequestException('仅待使用或已完成订单可由管理员退款');
+        }
+        if (booking.isFree) {
+            throw new BadRequestException('免费预约无需退款');
+        }
+        if (booking.paymentStatus !== PaymentStatus.PAID) {
+            throw new BadRequestException('订单未支付，无法退款');
+        }
+        if (booking.refundStatus === RefundStatus.REFUNDED) {
+            throw new BadRequestException('订单已退款');
+        }
+        if (booking.refundStatus === RefundStatus.REFUNDING) {
+            throw new BadRequestException('退款申请处理中，请勿重复提交');
+        }
+
+        if (booking.paidAt) {
+            const oneYearLater = new Date(booking.paidAt);
+            oneYearLater.setFullYear(oneYearLater.getFullYear() + 1);
+            if (new Date() > oneYearLater) {
+                throw new BadRequestException('订单已超过退款有效期（支付后一年内）');
+            }
+        }
+
+        const outRefundNo = booking.refundStatus === RefundStatus.FAILED
+            ? buildAdminCompletedRefundNo(booking.bookingId)
+            : booking.outRefundNo ?? `RF${booking.bookingId}`;
+        const affected = await this.bookingRepository.markRefundStarting(
+            bookingId,
+            outRefundNo,
+            Date.now() + 15 * 60 * 1000,
+            [BookingStatus.CONFIRMED, BookingStatus.COMPLETED],
+        );
+        if (affected === 0) {
+            const fresh = await this.bookingRepository.getBookingById(bookingId);
+            if (fresh.refundStatus === RefundStatus.REFUNDED) {
+                throw new BadRequestException('订单已退款');
+            }
+            if (fresh.refundStatus === RefundStatus.REFUNDING) {
+                throw new BadRequestException('退款申请处理中，请勿重复提交');
+            }
+            throw new BadRequestException('订单状态不允许退款');
+        }
+
+        try {
+            const refundResult = await this.wechatPayService.refund(
+                booking.outTradeNo,
+                outRefundNo,
+                booking.amount,
+                booking.amount,
+            );
+            this.loggingService.write({
+                source: AppLogSource.BACKEND,
+                level: AppLogLevel.INFO,
+                category: AppLogCategory.PAYMENT,
+                message: '管理员退款申请成功',
+                route: `/admin/bookings/${bookingId}/refund`,
+                context: { bookingId, outRefundNo },
+            });
+            return refundResult;
+        } catch (error) {
+            this.loggingService.write({
+                source: AppLogSource.BACKEND,
+                level: AppLogLevel.WARN,
+                category: AppLogCategory.PAYMENT,
+                message: '管理员退款申请失败',
+                route: `/admin/bookings/${bookingId}/refund`,
+                context: { bookingId, outRefundNo, error: (error as Error).message },
+            });
+            throw error;
+        }
+    }
+
+    /**
      * 申请退款
      * markRefundStarting 条件 UPDATE 落库 REFUNDING + 调度字段后再调微信，
      * 并发重复提交由条件更新保证只有一次进入 REFUNDING
@@ -2500,4 +2584,10 @@ export class BookingService {
     async getAllBookingsForExport(query: { bookingDate?: string; createdStart?: string; createdEnd?: string; status?: BookingStatus[]; keyword?: string }) {
         return await this.bookingRepository.getAllBookingsForExport(query);
     }
+}
+
+function buildAdminCompletedRefundNo(bookingId: string): string {
+    const suffix = `-M${Date.now().toString(36).toUpperCase()}`;
+    const prefix = `RF${bookingId}`.slice(0, 64 - suffix.length);
+    return `${prefix}${suffix}`;
 }
