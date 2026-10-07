@@ -193,7 +193,46 @@ describe('管理员对已支付订单发起退款', () => {
         expect(updated.outRefundNo).toBe(`RF${booking.bookingId}`);
     });
 
-    it('非待使用或已完成状态时拒绝管理员直接退款', async () => {
+    it('正确二级密码让已支付且已过期订单进入退款中', async () => {
+        const booking = await seedCompletedBooking({ status: BookingStatus.EXPIRED });
+
+        await (adminService as any).refundBookingAsAdmin(
+            booking.bookingId,
+            SECONDARY_PASSWORD,
+            { adminId: 1, adminName: '测试管理员' },
+        );
+
+        const updated = await bookingRawRepo.findOneOrFail({ where: { bookingId: booking.bookingId } });
+        // 退款期间 status 保持 expired，状态变化留待退款终态（markRefundStarting 的契约）
+        expect(updated.status).toBe(BookingStatus.EXPIRED);
+        expect(updated.paymentStatus).toBe(PaymentStatus.PAID);
+        expect(updated.refundStatus).toBe(RefundStatus.REFUNDING);
+        expect(updated.reconcileKind).toBe('refund');
+        expect(updated.outRefundNo).toBe(`RF${booking.bookingId}`);
+    });
+
+    it('已过期且超出用户申请时限的订单仍可由管理员直接退款', async () => {
+        // 申请时限（expiredAt + N 天）与「驳回即终态」只约束用户自助申请，
+        // 管理员人工兜底不受这两条限制——这正是本次放开 expired 的目的。
+        // 资金侧的约束（二级密码、支付后一年内）不受影响，见下面的用例。
+        const longAgo = new Date(Date.now() - 60 * 24 * 60 * 60 * 1000);
+        const booking = await seedCompletedBooking({
+            status: BookingStatus.EXPIRED,
+            expiredAt: longAgo,
+        });
+
+        await (adminService as any).refundBookingAsAdmin(
+            booking.bookingId,
+            SECONDARY_PASSWORD,
+            { adminId: 1, adminName: '测试管理员' },
+        );
+
+        const updated = await bookingRawRepo.findOneOrFail({ where: { bookingId: booking.bookingId } });
+        expect(updated.refundStatus).toBe(RefundStatus.REFUNDING);
+        expect(updated.outRefundNo).toBe(`RF${booking.bookingId}`);
+    });
+
+    it('非待使用/已完成/已过期状态时拒绝管理员直接退款', async () => {
         const booking = await seedCompletedBooking({ status: BookingStatus.CANCELLED });
 
         await expect(
@@ -202,7 +241,7 @@ describe('管理员对已支付订单发起退款', () => {
                 SECONDARY_PASSWORD,
                 { adminId: 1, adminName: '测试管理员' },
             ),
-        ).rejects.toThrow('仅待使用或已完成订单可由管理员退款');
+        ).rejects.toThrow('仅待使用、已完成或已过期订单可由管理员退款');
 
         const unchanged = await bookingRawRepo.findOneOrFail({ where: { bookingId: booking.bookingId } });
         expect(unchanged.refundStatus).toBe(RefundStatus.NONE);

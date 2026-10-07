@@ -142,7 +142,7 @@ export class AdminService {
     }
 
     /**
-     * 管理员直接退待使用或已完成订单：登录态之外，再校验独立的退款二级密码。
+     * 管理员直接退待使用、已完成或已过期订单：登录态之外，再校验独立的退款二级密码。
      * 明文密码只参与本次 bcrypt.compare，不进入日志、数据库或返回值。
      */
     async refundBookingAsAdmin(

@@ -86,7 +86,7 @@ export class AdminController {
     }
 
     /**
-     * 管理员对待使用或已完成的已支付订单发起退款。
+     * 管理员对待使用、已完成或已过期的已支付订单发起退款。
      * POST /admin/bookings/:bookingId/refund
      */
     @Post('bookings/:bookingId/refund')

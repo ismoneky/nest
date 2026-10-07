@@ -1447,18 +1447,39 @@ export class BookingService {
     // ─────────────────────────────────────────────────────────────────────────
 
     /**
-     * 管理员对待使用或已完成的已支付订单发起退款。
+     * 管理员对待使用、已完成或已过期的已支付订单发起退款。
      *
      * 这是独立于用户自助退款和过期订单审核的入口，最终落库仍复用
      * markRefundStarting 的条件更新，与其它退款入口原子互斥。
+     *
+     * ── 为什么 `expired` 也允许管理员直接退（2026-09-14 放开）────────────────
+     * 过期订单的默认出口是「用户申请 → 管理员审核」，那条路上带两条硬约束：
+     * 申请时限（`expiredAt + N 天`）与「驳回即终态」。但客服场景（用户不会自助
+     * 操作、电话要求退款）需要一条人工兜底通道，此时这两条流程约束不该成为阻碍。
+     *
+     * 放宽的是**流程门槛**，不是**资金门槛**：
+     *   · 资金侧仍由独立二级密码把守（`ADMIN_REFUND_PASSWORD_HASH`，见 AdminService）；
+     *   · 支付后一年内的退款有效期（下方 paidAt 校验）依旧生效；
+     *   · `markRefundStarting` 的条件更新未变，与其它退款入口仍然原子互斥。
+     *
+     * ⚠️ 本入口**不产生退款申请单**（`refund_applies`）。若该订单上已存在
+     * `pending` 的申请单，它不会随本次退款自动收敛，会继续留在退款审核列表里；
+     * 审核它时会因订单已退款而报错。需要人工把那张单驳回或忽略。
+     *
+     * ⚠️ `completed` 不在 `markRefundStarting` 的默认状态集里（默认只有
+     * confirmed/expired，后者是为审核路径放的），故下方必须显式传 allowedStatuses。
      */
     async initiateRefundAsAdmin(bookingId: string) {
         const booking = await this.bookingRepository.getBookingById(bookingId);
         if (!booking) {
             throw new BadRequestException('订单不存在');
         }
-        if (![BookingStatus.CONFIRMED, BookingStatus.COMPLETED].includes(booking.status)) {
-            throw new BadRequestException('仅待使用或已完成订单可由管理员退款');
+        if (
+            ![BookingStatus.CONFIRMED, BookingStatus.COMPLETED, BookingStatus.EXPIRED].includes(
+                booking.status,
+            )
+        ) {
+            throw new BadRequestException('仅待使用、已完成或已过期订单可由管理员退款');
         }
         if (booking.isFree) {
             throw new BadRequestException('免费预约无需退款');
@@ -1488,7 +1509,7 @@ export class BookingService {
             bookingId,
             outRefundNo,
             Date.now() + 15 * 60 * 1000,
-            [BookingStatus.CONFIRMED, BookingStatus.COMPLETED],
+            [BookingStatus.CONFIRMED, BookingStatus.COMPLETED, BookingStatus.EXPIRED],
         );
         if (affected === 0) {
             const fresh = await this.bookingRepository.getBookingById(bookingId);
