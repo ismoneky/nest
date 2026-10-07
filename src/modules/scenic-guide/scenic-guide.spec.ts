@@ -1,0 +1,129 @@
+import { INestApplication, ValidationPipe } from '@nestjs/common';
+import { Test } from '@nestjs/testing';
+import { TypeOrmModule } from '@nestjs/typeorm';
+import request from '../../../test/in-process-request';
+import { DataSource } from 'typeorm';
+import { ScenicGuide } from '../../entities/scenic-guide.entity';
+import { ScenicGuideModule } from './scenic-guide.module';
+
+const KEY = 'scenic-guide-test-key';
+const point = (id: string, extras = {}) => ({
+    id, name: '摩友驿站', categories: ['station', 'parking'], description: '休息和停车',
+    imageUrl: '', x: 0.85, y: 0.57, visible: true, sortOrder: 0, address: '', ...extras,
+});
+
+describe('Scenic guide HTTP and persistence', () => {
+    let app: INestApplication;
+    let initial: any;
+    const priorKey = process.env.ADMIN_API_KEY;
+    const cosNames = ['COS_BUCKET', 'COS_REGION', 'COS_SECRET_ID', 'COS_SECRET_KEY', 'COS_PUBLIC_BASE_URL'];
+    const priorCos = Object.fromEntries(cosNames.map(name => [name, process.env[name]]));
+
+    beforeAll(async () => {
+        process.env.ADMIN_API_KEY = KEY;
+        Object.assign(process.env, { COS_BUCKET: 'guide-test-1250000000', COS_REGION: 'ap-beijing', COS_SECRET_ID: 'test-id', COS_SECRET_KEY: 'test-secret', COS_PUBLIC_BASE_URL: 'https://cdn.example.com' });
+        const module = await Test.createTestingModule({
+            imports: [TypeOrmModule.forRoot({
+                type: 'sqlite', database: ':memory:', synchronize: true, entities: [ScenicGuide],
+            }), ScenicGuideModule],
+        }).compile();
+        app = module.createNestApplication();
+        app.useGlobalPipes(new ValidationPipe({ transform: true, whitelist: true, transformOptions: { enableImplicitConversion: true } }));
+        await app.init();
+    });
+
+    beforeEach(async () => {
+        await app.get(DataSource).getRepository(ScenicGuide).clear();
+        const res = await request(app.getHttpServer()).get('/scenic-guide/admin').set('x-admin-key', KEY).expect(200);
+        initial = { ...res.body.data, imageUrl: 'https://cdn.example.com/guide.jpg', imageWidth: 2412, imageHeight: 1280 };
+    });
+
+    afterAll(async () => {
+        await app?.close();
+        if (priorKey === undefined) delete process.env.ADMIN_API_KEY; else process.env.ADMIN_API_KEY = priorKey;
+        cosNames.forEach(name => { if (priorCos[name] === undefined) delete process.env[name]; else process.env[name] = priorCos[name]; });
+    });
+
+    const save = (data: any) => request(app.getHttpServer()).put('/scenic-guide/admin').set('x-admin-key', KEY).send(data);
+
+    it('starts empty until the administrator configures a COS image', async () => {
+        const res = await request(app.getHttpServer()).get('/scenic-guide').expect(200);
+        expect(res.body.data).toMatchObject({ revision: 0, imageUrl: '', points: [] });
+    });
+
+    it('persists edits, sorts points, and excludes hidden locations from the public response', async () => {
+        const result = await save({ ...initial, points: [point('later', { sortOrder: 9 }), point('hidden', { visible: false }), point('first', { sortOrder: 1 })] }).expect(200);
+        expect(result.body.data.revision).toBe(1);
+        const publicRes = await request(app.getHttpServer()).get('/scenic-guide').expect(200);
+        expect(publicRes.body.data.points.map((p: any) => p.id)).toEqual(['first', 'later']);
+        const adminRes = await request(app.getHttpServer()).get('/scenic-guide/admin').set('x-admin-key', KEY).expect(200);
+        expect(adminRes.body.data.points).toHaveLength(3);
+        expect(adminRes.body.data.points.find((p: any) => p.id === 'later')).toMatchObject({ x: 0.85, y: 0.57, categories: ['station', 'parking'] });
+    });
+
+    it('rejects unauthenticated reading of hidden points, configuration writes and uploads', async () => {
+        await request(app.getHttpServer()).get('/scenic-guide/admin').expect(401);
+        await request(app.getHttpServer()).put('/scenic-guide/admin').send(initial).expect(401);
+        await request(app.getHttpServer()).post('/scenic-guide/upload-policy').send({ contentType: 'image/png', size: 100 }).expect(401);
+    });
+
+    it('rejects stale revisions, including simultaneous first saves', async () => {
+        const responses = await Promise.all([save({ ...initial, title: '版本甲' }), save({ ...initial, title: '版本乙' })]);
+        expect(responses.map(r => r.status).sort()).toEqual([200, 409]);
+        await save({ ...initial, title: '不能覆盖' }).expect(409);
+        const stored = await request(app.getHttpServer()).get('/scenic-guide').expect(200);
+        expect(stored.body.data.title).not.toBe('不能覆盖');
+        expect(stored.body.data.revision).toBe(1);
+    });
+
+    it.each([
+        { x: -0.01 }, { y: 1.01 }, { x: '0.3' }, { name: '   ' },
+        { visible: 'false' }, { categories: ['unknown'] }, { categories: [] },
+        { latitude: 35 }, { latitude: 91, longitude: 114 },
+        { imageUrl: 'javascript:alert(1)' },
+    ])('rejects invalid point data without altering the saved map: %j', async (invalid) => {
+        await save({ ...initial, points: [point('bad', invalid)] }).expect(400);
+        expect((await request(app.getHttpServer()).get('/scenic-guide')).body.data.revision).toBe(0);
+    });
+
+    it('accepts edge coordinates and clears navigation when both geographic coordinates are omitted', async () => {
+        const first = await save({ ...initial, points: [point('edge', { x: 0, y: 1, latitude: 35.7, longitude: 114.1 })] }).expect(200);
+        const second = await save({ ...first.body.data, points: [point('edge', { x: 0, y: 1 })] }).expect(200);
+        expect(second.body.data.points[0].latitude).toBeUndefined();
+        expect(second.body.data.points[0].longitude).toBeUndefined();
+    });
+
+    it('rejects duplicate ids and invalid base image dimensions or URLs', async () => {
+        await save({ ...initial, points: [point('same'), point('same')] }).expect(400);
+        await save({ ...initial, imageWidth: 0 }).expect(400);
+        await save({ ...initial, imageUrl: 'http://example.com/a.jpg' }).expect(400);
+    });
+
+    it('issues a short-lived, single-object COS policy with size and content type restrictions', async () => {
+        const result = await request(app.getHttpServer()).post('/scenic-guide/upload-policy').set('x-admin-key', KEY).send({ contentType: 'image/png', size: 1234 }).expect(201);
+        const upload = result.body.data;
+        expect(upload.uploadUrl).toBe('https://guide-test-1250000000.cos.ap-beijing.myqcloud.com');
+        expect(upload.imageUrl).toMatch(/^https:\/\/cdn.example.com\/scenic-guide\/[0-9-]+\/[a-f0-9-]+\.png$/);
+        const policy = JSON.parse(Buffer.from(upload.fields.policy, 'base64').toString());
+        expect(policy.conditions).toEqual(expect.arrayContaining([
+            { bucket: 'guide-test-1250000000' }, { key: upload.fields.key },
+            { 'Content-Type': 'image/png' }, ['content-length-range', 1, 1234],
+        ]));
+        expect(new Date(policy.expiration).getTime() - Date.now()).toBeLessThanOrEqual(600000);
+        expect(new Date(policy.expiration).getTime() - Date.now()).toBeGreaterThan(590000);
+        expect(upload.fields['q-signature']).toMatch(/^[a-f0-9]{40}$/);
+        expect(JSON.stringify(upload)).not.toContain('test-secret');
+    });
+
+    it.each([{ contentType: 'text/html', size: 100 }, { contentType: 'image/svg+xml', size: 100 }, { contentType: 'image/png', size: 0 }, { contentType: 'image/jpeg', size: 10 * 1024 * 1024 + 1 }])('rejects unsafe upload metadata: %j', async metadata => {
+        await request(app.getHttpServer()).post('/scenic-guide/upload-policy').set('x-admin-key', KEY).send(metadata).expect(400);
+    });
+
+    it('reports missing COS configuration without accepting a server upload', async () => {
+        delete process.env.COS_SECRET_KEY;
+        try {
+            await request(app.getHttpServer()).post('/scenic-guide/upload-policy').set('x-admin-key', KEY).send({ contentType: 'image/png', size: 100 }).expect(503);
+            await request(app.getHttpServer()).post('/scenic-guide/assets').expect(404);
+        } finally { process.env.COS_SECRET_KEY = 'test-secret'; }
+    });
+});
