@@ -2,7 +2,7 @@
 
 ## 数据库
 
-生产环境关闭 synchronize，部署新后端前请备份 SQLite 数据库并执行：
+生产环境关闭 synchronize，部署代码不会自动创建导览表。部署新后端前请备份 SQLite 主数据库，并执行 [deploy-scenic-guide.sql](./deploy-scenic-guide.sql)：
 
 ```sql
 CREATE TABLE IF NOT EXISTS scenic_guides (
@@ -14,6 +14,22 @@ CREATE TABLE IF NOT EXISTS scenic_guides (
 ```
 
 无须插入初始数据。管理员首次保存创建 id=1 配置；未设置底图时小程序显示“景区导览正在准备中”。
+
+### 已上线后报 `SQLITE_ERROR: no such table: scenic_guides`
+
+这是主库漏执行建表 SQL。先确认 Nest 运行时的 `DATABASE_PATH`；若未配置，默认是 Nest 工作目录下的 `data/app.db`。不要把 SQL 执行到 `LOG_DATABASE_PATH` 指向的日志库，或根据示例路径另建一个空库。
+
+在服务器 Nest 项目目录中执行下面的命令，将第一行替换为实际主库路径：
+
+```sh
+GUIDE_DB='/实际路径/主数据库.db'
+test -f "$GUIDE_DB" && sqlite3 -bail "$GUIDE_DB" ".backup '$GUIDE_DB.before-guide-$(date +%Y%m%d-%H%M%S).bak'" && sqlite3 -bail -cmd '.timeout 5000' "$GUIDE_DB" < docs/deploy-scenic-guide.sql
+sqlite3 -readonly "$GUIDE_DB" 'PRAGMA table_info(scenic_guides);'
+```
+
+最后应输出 `id`、`contentJson`、`revision`、`updatedAt` 四列。随后刷新 admin 导览页即可，已部署的 Nest 和 admin 不需要重新构建。SQL 可以重复执行，不会覆盖已有导览数据。若依然报错，核对错误中的表名、实际数据库路径，以及 admin 是否请求了另一个后端环境。
+
+COS 配置只影响上传图片，读取导览配置和建表不依赖 COS。
 
 ## 腾讯云 COS 直传
 
