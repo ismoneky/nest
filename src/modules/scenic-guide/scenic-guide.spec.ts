@@ -13,7 +13,8 @@ const guideSchemaSql = () => readFileSync(join(__dirname, '../../../docs/deploy-
 const KEY = 'scenic-guide-test-key';
 const point = (id: string, extras = {}) => ({
     id, name: '摩友驿站', categories: ['station', 'parking'], description: '休息和停车',
-    imageUrl: '', x: 0.85, y: 0.57, visible: true, sortOrder: 0, address: '', ...extras,
+    imageUrl: '', x: 0.85, y: 0.57, visible: true, sortOrder: 0, address: '',
+    latitude: 35.7, longitude: 114.1, ...extras,
 });
 
 describe('Scenic guide HTTP and persistence', () => {
@@ -97,18 +98,16 @@ describe('Scenic guide HTTP and persistence', () => {
     it.each([
         { x: -0.01 }, { y: 1.01 }, { x: '0.3' }, { name: '   ' },
         { visible: 'false' }, { categories: ['unknown'] }, { categories: [] },
-        { latitude: 35 }, { latitude: 91, longitude: 114 },
+        { latitude: undefined, longitude: undefined }, { latitude: 35, longitude: undefined }, { latitude: 91, longitude: 114 },
         { imageUrl: 'javascript:alert(1)' },
     ])('rejects invalid point data without altering the saved map: %j', async (invalid) => {
         await save({ ...initial, points: [point('bad', invalid)] }).expect(400);
         expect((await request(app.getHttpServer()).get('/scenic-guide')).body.data.revision).toBe(0);
     });
 
-    it('accepts edge coordinates and clears navigation when both geographic coordinates are omitted', async () => {
-        const first = await save({ ...initial, points: [point('edge', { x: 0, y: 1, latitude: 35.7, longitude: 114.1 })] }).expect(200);
-        const second = await save({ ...first.body.data, points: [point('edge', { x: 0, y: 1 })] }).expect(200);
-        expect(second.body.data.points[0].latitude).toBeUndefined();
-        expect(second.body.data.points[0].longitude).toBeUndefined();
+    it('accepts edge image positions and zero-valued navigation coordinates', async () => {
+        const saved = await save({ ...initial, points: [point('edge', { x: 0, y: 1, latitude: 0, longitude: 0 })] }).expect(200);
+        expect(saved.body.data.points[0]).toMatchObject({ x: 0, y: 1, latitude: 0, longitude: 0 });
     });
 
     it('rejects duplicate ids and invalid base image dimensions or URLs', async () => {

@@ -13,8 +13,8 @@ export interface GuidePoint {
     y: number;
     visible: boolean;
     sortOrder: number;
-    latitude?: number;
-    longitude?: number;
+    latitude: number;
+    longitude: number;
     address: string;
 }
 
@@ -97,15 +97,10 @@ export function parseGuide(input: unknown): GuideContent & { revision: number } 
             y: number(p.y, `${name}纵坐标`, 0, 1),
             visible: p.visible,
             sortOrder: number(p.sortOrder, `${name}排序`, 0, 9999, true),
+            latitude: number(p.latitude, `${name}纬度`, -90, 90),
+            longitude: number(p.longitude, `${name}经度`, -180, 180),
             address: text(p.address, `${name}地址`, 200),
         };
-        const hasLat = p.latitude !== undefined && p.latitude !== null;
-        const hasLng = p.longitude !== undefined && p.longitude !== null;
-        if (hasLat !== hasLng) return fail(`${name}经纬度须同时填写或同时留空`);
-        if (hasLat) {
-            result.latitude = number(p.latitude, `${name}纬度`, -90, 90);
-            result.longitude = number(p.longitude, `${name}经度`, -180, 180);
-        }
         return result;
     });
     const result = { title, imageUrl: url, imageWidth, imageHeight, points, revision };
